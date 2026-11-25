@@ -104,6 +104,8 @@ rune-editor/
 
 ## Roadmap
 
+See the full, continuously updated **[Capture One (16.9.1) vs. Rune Darkroom Feature Parity Matrix](docs/CAPTURE_ONE_PARITY.md)** for a complete tool-by-tool breakdown of what's shipped vs. planned.
+
 - [x] **Phase 0 & 1:** Rune `Compositor` + `El::effect` 120Hz viewport, linear `Rgba16Float` WGSL develop pipeline, native RAW decoding (`CIRAWFilter` + `rawler`), full-res export, sidecar persistence.
 - [x] **Phase 2:** Capture One-style 3-Way Color Balance wheels, Fritsch-Carlson RGB/Luma Tone Curves LUT, 8-Band HSL, Clarity/Sharpening/Denoise, Folder Filmstrip culling, Anomaly OpenCode UI + Apple macOS HIG polish.
 - [ ] **Phase 3:** Local Adjustment Layers & Masks (Linear/Radial gradients, sparse `256×256` CoW Brush, Apple Neural Engine Subject/Sky masking via `objc2-vision`).
