@@ -6,7 +6,9 @@
 //! built-in styles, and scene-referred linear color math (including fast
 //! precompiled evaluation for live histograms and full-resolution export).
 
+pub mod color_science;
 pub mod curves;
+pub mod geometry;
 pub mod session;
 
 use std::path::{Path, PathBuf};
@@ -14,7 +16,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::color_science::{
+    BlackAndWhiteParams, LevelsParams, auto_exposure_and_tone, auto_levels, auto_white_balance,
+    pick_white_balance, rgb_to_hsl_and_lab,
+};
 pub use crate::curves::{CURVE_LUT_SIZE, ToneCurves, default_curve_points, sample_curve_lut};
+pub use crate::geometry::{CompositionGrid, CropAspect, GeometryParams};
 pub use crate::session::{CullFilter, CullFlag, PhotoMeta, SessionCatalog, SessionEntry};
 
 /// Version tag embedded in `.rune-edit.json` sidecar files.
@@ -56,18 +63,34 @@ impl ColorWheel {
         self.hue_x == 0.0 && self.hue_y == 0.0 && self.luma == 0.0
     }
 
-    /// Clamps `(hue_x, hue_y)` to the unit disk and `luma` to `-1.0..=1.0`.
+    /// Clamps `(hue_x, hue_y)` to the unit disk and `luma` to `-1.0..=1.0`,
+    /// sanitizing any non-finite inputs to `0.0`.
     pub fn clamped(self) -> Self {
-        let len = self.hue_x.hypot(self.hue_y);
-        let (hx, hy) = if len > 1.0 {
-            (self.hue_x / len, self.hue_y / len)
+        let raw_x = if self.hue_x.is_finite() {
+            self.hue_x
         } else {
-            (self.hue_x, self.hue_y)
+            0.0
+        };
+        let raw_y = if self.hue_y.is_finite() {
+            self.hue_y
+        } else {
+            0.0
+        };
+        let raw_l = if self.luma.is_finite() {
+            self.luma
+        } else {
+            0.0
+        };
+        let len = raw_x.hypot(raw_y);
+        let (hx, hy) = if len > 1.0 {
+            (raw_x / len, raw_y / len)
+        } else {
+            (raw_x, raw_y)
         };
         Self {
             hue_x: hx,
             hue_y: hy,
-            luma: self.luma.clamp(-1.0, 1.0),
+            luma: raw_l.clamp(-1.0, 1.0),
         }
     }
 
@@ -168,6 +191,24 @@ pub struct DevelopRecipe {
     /// Edge-aware chroma/luma noise reduction (`0.0..=1.0`).
     #[serde(default)]
     pub noise_reduction: f32,
+    /// Capture One midtone-weighted luminance lift preserving black/white endpoints (`-1.0..=+1.0`).
+    #[serde(default)]
+    pub brightness: f32,
+    /// Fine micro-contrast companion to Clarity (`-1.0..=+1.0`).
+    #[serde(default)]
+    pub structure: f32,
+    /// Atmospheric contrast / airlight dehaze (`-1.0..=+1.0`).
+    #[serde(default)]
+    pub dehaze: f32,
+    /// Capture One Input/Output Levels controls.
+    #[serde(default)]
+    pub levels: LevelsParams,
+    /// Capture One 6-Channel Black & White color sensitivity mixer.
+    #[serde(default)]
+    pub bw: BlackAndWhiteParams,
+    /// Persistent non-destructive Crop, Straighten, Rotation, and Flip geometry.
+    #[serde(default)]
+    pub geometry: GeometryParams,
 }
 
 impl Default for DevelopRecipe {
@@ -195,6 +236,12 @@ impl Default for DevelopRecipe {
             clarity: 0.0,
             sharpen: 0.0,
             noise_reduction: 0.0,
+            brightness: 0.0,
+            structure: 0.0,
+            dehaze: 0.0,
+            levels: LevelsParams::default(),
+            bw: BlackAndWhiteParams::default(),
+            geometry: GeometryParams::default(),
         }
     }
 }
@@ -222,6 +269,12 @@ impl DevelopRecipe {
             && self.clarity == 0.0
             && self.sharpen == 0.0
             && self.noise_reduction == 0.0
+            && self.brightness == 0.0
+            && self.structure == 0.0
+            && self.dehaze == 0.0
+            && self.levels.is_identity()
+            && self.bw.is_neutral()
+            && self.geometry.is_identity()
     }
 
     /// Compiles this recipe into a fast per-pixel evaluator with a pre-baked 256-entry
@@ -272,6 +325,12 @@ pub struct ViewportCamera {
     pub split_pos: f32,
     /// Momentary full-canvas "Before" preview (hold `\`).
     pub show_original: bool,
+    /// Highlight (red) & shadow (blue) clipping diagnostic overlay.
+    pub exposure_warning: bool,
+    /// Real-time green acutance focus mask overlay.
+    pub focus_mask: bool,
+    /// Interactive crop framing mode (shows full uncropped frame with dimmed outer mask & grid).
+    pub crop_mode: bool,
 }
 
 impl Default for ViewportCamera {
@@ -283,6 +342,9 @@ impl Default for ViewportCamera {
             split_compare: false,
             split_pos: 0.5,
             show_original: false,
+            exposure_warning: false,
+            focus_mask: false,
+            crop_mode: false,
         }
     }
 }
@@ -612,11 +674,15 @@ impl Default for HistogramData {
 #[derive(Clone, Debug)]
 pub struct CompiledRecipe {
     pub wb_exp: [f32; 3],
+    pub brightness: f32,
     pub contrast_pow: f32,
     pub highlights: f32,
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    pub levels: LevelsParams,
+    pub levels_active: bool,
+    pub dehaze: f32,
     pub vibrance: f32,
     pub saturation: f32,
     pub shadows_wheel: ColorWheel,
@@ -627,6 +693,8 @@ pub struct CompiledRecipe {
     pub curves_active: bool,
     pub hsl: [HslBand; HSL_BAND_COUNT],
     pub hsl_active: bool,
+    pub bw_enabled: bool,
+    pub bw_channels: [f32; 6],
 }
 
 impl CompiledRecipe {
@@ -635,6 +703,19 @@ impl CompiledRecipe {
         let wb_g = 2.0_f32.powf(-recipe.tint * 0.35);
         let wb_b = 2.0_f32.powf(-recipe.temperature * 0.45 + recipe.tint * 0.22);
         let exp_gain = 2.0_f32.powf(recipe.exposure);
+
+        let brightness = if recipe.brightness.is_finite() {
+            recipe.brightness.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let dehaze = if recipe.dehaze.is_finite() {
+            recipe.dehaze.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let levels = recipe.levels.sanitized();
+        let levels_active = !levels.is_identity();
 
         let shadows_wheel = recipe.shadows_wheel.clamped();
         let midtones_wheel = recipe.midtones_wheel.clamped();
@@ -646,14 +727,20 @@ impl CompiledRecipe {
         let curves_active = !recipe.curves.is_identity();
         let curve_lut = recipe.curves.bake_curve_lut_f32();
         let hsl_active = recipe.hsl.iter().any(|b| !b.is_neutral());
+        let bw_enabled = recipe.bw.enabled;
+        let bw_channels = recipe.bw.channels_clamped();
 
         Self {
             wb_exp: [wb_r * exp_gain, wb_g * exp_gain, wb_b * exp_gain],
+            brightness,
             contrast_pow: 2.0_f32.powf(recipe.contrast * 0.85),
             highlights: recipe.highlights,
             shadows: recipe.shadows,
             whites: recipe.whites,
             blacks: recipe.blacks,
+            levels,
+            levels_active,
+            dehaze,
             vibrance: recipe.vibrance,
             saturation: recipe.saturation,
             shadows_wheel,
@@ -664,11 +751,13 @@ impl CompiledRecipe {
             curves_active,
             hsl: recipe.hsl,
             hsl_active,
+            bw_enabled,
+            bw_channels,
         }
     }
 
-    /// Evaluates stages 1–7 in scene-referred linear light *before* optical vignette,
-    /// film grain, and filmic highlight roll-off (matching `shaders/develop.wgsl` stages 1–7).
+    /// Evaluates all per-pixel color & tone stages in scene-referred linear light *before*
+    /// optical vignette, film grain, and filmic highlight roll-off (matching `shaders/develop.wgsl`).
     ///
     /// Use this in full-resolution export when applying vignette/grain pre-tonemap, then
     /// finish with [`filmic_tonemap`].
@@ -679,18 +768,20 @@ impl CompiledRecipe {
         let mut g = (rgb[1] * self.wb_exp[1]).max(0.0);
         let mut b = (rgb[2] * self.wb_exp[2]).max(0.0);
 
-        // 2. Tonal regions (Shadows / Highlights / Whites / Blacks)
+        // 2. Tonal regions (Shadows / Highlights / Whites / Blacks / Midtone Brightness)
         let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(1e-5);
         let t = (luma / (luma + 0.18)).clamp(0.0, 1.0);
         let shadow_w = (1.0 - t) * (1.0 - t);
         let highlight_w = t * t;
         let black_w = shadow_w * shadow_w;
         let white_w = highlight_w * highlight_w;
+        let mid_w = 4.0 * t * (1.0 - t);
 
         let tone_stops = self.shadows * 1.15 * shadow_w
             + self.highlights * 1.15 * highlight_w
             + self.blacks * 0.90 * black_w
-            + self.whites * 0.75 * white_w;
+            + self.whites * 0.75 * white_w
+            + self.brightness * 0.95 * mid_w;
         let tone_gain = 2.0_f32.powf(tone_stops);
         r *= tone_gain;
         g *= tone_gain;
@@ -702,36 +793,37 @@ impl CompiledRecipe {
         g = pivot * (g / pivot).max(0.0).powf(self.contrast_pow);
         b = pivot * (b / pivot).max(0.0).powf(self.contrast_pow);
 
-        // 4. Tone Curves (Luma + per-channel R/G/B in perceptual gamma 2.2 space, HDR-preserving)
-        if self.curves_active {
-            let [cr, cg, cb] = apply_tone_curves_lut([r, g, b], &self.curve_lut);
-            r = cr;
-            g = cg;
-            b = cb;
+        // 4. Levels (Input black/mid/white + Output black/white)
+        if self.levels_active {
+            [r, g, b] = crate::color_science::apply_levels([r, g, b], self.levels);
         }
 
-        // 5. Capture One 3-Way Color Balance (Shadows / Midtones / Highlights wheels)
+        // 5. Atmospheric Dehaze
+        if self.dehaze.abs() > 1e-6 {
+            [r, g, b] = crate::color_science::apply_dehaze([r, g, b], self.dehaze);
+        }
+
+        // 6. Tone Curves (Luma + per-channel R/G/B in perceptual gamma 2.2 space, HDR-preserving)
+        if self.curves_active {
+            [r, g, b] = apply_tone_curves_lut([r, g, b], &self.curve_lut);
+        }
+
+        // 7. Capture One 3-Way Color Balance (Shadows / Midtones / Highlights wheels)
         if self.wheels_active {
-            let [wr, wg, wb] = apply_color_wheels(
+            [r, g, b] = apply_color_wheels(
                 [r, g, b],
                 self.shadows_wheel,
                 self.midtones_wheel,
                 self.highlights_wheel,
             );
-            r = wr;
-            g = wg;
-            b = wb;
         }
 
-        // 6. 8-Band HSL Color Editor
+        // 8. 8-Band HSL Color Editor
         if self.hsl_active {
-            let [hr, hg, hb] = apply_hsl_bands([r, g, b], &self.hsl);
-            r = hr;
-            g = hg;
-            b = hb;
+            [r, g, b] = apply_hsl_bands([r, g, b], &self.hsl);
         }
 
-        // 7. Vibrance & Saturation
+        // 9. Vibrance & Saturation
         let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         let max_c = r.max(g).max(b);
         let min_c = r.min(g).min(b);
@@ -744,6 +836,11 @@ impl CompiledRecipe {
         r = (y + (r - y) * sat_scale).max(0.0);
         g = (y + (g - y) * sat_scale).max(0.0);
         b = (y + (b - y) * sat_scale).max(0.0);
+
+        // 10. 6-Channel Black & White Mixer
+        if self.bw_enabled {
+            [r, g, b] = crate::color_science::apply_bw_mixer([r, g, b], self.bw_channels);
+        }
 
         [r, g, b]
     }
@@ -840,7 +937,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 #[inline]
-fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
+pub(crate) fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
     let r = rgb[0];
     let g = rgb[1];
     let b = rgb[2];
@@ -1002,9 +1099,12 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Computes a fast 64-bin RGB + Luma histogram from a downsampled linear RGB proxy.
-pub fn compute_histogram(proxy_linear_rgb: &[[f32; 3]], recipe: &DevelopRecipe) -> HistogramData {
-    let compiled = CompiledRecipe::from_recipe(recipe);
+/// Computes a fast 64-bin RGB + Luma histogram from a downsampled linear RGB proxy
+/// using an already-compiled recipe (zero redundant tone-curve LUT baking on 120Hz drags).
+pub fn compute_histogram_compiled(
+    proxy_linear_rgb: &[[f32; 3]],
+    compiled: &CompiledRecipe,
+) -> HistogramData {
     let mut r_bins = [0u32; HISTOGRAM_BINS];
     let mut g_bins = [0u32; HISTOGRAM_BINS];
     let mut b_bins = [0u32; HISTOGRAM_BINS];
@@ -1056,6 +1156,11 @@ pub fn compute_histogram(proxy_linear_rgb: &[[f32; 3]], recipe: &DevelopRecipe) 
     out.shadow_clip_pct = (shadow_clips as f32 / total) * 100.0;
     out.highlight_clip_pct = (highlight_clips as f32 / total) * 100.0;
     out
+}
+
+/// Computes a fast 64-bin RGB + Luma histogram from a downsampled linear RGB proxy.
+pub fn compute_histogram(proxy_linear_rgb: &[[f32; 3]], recipe: &DevelopRecipe) -> HistogramData {
+    compute_histogram_compiled(proxy_linear_rgb, &CompiledRecipe::from_recipe(recipe))
 }
 
 #[derive(Debug, Error)]
@@ -1361,6 +1466,12 @@ mod tests {
         assert_eq!(parsed_recipe.clarity, 0.0);
         assert_eq!(parsed_recipe.sharpen, 0.0);
         assert_eq!(parsed_recipe.noise_reduction, 0.0);
+        assert_eq!(parsed_recipe.brightness, 0.0);
+        assert_eq!(parsed_recipe.structure, 0.0);
+        assert_eq!(parsed_recipe.dehaze, 0.0);
+        assert!(parsed_recipe.levels.is_identity());
+        assert!(parsed_recipe.bw.is_neutral());
+        assert!(parsed_recipe.geometry.is_identity());
 
         let parsed_meta = PhotoMeta::from_sidecar_json(legacy_json)
             .expect("PhotoMeta must load legacy bare DevelopRecipe sidecar");
@@ -1419,5 +1530,241 @@ mod tests {
         let mapped = filmic_tonemap(scene);
         assert!(mapped[0] < 1.0 && mapped[0] > 0.75);
         assert_eq!(mapped, compiled.evaluate_pixel_linear(hdr_px));
+    }
+
+    #[test]
+    fn brightness_midtone_lift_preserves_endpoints() {
+        let recipe = DevelopRecipe {
+            brightness: 0.8,
+            ..DevelopRecipe::default()
+        };
+        let compiled = recipe.compile();
+        let black = compiled.evaluate_pixel_scene_linear([0.0, 0.0, 0.0]);
+        assert_eq!(black, [0.0, 0.0, 0.0]);
+        let mid = compiled.evaluate_pixel_scene_linear([0.18, 0.18, 0.18]);
+        assert!(mid[0] > 0.18 * 1.5, "midtones should lift, got {mid:?}");
+        let hi = compiled.evaluate_pixel_scene_linear([4.0, 4.0, 4.0]);
+        let mid_ratio = mid[0] / 0.18;
+        let hi_ratio = hi[0] / 4.0;
+        assert!(
+            mid_ratio > hi_ratio * 1.4,
+            "midtones ({mid_ratio}) should lift far more than highlights ({hi_ratio})"
+        );
+    }
+
+    #[test]
+    fn levels_identity_contrast_and_adversarial_sanitization() {
+        let id = LevelsParams::default();
+        assert!(id.is_identity());
+        let id_recipe = DevelopRecipe::default().compile();
+        let hdr = [1.5, 0.5, 0.05];
+        let out = id_recipe.evaluate_pixel_scene_linear(hdr);
+        for ch in 0..3 {
+            assert!((out[ch] - hdr[ch]).abs() < 1e-6);
+        }
+
+        // Input black/white stretch + midtone lift
+        let stretched = DevelopRecipe {
+            levels: LevelsParams {
+                in_black: 0.10,
+                in_mid: 0.35,
+                in_white: 0.85,
+                out_black: 0.02,
+                out_white: 0.96,
+            },
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        let mid = stretched.evaluate_pixel_scene_linear([0.18, 0.18, 0.18]);
+        assert!(mid[0] > 0.18 && mid[0].is_finite());
+
+        // Adversarial inverted / NaN / Inf levels must sanitize cleanly without NaN or Inf.
+        let bad = LevelsParams {
+            in_black: 0.95,
+            in_mid: f32::NAN,
+            in_white: 0.10,
+            out_black: f32::INFINITY,
+            out_white: f32::NEG_INFINITY,
+        };
+        let clean = bad.sanitized();
+        assert!(clean.in_white - clean.in_black >= 0.01 - 1e-6);
+        let bad_recipe = DevelopRecipe {
+            levels: bad,
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        let res = bad_recipe.evaluate_pixel_scene_linear([0.2, 0.5, 0.8]);
+        assert!(res.iter().all(|v| v.is_finite() && *v >= 0.0));
+    }
+
+    #[test]
+    fn dehaze_positive_negative_and_edge_cases() {
+        let hazy = [0.22, 0.24, 0.28];
+        let pos = DevelopRecipe {
+            dehaze: 0.7,
+            ..DevelopRecipe::default()
+        }
+        .compile()
+        .evaluate_pixel_scene_linear(hazy);
+        let neg = DevelopRecipe {
+            dehaze: -0.7,
+            ..DevelopRecipe::default()
+        }
+        .compile()
+        .evaluate_pixel_scene_linear(hazy);
+        // Positive dehaze deepens chroma separation; negative lifts shadows toward airlight.
+        assert!((pos[2] - pos[0]) > (hazy[2] - hazy[0]));
+        assert!(neg[0] > hazy[0]);
+
+        // Pure black and NaN stay safe & finite.
+        let black = DevelopRecipe {
+            dehaze: 1.0,
+            ..DevelopRecipe::default()
+        }
+        .compile()
+        .evaluate_pixel_scene_linear([0.0, 0.0, 0.0]);
+        assert_eq!(black, [0.0, 0.0, 0.0]);
+        let nan_out = DevelopRecipe {
+            dehaze: f32::NAN,
+            ..DevelopRecipe::default()
+        }
+        .compile()
+        .evaluate_pixel_scene_linear(hazy);
+        for ch in 0..3 {
+            assert!((nan_out[ch] - hazy[ch]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn six_channel_bw_selectivity_and_neutral_invariance() {
+        let bw_recipe = DevelopRecipe {
+            bw: BlackAndWhiteParams {
+                enabled: true,
+                red: 0.7,
+                blue: -0.8,
+                ..BlackAndWhiteParams::default()
+            },
+            ..DevelopRecipe::default()
+        }
+        .compile();
+
+        let red_px = [0.45, 0.03, 0.03];
+        let blue_px = [0.03, 0.03, 0.45];
+        let gray_px = [0.18, 0.18, 0.18];
+
+        let r_out = bw_recipe.evaluate_pixel_scene_linear(red_px);
+        let b_out = bw_recipe.evaluate_pixel_scene_linear(blue_px);
+        let g_out = bw_recipe.evaluate_pixel_scene_linear(gray_px);
+
+        // Strictly monochrome outputs
+        assert!((r_out[0] - r_out[1]).abs() < 1e-6 && (r_out[1] - r_out[2]).abs() < 1e-6);
+        assert!((b_out[0] - b_out[1]).abs() < 1e-6 && (b_out[1] - b_out[2]).abs() < 1e-6);
+        // Neutral gray invariant to color channel offsets
+        assert!((g_out[0] - 0.18).abs() < 1e-5);
+        // Red lifted above its Rec.709 luma, Blue darkened below its Rec.709 luma
+        let red_base = 0.2126 * red_px[0] + 0.7152 * red_px[1] + 0.0722 * red_px[2];
+        let blue_base = 0.2126 * blue_px[0] + 0.7152 * blue_px[1] + 0.0722 * blue_px[2];
+        assert!(r_out[0] > red_base * 1.4);
+        assert!(b_out[0] < blue_base * 0.65);
+    }
+
+    #[test]
+    fn auto_and_eyedropper_color_science() {
+        // Pick WB neutralizes a warm/green cast accurately
+        let cast = [0.24_f32, 0.20, 0.16];
+        let (temp, tint) = pick_white_balance(cast);
+        let wb_recipe = DevelopRecipe {
+            temperature: temp,
+            tint,
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        let neutralized = wb_recipe.evaluate_pixel_scene_linear(cast);
+        assert!((neutralized[0] - neutralized[1]).abs() < 1e-4);
+        assert!((neutralized[1] - neutralized[2]).abs() < 1e-4);
+
+        // Adversarial black & NaN inputs must return (0, 0) safely
+        assert_eq!(pick_white_balance([0.0, 0.0, 0.0]), (0.0, 0.0));
+        assert_eq!(pick_white_balance([f32::NAN, 0.2, 0.2]), (0.0, 0.0));
+
+        // Auto WB recovers uniform warm cast
+        let warm_proxy = vec![cast; 64];
+        let (auto_t, auto_ti) = auto_white_balance(&warm_proxy);
+        assert!((auto_t - temp).abs() < 1e-4 && (auto_ti - tint).abs() < 1e-4);
+
+        // Auto exposure lifts dark proxy toward 18% gray
+        let dark_proxy = vec![[0.045, 0.045, 0.045]; 64];
+        let (exp, _con, _hi, _sh) = auto_exposure_and_tone(&dark_proxy);
+        assert!(exp > 1.0 && exp.is_finite());
+
+        // Auto levels finds 0.1% shadow/highlight bounds
+        let mut ramp = Vec::with_capacity(2000);
+        for i in 0..2000 {
+            let t = 0.15 + 0.65 * (i as f32 / 1999.0);
+            let lin = t.powf(2.2);
+            ramp.push([lin, lin, lin]);
+        }
+        let lv = auto_levels(&ramp);
+        assert!((lv.in_black - 0.15).abs() < 0.015, "got {}", lv.in_black);
+        assert!((lv.in_white - 0.80).abs() < 0.015, "got {}", lv.in_white);
+
+        // RGB -> HSL & CIE Lab (D65) sanity checks
+        let (hsl_w, lab_w) = rgb_to_hsl_and_lab([1.0, 1.0, 1.0]);
+        assert!((hsl_w[2] - 100.0).abs() < 1e-3 && (lab_w[0] - 100.0).abs() < 1e-2);
+        assert!(lab_w[1].abs() < 0.05 && lab_w[2].abs() < 0.05);
+
+        let (hsl_r, lab_r) = rgb_to_hsl_and_lab([1.0, 0.0, 0.0]);
+        assert!((hsl_r[0] - 0.0).abs() < 1e-3 && (hsl_r[1] - 100.0).abs() < 1e-3);
+        assert!((lab_r[0] - 53.23).abs() < 0.15 && (lab_r[1] - 80.11).abs() < 0.2);
+
+        let (hsl_nan, lab_nan) = rgb_to_hsl_and_lab([f32::NAN, -1.0, 2.0]);
+        assert!(hsl_nan.iter().all(|v| v.is_finite()));
+        assert!(lab_nan.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn geometry_transforms_aspect_presets_and_sanitization() {
+        let mut geo = GeometryParams {
+            crop: [0.95, 0.95, 0.50, -0.20],
+            straighten_deg: 90.0,
+            rotate_90: 1,
+            flip_h: true,
+            flip_v: false,
+            aspect_preset: CropAspect::Free,
+            grid: CompositionGrid::GoldenRatio,
+        };
+        let c = geo.sanitized_crop();
+        assert!(c[0] + c[2] <= 1.0 + 1e-6 && c[2] >= 0.01);
+        assert!(c[1] + c[3] <= 1.0 + 1e-6 && c[3] >= 0.01);
+        assert_eq!(geo.sanitized_straighten_deg(), 45.0);
+        assert_eq!(geo.oriented_size(1600, 1000), [1000, 1600]);
+
+        // 90 deg CW: oriented top-right (1, 0) comes from source top-left (0, 0)
+        geo.straighten_deg = 0.0;
+        geo.flip_h = false;
+        let su = geo
+            .oriented_to_source_uv(1.0, 0.0, 1600, 1000)
+            .expect("valid uv");
+        assert!((su[0] - 0.0).abs() < 1e-5 && (su[1] - 0.0).abs() < 1e-5);
+
+        // Square aspect preset produces equal pixel width & height
+        let mut sq = GeometryParams::default();
+        sq.apply_aspect_preset(CropAspect::Square, 1600, 1000);
+        let [ow, oh] = sq.cropped_output_size(1600, 1000);
+        assert_eq!(ow, oh);
+        assert_eq!(ow, 1000);
+
+        // viewport_to_oriented_uv center maps to (0.5, 0.5) in crop_mode
+        let crop_cam = ViewportCamera {
+            crop_mode: true,
+            ..ViewportCamera::default()
+        };
+        let ori_center =
+            sq.viewport_to_oriented_uv([0.5, 0.5], [800.0, 600.0], [1600, 1000], &crop_cam);
+        assert!((ori_center[0] - 0.5).abs() < 1e-5 && (ori_center[1] - 0.5).abs() < 1e-5);
+
+        // Non-finite ColorWheel::clamped sanitizes cleanly to 0.0
+        let bad_wheel = ColorWheel::new(f32::NAN, f32::INFINITY, f32::NEG_INFINITY).clamped();
+        assert!(bad_wheel.is_neutral());
     }
 }
