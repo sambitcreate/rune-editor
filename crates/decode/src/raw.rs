@@ -156,6 +156,7 @@ fn decode_raster_image(path: &Path, max_edge: Option<u32>) -> Result<LinearImage
     let histogram_proxy = build_histogram_proxy(&rgba16f, width, height);
     let display_name = file_display_name(path);
     let ext = file_ext_upper(path);
+    let exif = crate::exif::extract_exif_from_path(path);
 
     Ok(LinearImage {
         width,
@@ -165,6 +166,7 @@ fn decode_raster_image(path: &Path, max_edge: Option<u32>) -> Result<LinearImage
         display_name,
         source_path: Some(path.to_path_buf()),
         format_label: format!("{ext} • 16-bit Linear FP16"),
+        exif,
     })
 }
 
@@ -271,6 +273,7 @@ pub(crate) fn decode_rawler_linear(
     let histogram_proxy = build_histogram_proxy(&rgba16f, width, height);
     let display_name = file_display_name(path);
     let ext = file_ext_upper(path);
+    let exif = crate::exif::extract_exif_from_path(path);
 
     Ok(LinearImage {
         width,
@@ -280,6 +283,7 @@ pub(crate) fn decode_rawler_linear(
         display_name,
         source_path: Some(path.to_path_buf()),
         format_label: format!("{ext} • RAW Linear FP16"),
+        exif,
     })
 }
 
@@ -724,6 +728,7 @@ pub(crate) mod macos {
             } else {
                 "CoreImage Linear FP16"
             };
+            let exif = crate::exif::extract_exif_from_path(path);
 
             Ok(LinearImage {
                 width: w32,
@@ -733,6 +738,7 @@ pub(crate) mod macos {
                 display_name,
                 source_path: Some(path.to_path_buf()),
                 format_label: format!("{ext} • {tier}"),
+                exif,
             })
         })
     }

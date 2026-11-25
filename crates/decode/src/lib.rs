@@ -5,6 +5,7 @@
 //! linear `Rgba16Float` buffers ready for direct upload into the GPU develop
 //! pipeline, plus downsampled proxies for sub-millisecond live histogram evaluation.
 
+pub mod exif;
 pub mod export;
 pub mod folder;
 pub mod raw;
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 use half::f16;
 use thiserror::Error;
 
-pub use export::{ExportFormat, export_image};
+pub use exif::{PhotoExif, extract_exif_from_bytes, extract_exif_from_path, format_shutter_speed};
+pub use export::{ExportFormat, ExportOptions, export_image, export_image_with_options};
 pub use folder::{ThumbnailRgba8, generate_demo_thumbnail, load_thumbnail, scan_photo_folder};
 pub use raw::{
     RASTER_EXTENSIONS, RAW_EXTENSIONS, SUPPORTED_EXTENSIONS, is_raw_extension, is_supported_photo,
@@ -33,6 +35,8 @@ pub struct LinearImage {
     pub display_name: String,
     pub source_path: Option<PathBuf>,
     pub format_label: String,
+    /// Extracted camera EXIF metadata (`None` if unavailable or stripped).
+    pub exif: Option<PhotoExif>,
 }
 
 impl LinearImage {
@@ -94,6 +98,7 @@ pub fn load_from_memory(
         rgba16f.push(f16::from_f32(px[3].clamp(0.0, 1.0)));
     }
     let histogram_proxy = build_histogram_proxy(&rgba16f, width, height);
+    let exif = extract_exif_from_bytes(bytes);
 
     Ok(LinearImage {
         width,
@@ -103,6 +108,7 @@ pub fn load_from_memory(
         display_name: display_name.to_owned(),
         source_path: None,
         format_label: format_label.to_owned(),
+        exif,
     })
 }
 
@@ -212,6 +218,15 @@ pub fn generate_demo_hdr_scene(width: u32, height: u32) -> LinearImage {
         display_name: "Alpine_Twilight_HDR.dng (Demo)".to_owned(),
         source_path: None,
         format_label: "HDR Demo • 16-bit Linear FP16".to_owned(),
+        exif: Some(PhotoExif {
+            camera_model: Some("Leica SL3 (Demo)".to_owned()),
+            lens_model: Some("APO-Summicron 35mm f/2 ASPH".to_owned()),
+            focal_length_mm: Some(35.0),
+            aperture_f: Some(2.8),
+            shutter_display: Some("1/250s".to_owned()),
+            iso: Some(100),
+            date_taken: Some("2026:10:18 18:42:10".to_owned()),
+        }),
     }
 }
 
@@ -447,6 +462,7 @@ mod tests {
             display_name: "Gray18.dng".to_owned(),
             source_path: None,
             format_label: "Test".to_owned(),
+            exif: None,
         };
 
         let neutral = DevelopRecipe::default();
@@ -544,6 +560,7 @@ mod tests {
             display_name: "HDR_Highlight.dng".to_owned(),
             source_path: None,
             format_label: "Test".to_owned(),
+            exif: None,
         };
 
         let recipe = DevelopRecipe {
@@ -581,6 +598,7 @@ mod tests {
             display_name: "Mid18.dng".to_owned(),
             source_path: None,
             format_label: "Test".to_owned(),
+            exif: None,
         };
         let grain_path = dir.join("mid_grain.png");
         export_image(&mid, &recipe, &grain_path, ExportFormat::Png16).expect("export grain png16");
@@ -594,6 +612,389 @@ mod tests {
             p0 != p1 || p1 != p2,
             "expected film grain to vary adjacent midtone pixels, got {p0}, {p1}, {p2}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exif_exposure_summary_and_shutter_formatting() {
+        assert_eq!(format_shutter_speed(1.0 / 250.0).as_deref(), Some("1/250s"));
+        assert_eq!(format_shutter_speed(0.5).as_deref(), Some("0.5s"));
+        assert_eq!(format_shutter_speed(2.0).as_deref(), Some("2s"));
+        assert_eq!(format_shutter_speed(1.5).as_deref(), Some("1.5s"));
+        assert_eq!(format_shutter_speed(0.0), None);
+        assert_eq!(format_shutter_speed(-0.1), None);
+        assert_eq!(format_shutter_speed(f64::NAN), None);
+
+        let full = PhotoExif {
+            camera_model: Some("Sony ILCE-7RM5".to_owned()),
+            lens_model: Some("FE 50mm F1.4 GM".to_owned()),
+            focal_length_mm: Some(50.0),
+            aperture_f: Some(2.0),
+            shutter_display: Some("1/250s".to_owned()),
+            iso: Some(400),
+            date_taken: Some("2026:05:12 14:30:00".to_owned()),
+        };
+        assert!(!full.is_empty());
+        assert_eq!(full.exposure_summary(), "50mm • f/2.0 • 1/250s • ISO 400");
+
+        let partial = PhotoExif {
+            focal_length_mm: Some(24.5),
+            iso: Some(800),
+            ..PhotoExif::default()
+        };
+        assert_eq!(partial.exposure_summary(), "24.5mm • ISO 800");
+
+        let empty = PhotoExif::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.exposure_summary(), "");
+    }
+
+    /// Builds a valid minimal JPEG with an embedded APP1 Exif TIFF block containing
+    /// TIFF Model + Exif LensModel, FocalLength, FNumber, ExposureTime, ISOSpeedRatings, DateTimeOriginal.
+    #[cfg(target_os = "macos")]
+    fn build_synthetic_exif_jpeg() -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+
+        let mut base_jpg = Vec::new();
+        let px = vec![128u8; 4 * 4 * 3];
+        JpegEncoder::new_with_quality(&mut base_jpg, 90)
+            .encode(&px, 4, 4, image::ExtendedColorType::Rgb8)
+            .expect("encode tiny jpeg");
+        assert_eq!(&base_jpg[0..2], &[0xFF, 0xD8]);
+
+        // Construct big-endian ("MM") TIFF payload.
+        let mut tiff = Vec::<u8>::new();
+        tiff.extend_from_slice(b"MM");
+        tiff.extend_from_slice(&42u16.to_be_bytes());
+        tiff.extend_from_slice(&8u32.to_be_bytes()); // IFD0 offset = 8
+
+        let model_bytes = b"Leica Q3\0";
+        let lens_bytes = b"Summilux 28mm f/1.7\0";
+        let date_bytes = b"2026:10:18 18:42:10\0";
+
+        // IFD0: 2 entries (Model 0x0110, ExifIFDPointer 0x8769)
+        // IFD0 starts at 8: 2 (count) + 2*12 (entries) + 4 (next=0) = 36 -> offset 36
+        let ifd0_count: u16 = 2;
+        let exif_ifd_offset: u32 = 8 + 2 + (ifd0_count as u32) * 12 + 4; // 36
+        // Exif IFD: 6 entries (ExposureTime, FNumber, ISOSpeedRatings, DateTimeOriginal, FocalLength, LensModel)
+        let exif_count: u16 = 6;
+        let data_start: u32 = exif_ifd_offset + 2 + (exif_count as u32) * 12 + 4; // 36 + 78 = 114
+
+        // Reserve space for data payloads placed sequentially starting at data_start.
+        let model_off = data_start;
+        let exp_off = model_off + model_bytes.len() as u32;
+        let fnum_off = exp_off + 8;
+        let date_off = fnum_off + 8;
+        let fl_off = date_off + date_bytes.len() as u32;
+        let lens_off = fl_off + 8;
+
+        let push_entry = |buf: &mut Vec<u8>, tag: u16, typ: u16, count: u32, val: u32| {
+            buf.extend_from_slice(&tag.to_be_bytes());
+            buf.extend_from_slice(&typ.to_be_bytes());
+            buf.extend_from_slice(&count.to_be_bytes());
+            buf.extend_from_slice(&val.to_be_bytes());
+        };
+
+        // Write IFD0
+        tiff.extend_from_slice(&ifd0_count.to_be_bytes());
+        push_entry(&mut tiff, 0x0110, 2, model_bytes.len() as u32, model_off);
+        push_entry(&mut tiff, 0x8769, 4, 1, exif_ifd_offset);
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(tiff.len() as u32, exif_ifd_offset);
+
+        // Write Exif IFD (sorted by tag ID per TIFF spec)
+        tiff.extend_from_slice(&exif_count.to_be_bytes());
+        push_entry(&mut tiff, 0x829A, 5, 1, exp_off); // ExposureTime: 1/250s
+        push_entry(&mut tiff, 0x829D, 5, 1, fnum_off); // FNumber: 20/10 = f/2.0
+        push_entry(&mut tiff, 0x8827, 3, 1, 400u32 << 16); // ISOSpeedRatings: SHORT(400) in upper 16 bits (BE)
+        push_entry(&mut tiff, 0x9003, 2, date_bytes.len() as u32, date_off); // DateTimeOriginal
+        push_entry(&mut tiff, 0x920A, 5, 1, fl_off); // FocalLength: 28/1 = 28mm
+        push_entry(&mut tiff, 0xA434, 2, lens_bytes.len() as u32, lens_off); // LensModel
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(tiff.len() as u32, data_start);
+
+        // Data area
+        tiff.extend_from_slice(model_bytes);
+        tiff.extend_from_slice(&1u32.to_be_bytes());
+        tiff.extend_from_slice(&250u32.to_be_bytes());
+        tiff.extend_from_slice(&20u32.to_be_bytes());
+        tiff.extend_from_slice(&10u32.to_be_bytes());
+        tiff.extend_from_slice(date_bytes);
+        tiff.extend_from_slice(&28u32.to_be_bytes());
+        tiff.extend_from_slice(&1u32.to_be_bytes());
+        tiff.extend_from_slice(lens_bytes);
+
+        // Splice APP1 ("Exif\0\0" + tiff) right after SOI.
+        let mut app1_payload = b"Exif\0\0".to_vec();
+        app1_payload.extend_from_slice(&tiff);
+        let seg_len = (app1_payload.len() + 2) as u16;
+
+        let mut out = Vec::with_capacity(base_jpg.len() + app1_payload.len() + 4);
+        out.extend_from_slice(&base_jpg[0..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&app1_payload);
+        out.extend_from_slice(&base_jpg[2..]);
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exif_extraction_reads_memory_and_disk_jpeg_metadata() {
+        let jpeg_bytes = build_synthetic_exif_jpeg();
+
+        let from_mem =
+            load_from_memory(&jpeg_bytes, "LeicaTest.jpg", "JPEG").expect("load memory jpeg");
+        let exif = from_mem.exif.expect("expected EXIF from memory JPEG");
+        assert_eq!(exif.camera_model.as_deref(), Some("Leica Q3"));
+        assert_eq!(exif.lens_model.as_deref(), Some("Summilux 28mm f/1.7"));
+        assert_eq!(exif.focal_length_mm, Some(28.0));
+        assert_eq!(exif.aperture_f, Some(2.0));
+        assert_eq!(exif.shutter_display.as_deref(), Some("1/250s"));
+        assert_eq!(exif.iso, Some(400));
+        assert_eq!(exif.date_taken.as_deref(), Some("2026:10:18 18:42:10"));
+        assert_eq!(exif.exposure_summary(), "28mm • f/2.0 • 1/250s • ISO 400");
+
+        let dir = unique_temp_dir("exif_disk");
+        let jpg_path = dir.join("leica.jpg");
+        fs::write(&jpg_path, &jpeg_bytes).expect("write exif jpeg");
+        let from_disk = load_file_proxy(&jpg_path, None).expect("load disk jpeg");
+        assert_eq!(from_disk.exif.as_ref(), Some(&exif));
+
+        // Plain PNG without EXIF should gracefully yield None.
+        let png_path = dir.join("plain.png");
+        write_top_red_bottom_blue_png(&png_path, 16, 16);
+        let plain = load_file_proxy(&png_path, None).expect("load plain png");
+        assert_eq!(plain.exif, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_webp_max_edge_and_output_sharpen_work_cleanly() {
+        let dir = unique_temp_dir("export_pro");
+        let width = 120u32;
+        let height = 60u32;
+
+        // Sharp vertical step-edge scene (left dark gray, right bright gray) to test sharpening + resize.
+        let mut rgba16f = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                let v = if x < width / 2 { 0.08 } else { 0.36 };
+                rgba16f.push(f16::from_f32(v));
+                rgba16f.push(f16::from_f32(v));
+                rgba16f.push(f16::from_f32(v));
+                rgba16f.push(f16::ONE);
+            }
+        }
+        let img = LinearImage {
+            width,
+            height,
+            histogram_proxy: build_histogram_proxy(&rgba16f, width, height),
+            rgba16f,
+            display_name: "StepEdge.dng".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+        };
+        let recipe = DevelopRecipe::default();
+
+        // 1. WebP export + max_edge downscale (120x60 -> 60x30)
+        let webp_path = dir.join("scaled.webp");
+        export_image_with_options(
+            &img,
+            &recipe,
+            &webp_path,
+            &ExportOptions {
+                format: ExportFormat::WebP,
+                max_edge: Some(60),
+                respect_crop: true,
+                output_sharpen: 0.0,
+            },
+        )
+        .expect("export webp");
+        let dec_webp = image::open(&webp_path).expect("decode webp");
+        assert_eq!(dec_webp.width(), 60);
+        assert_eq!(dec_webp.height(), 30);
+
+        // 2. Output sharpening increases local contrast right across the step edge.
+        let unsharp_off = dir.join("unsharp_off.png");
+        let unsharp_on = dir.join("unsharp_on.png");
+        export_image_with_options(
+            &img,
+            &recipe,
+            &unsharp_off,
+            &ExportOptions {
+                format: ExportFormat::Png16,
+                max_edge: None,
+                respect_crop: true,
+                output_sharpen: 0.0,
+            },
+        )
+        .expect("export unsharp off");
+        export_image_with_options(
+            &img,
+            &recipe,
+            &unsharp_on,
+            &ExportOptions {
+                format: ExportFormat::Png16,
+                max_edge: None,
+                respect_crop: true,
+                output_sharpen: 0.8,
+            },
+        )
+        .expect("export unsharp on");
+
+        let off = image::open(&unsharp_off).expect("decode off").to_rgb16();
+        let on = image::open(&unsharp_on).expect("decode on").to_rgb16();
+        let edge_diff_off = off.get_pixel(width / 2, height / 2)[0] as i32
+            - off.get_pixel(width / 2 - 1, height / 2)[0] as i32;
+        let edge_diff_on = on.get_pixel(width / 2, height / 2)[0] as i32
+            - on.get_pixel(width / 2 - 1, height / 2)[0] as i32;
+        assert!(
+            edge_diff_on > edge_diff_off + 1000,
+            "expected output_sharpen to boost edge contrast (off={edge_diff_off}, on={edge_diff_on})"
+        );
+        // Flat interior far from edge should be unchanged.
+        assert_eq!(
+            off.get_pixel(5, height / 2)[0],
+            on.get_pixel(5, height / 2)[0]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_respects_geometry_crop_rotate_flip_and_straighten_parity() {
+        use rune_editor_core::GeometryParams;
+
+        let dir = unique_temp_dir("export_geo");
+        // 80x40 4-quadrant test chart:
+        // Top-Left = Red, Top-Right = Green, Bottom-Left = Blue, Bottom-Right = White
+        let width = 80u32;
+        let height = 40u32;
+        let mut rgba16f = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let rgb = match (x < width / 2, y < height / 2) {
+                    (true, true) => [0.5, 0.01, 0.01],  // TL: Red
+                    (false, true) => [0.01, 0.5, 0.01], // TR: Green
+                    (true, false) => [0.01, 0.01, 0.5], // BL: Blue
+                    (false, false) => [0.5, 0.5, 0.5],  // BR: White
+                };
+                rgba16f.push(f16::from_f32(rgb[0]));
+                rgba16f.push(f16::from_f32(rgb[1]));
+                rgba16f.push(f16::from_f32(rgb[2]));
+                rgba16f.push(f16::ONE);
+            }
+        }
+        let img = LinearImage {
+            width,
+            height,
+            histogram_proxy: build_histogram_proxy(&rgba16f, width, height),
+            rgba16f,
+            display_name: "Quadrants.dng".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+        };
+
+        // 1. Crop to Top-Right quadrant (Green): [0.5, 0.0, 0.5, 0.5] -> 40x20
+        let crop_recipe = DevelopRecipe {
+            geometry: GeometryParams {
+                crop: [0.5, 0.0, 0.5, 0.5],
+                ..GeometryParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+        let crop_path = dir.join("crop_tr.png");
+        export_image(&img, &crop_recipe, &crop_path, ExportFormat::Png8).expect("export crop");
+        let dec_crop = image::open(&crop_path).expect("open crop").to_rgb8();
+        assert_eq!(dec_crop.dimensions(), (40, 20));
+        let px = dec_crop.get_pixel(20, 10);
+        assert!(
+            px[1] > 150 && px[0] < 60 && px[2] < 60,
+            "expected green TR crop, got {px:?}"
+        );
+
+        // 2. respect_crop = false bypasses crop and keeps full 80x40 dimensions.
+        let uncropped_path = dir.join("uncropped.png");
+        export_image_with_options(
+            &img,
+            &crop_recipe,
+            &uncropped_path,
+            &ExportOptions {
+                format: ExportFormat::Png8,
+                max_edge: None,
+                respect_crop: false,
+                output_sharpen: 0.0,
+            },
+        )
+        .expect("export uncropped");
+        let dec_uncropped = image::open(&uncropped_path).expect("open uncropped");
+        assert_eq!((dec_uncropped.width(), dec_uncropped.height()), (80, 40));
+
+        // 3. Rotate 90° CW: 80x40 -> 40x80; old BL (Blue) becomes new TL, old TL (Red) becomes new TR.
+        let rot_recipe = DevelopRecipe {
+            geometry: GeometryParams {
+                rotate_90: 1,
+                ..GeometryParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+        let rot_path = dir.join("rot90.png");
+        export_image(&img, &rot_recipe, &rot_path, ExportFormat::Png8).expect("export rot90");
+        let dec_rot = image::open(&rot_path).expect("open rot90").to_rgb8();
+        assert_eq!(dec_rot.dimensions(), (40, 80));
+        let tl = dec_rot.get_pixel(5, 5);
+        let tr = dec_rot.get_pixel(34, 5);
+        assert!(
+            tl[2] > 150 && tl[0] < 60,
+            "rot90 TL should be Blue, got {tl:?}"
+        );
+        assert!(
+            tr[0] > 150 && tr[2] < 60,
+            "rot90 TR should be Red, got {tr:?}"
+        );
+
+        // 4. Flip H + Flip V: TL (Red) and BR (White) swap; TR (Green) and BL (Blue) swap.
+        let flip_recipe = DevelopRecipe {
+            geometry: GeometryParams {
+                flip_h: true,
+                flip_v: true,
+                ..GeometryParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+        let flip_path = dir.join("flip_hv.png");
+        export_image(&img, &flip_recipe, &flip_path, ExportFormat::Png8).expect("export flip");
+        let dec_flip = image::open(&flip_path).expect("open flip").to_rgb8();
+        let tl = dec_flip.get_pixel(10, 5);
+        let br = dec_flip.get_pixel(70, 35);
+        assert!(
+            tl[0] > 150 && tl[1] > 150 && tl[2] > 150,
+            "flip_hv TL should be White, got {tl:?}"
+        );
+        assert!(
+            br[0] > 150 && br[1] < 60 && br[2] < 60,
+            "flip_hv BR should be Red, got {br:?}"
+        );
+
+        // 5. Straighten + degenerate crop safety (NaN/negative/overflow crop + straighten angle).
+        let straight_recipe = DevelopRecipe {
+            geometry: GeometryParams {
+                crop: [f32::NAN, -1.0, 0.0, 2.5],
+                straighten_deg: 15.0,
+                ..GeometryParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+        let straight_path = dir.join("straight.png");
+        export_image(&img, &straight_recipe, &straight_path, ExportFormat::Png8)
+            .expect("export degenerate crop + straighten");
+        let dec_straight = image::open(&straight_path).expect("open straight");
+        assert!(dec_straight.width() >= 1 && dec_straight.height() >= 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

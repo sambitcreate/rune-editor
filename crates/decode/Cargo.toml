@@ -16,7 +16,7 @@ rawler = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-core-foundation = { version = "0.3.2", features = ["CFBase", "CFData", "CFDictionary", "CFNumber", "CFString", "CFURL", "CFCGTypes"] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString", "CFURL", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage"] }
 objc2-core-image = { version = "0.3.2", features = ["CIContext", "CIFilter", "CIImage", "CIRAWFilter", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2-foundation = { version = "0.3.2", features = ["NSData", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "objc2-core-foundation"] }
