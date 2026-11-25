@@ -1,0 +1,11 @@
+[package]
+name = "rune-editor-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+rune-editor-core.workspace = true
+rune-editor-decode.workspace = true
+wgpu.workspace = true

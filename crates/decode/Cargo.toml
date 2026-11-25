@@ -1,0 +1,12 @@
+[package]
+name = "rune-editor-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+half.workspace = true
+image.workspace = true
+rune-editor-core.workspace = true
+thiserror.workspace = true
