@@ -3,9 +3,14 @@ name = "rune-editor-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+half.workspace = true
 rune-editor-core.workspace = true
 rune-editor-decode.workspace = true
-wgpu.workspace = true
+wgpu = { workspace = true, features = ["wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+wgpu = { workspace = true, features = ["wgsl", "metal"] }
