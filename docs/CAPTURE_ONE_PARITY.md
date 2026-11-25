@@ -22,23 +22,23 @@
 | # | Domain | Rune Darkroom Status | Key Shipped Strengths | Biggest Next Gaps |
 | :-: | :--- | :---: | :--- | :--- |
 | 1 | Base Characteristics & RAW Engine | 🟡 | macOS `CIRAWFilter` + `rawler` linear FP16 | Camera ICC / ProStandard profiles, Film Curves, Film Negative mode |
-| 2 | White Balance & Calibration | 🟡 | Temp & Tint linear matrix | Kelvin scale (800–14,000K), WB Eyedropper, Auto WB, Normalize, Match Look |
-| 3 | Exposure, HDR & Tone | ✅ / 🟡 | Exposure (`±4 EV`), Contrast, HDR H/S/W/B | Brightness slider, Auto Adjust, Viewer Exposure/Shadow clip overlays |
-| 4 | Levels & Tone Curves | 🟡 | Fritsch-Carlson Luma/R/G/B Curves (`256×1` LUT) | RGB Curve tab, Curve eyedroppers, dedicated Levels tool (In/Out/Auto/Target) |
-| 5 | Color Balance, Color Editor & B&W | 🟡 | 3-Way Color Wheels + 8-Band HSL | Master wheel, Advanced arbitrary color range + Uniformity, Skin Tone, B&W 6-channel |
-| 6 | Clarity, Dehaze & Vignetting | 🟡 | Spatial Clarity + Optical Vignette | Clarity Methods (Natural/Punch/Neutral/Classic) + Structure, Dehaze, Crop-aware Vignette |
+| 2 | White Balance & Calibration | 🟡 | Temp/Tint, WB Eyedropper (`3×3`), Auto WB (`A`) | Kelvin scale (800–14,000K), WB presets, Normalize, Match Look |
+| 3 | Exposure, HDR & Tone | ✅ | Exposure (`±4 EV`), Contrast, **Brightness**, HDR H/S/W/B, Auto Tone (`A`), **Exposure/Shadow Clipping Overlay (`⌘E`)** | Configurable Auto checklist, RAW single-channel highlight reconstruction |
+| 4 | Levels & Tone Curves | 🟡 | **Levels** (In/Out + Auto 0.1% clip + histogram strip), Fritsch-Carlson Luma/R/G/B Curves (`256×1` LUT) | Per-channel R/G/B Levels, RGB Curve tab, Curve eyedroppers |
+| 5 | Color Balance, Color Editor & B&W | 🟡 | 3-Way Color Wheels, 8-Band HSL, **6-Channel Black & White Mixer** | Master wheel, Advanced arbitrary color range + Uniformity, Skin Tone, B&W Split Tones |
+| 6 | Clarity, Dehaze & Vignetting | 🟡 | Spatial Clarity, **Structure**, **Dehaze**, Optical Vignette | Clarity Methods (Natural/Punch/Neutral/Classic), Dehaze shadow tone picker, Crop-aware Vignette |
 | 7 | Detail, Noise, Grain & Artifacts | 🟡 | Unsharp Sharpen, Chroma/Luma NR, Film Grain | Radius/Threshold/Halo Suppression, AI Enhanced Denoise, 6 Grain types, Moiré, Purple Fringing, Dust Removal |
 | 8 | Lens Correction & LCC | ⬜ | — | Lensfun/Manufacturer profiles, CA, Distortion, Diffraction, LCC flat-field |
-| 9 | Composition & Geometry | 🟡 | GPU Zoom / Pan / Two-finger Rotate | Interactive Crop + aspect ratios + Grid/Guides, Straighten, Keystone 4-point |
+| 9 | Composition & Geometry | 🟡 | **Interactive Crop** (7 aspect presets, drag handles), **Straighten (`±45°`)**, **90° Rotate / Flip H/V**, **Composition Grids** (Thirds/Golden/Diag), 120Hz Zoom/Pan | Keystone 4-point perspective, AI Crop, Auto Rotate, Custom Ratios |
 | 10 | Multi-Image Computational | ⬜ | — | HDR Merge (linear DNG), Panorama Stitch, Focus Stacking |
 | 11 | Layers, Masks & Local Adjustments | ⬜ | — | Adjustment Layers (up to 16), Brush/Magic Brush, Linear/Radial/Luma Masks, Combine Masks, Heal/Clone |
 | 12 | AI Masking & Portrait Retouching | ⬜ | — | Apple Neural Engine (`objc2-vision`) Subject/Background/People masks, Face/Eye/Teeth/Hair Retouch |
 | 13 | Sessions, Catalogs, Variants & Stacks | 🟡 | Folder Session catalog, `.rune-edit.json` sidecars, Copy/Paste Look | Full Capture/Selects/Output/Trash Session folders, Virtual Variants, Selective Adjustments Clipboard, Catalogs |
-| 14 | Culling, Ratings, Filters & Search | 🟡 | Filmstrip, 0–5★ ratings, Pick/Reject flags, `All/Picks/★3+` filter, `←`/`→` prefetch | 7 Color Tags, Focus Mask, Group Similar, Compare Variant, Advanced Boolean Search |
-| 15 | Metadata, Keywords & Naming | ⬜ | Basic file resolution/format HUD | EXIF/IPTC editor, XMP sidecar sync, Hierarchical Keywords, Dynamic Naming Tokens, Batch Rename |
-| 16 | Styles, Presets, Speed Edit & Automation | 🟡 | 6 Built-in Styles, native macOS menus & shortcuts | User Styles/Presets, Stacked Styles, Style Brushes, **Speed Edit** (key+drag), Custom Workspaces |
-| 17 | Viewer, Scopes & Proofing | 🟡 | Live anti-aliased RGB+Luma Histogram, Before/After Split, 120Hz Metal | Pinned RGB/Lab/HSL Color Readouts, Loupe, Focus Mask, Soft-Proofing, Display P3 & XDR/EDR |
-| 18 | Export, Recipes, External Edit & Print | 🟡 | `rayon` parallel 8/16-bit JPEG/PNG/TIFF export (GPU-parity) | Multi-Recipe batch queue, Resizing/Output Sharpening, Watermarks, ICC conversion, Edit With, Contact Sheets, Print |
+| 14 | Culling, Ratings, Filters & Search | 🟡 | Filmstrip, 0–5★ ratings, Pick/Reject flags, `All/Picks/★3+` filter, `←`/`→` prefetch, **Focus Mask (`⌘M`)** | 7 Color Tags, Group Similar, Compare Variant, Advanced Boolean Search |
+| 15 | Metadata, Keywords & Naming | 🟡 | **macOS ImageIO EXIF telemetry** (camera, lens, focal, f-stop, shutter, ISO) in status bar | IPTC editor, XMP sidecar sync, Hierarchical Keywords, Dynamic Naming Tokens, Batch Rename |
+| 16 | Styles, Presets, Speed Edit & Automation | 🟡 | 6 Built-in Styles, **Speed Edit** (hold hotkey + drag/scroll + HUD), native macOS menus, centralized `tokens.rs` | User Styles/Presets, Stacked Styles, Style Brushes, Custom Workspaces, Shortcut Remapping |
+| 17 | Viewer, Scopes & Proofing | 🟡 | Live RGB+Luma Histogram, **Live RGB/HSL/Lab Color Readout**, **Clipping Warning**, **Focus Mask**, Before/After Split, 120Hz Metal | Pinned readout markers, Loupe, Soft-Proofing, Display P3 & XDR/EDR |
+| 18 | Export, Recipes, External Edit & Print | 🟡 | `rayon` parallel **JPEG/PNG-8/PNG-16/TIFF-16/WebP** export with **Crop/Rotate/Flip**, **Long-Edge Resize**, **Output Sharpen** | Multi-Recipe batch queue, Watermarks, ICC conversion, Edit With, Contact Sheets, Print |
 | 19 | Tethering, Live View, Collaboration & Studio | ⬜ / ➖ | — | Hot Folder watch, USB/Wi-Fi Tethering, Live View, Overlay, LAN/Web Client Review |
 
 > **Where Rune Darkroom Aims to Leapfrog Capture One:**
@@ -322,12 +322,13 @@
 
 If you want to close the highest-impact gaps for real-world photographers fastest (and great places for community PRs!):
 
-### Tier 1 — Daily-Driver Photographer Essentials
-1. **Interactive Crop, Straighten & Composition Grid (`Rule of Thirds` / `Golden Ratio`)** + persistent Rotation/Flip in `DevelopRecipe` & `develop.wgsl`.
-2. **EXIF / Camera Metadata Readout** (Camera model, Lens, Focal Length, Aperture, Shutter, ISO) in the Status Bar & Inspector.
-3. **White Balance Eyedropper + Kelvin Scale + Auto WB / Auto Exposure**.
-4. **Speed Edit (Key + Drag / Scroll)** (`Q` Exposure, `W` Contrast, `A` Highlights, `S` Shadows, `1`/`2` Temp/Tint).
-5. **Viewer Overlays & Probes:** Exposure/Shadow Clipping Warning overlay, **Focus Mask**, and **Live RGB / HSL / Lab Color Readout** under cursor.
+### Tier 1 — Daily-Driver Photographer Essentials (Completed!)
+1. ✅ **Interactive Crop, Straighten & Composition Grid (`Rule of Thirds` / `Golden Ratio` / `Diagonal`)** + persistent Rotation/Flip in `DevelopRecipe`, `develop.wgsl`, and export.
+2. ✅ **EXIF / Camera Metadata Readout** (Camera model, Lens, Focal Length, Aperture, Shutter, ISO via macOS `ImageIO`) in the Status Bar.
+3. ✅ **White Balance Eyedropper (`3×3` patch) + Auto WB + Auto Exposure/Tone + Auto Levels (0.1% clip)**.
+4. ✅ **Speed Edit (Key + Drag / Scroll)** (`Q` Exposure, `W` Contrast, `E` Brightness, `R` Saturation, `A` Highlights, `S` Shadows, `D` Whites, `Z` Clarity, `T` Temp, `Y` Tint + floating HUD).
+5. ✅ **Viewer Overlays & Probes:** Exposure/Shadow Clipping Warning (`⌘E`), **Focus Mask (`⌘M`)**, and **Live RGB / HSL / Lab Color Readout** under cursor.
+6. ✅ **Levels, Brightness, Structure, Dehaze, 6-Channel Black & White Mixer**, plus **WebP / Resize / Output Sharpening** export.
 
 ### Tier 2 — Signature Capture One Color & Workflow Depth
 6. **Levels Tool** (`RGB`, `R`, `G`, `B` Input/Output + Auto + Pickers) + **Brightness** + **Structure** + **Dehaze** + **6-Channel Black & White**.
