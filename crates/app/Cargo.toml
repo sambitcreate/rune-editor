@@ -3,6 +3,11 @@ name = "rune-editor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
@@ -11,4 +16,5 @@ rune-editor-core.workspace = true
 rune-editor-decode.workspace = true
 rune-editor-engine.workspace = true
 rune-kit.workspace = true
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "0d2cad27f83747120156c8406f6ecfd2a018bd39" }
 wgpu.workspace = true

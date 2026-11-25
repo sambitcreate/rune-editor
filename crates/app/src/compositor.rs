@@ -29,9 +29,10 @@ impl Compositor<AppState> for DarkroomCompositor {
         let image = f.rt.state.image.clone();
         gpu.ensure_image_uploaded(f.device, f.queue, generation, &image);
 
-        // Pre-compute the viewport slot rect and write uniforms ahead of the render pass
-        // so zero extra command buffers are created mid-pass.
+        // Pre-compute the viewport slot rect and write uniforms + 256x1 tone curve LUT
+        // ahead of the render pass so zero extra command buffers are created mid-pass.
         let recipe = f.rt.state.recipe.clone();
+        gpu.ensure_curve_lut_uploaded(f.queue, &recipe);
         let camera = f.rt.state.camera;
         let srgb_blend = f.srgb_blend();
         let image_size = gpu.image_size();
