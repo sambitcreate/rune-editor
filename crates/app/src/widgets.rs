@@ -2,7 +2,8 @@
 //! centralized Anomaly OpenCode tokens (`crate::tokens`).
 
 use rune::{
-    Color, Cursor, Drag, El, LineCap, Phase, ScrollSpec, Shape, Tx, col, el, icon, row, text,
+    Color, Cursor, Drag, El, Key, KeyEvent, LineCap, Phase, ScrollSpec, Shape, Tx, col, el, icon,
+    row, text,
 };
 use rune_editor_core::{
     BlackAndWhiteParams, ColorWheel, CompositionGrid, CropAspect, DevelopRecipe, HISTOGRAM_BINS,
@@ -10,7 +11,7 @@ use rune_editor_core::{
 };
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl,
-    Slider, Switch,
+    Switch,
 };
 use rune_theme_opencode::icons;
 
@@ -318,7 +319,165 @@ fn mini_auto_btn(
         .on_press_tx(on_press)
 }
 
-/// Unified OpenCode photographic slider with click-to-reset label and tabular mono readout.
+/// Maps a normalized `[0, 1]` scrub position into `min..=max` with a subtle
+/// magnetic zero detent around `reset_val` for effortless neutral resets.
+#[inline]
+fn capsule_value_from_norm(norm: f32, min: f32, max: f32, reset_val: f32) -> f32 {
+    let span = max - min;
+    if !span.is_finite() || span <= 0.0 {
+        return min;
+    }
+    let n = norm.clamp(0.0, 1.0);
+    let reset_norm = ((reset_val - min) / span).clamp(0.0, 1.0);
+    if reset_norm > 0.02 && reset_norm < 0.98 && (n - reset_norm).abs() < 0.016 {
+        return reset_val;
+    }
+    (min + n * span).clamp(min, max)
+}
+
+/// Core token-driven monochrome Scrubbable Capsule slider (no protruding knob;
+/// entire row is horizontally scrubbable, double-click resets to `reset_val`).
+#[allow(clippy::too_many_arguments)]
+fn capsule_slider_el(
+    k: &Kit,
+    key: String,
+    a11y_label: String,
+    height: f32,
+    width: f32,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    value_fmt: String,
+    reset_val: f32,
+    content_row: El,
+    refresh_histogram: bool,
+    setter: impl Fn(&mut DevelopRecipe, f32) + Copy + 'static,
+) -> El {
+    let min = *range.start();
+    let max = *range.end();
+    let span = (max - min).max(1e-6);
+    let norm = ((value - min) / span).clamp(0.0, 1.0);
+    let reset_norm = ((reset_val - min) / span).clamp(0.0, 1.0);
+    let bipolar = reset_norm > 0.02 && reset_norm < 0.98;
+    let modified = (value - reset_val).abs() > (span * 0.0025);
+
+    // Bipolar sliders grow strictly from center `reset_norm` (clean empty capsule at 0);
+    // unipolar sliders grow cleanly from the left edge (`0.0`).
+    let origin_norm = if bipolar { reset_norm } else { 0.0 };
+    let fill_left = norm.min(origin_norm) * width;
+    let fill_w = ((norm - origin_norm).abs() * width).max(0.0);
+    let edge_x = (norm * width - size::CAPSULE_EDGE_W * 0.5)
+        .clamp(0.0, (width - size::CAPSULE_EDGE_W).max(0.0));
+    let kbd_step = (f64::from(span) / 40.0).max(1e-4);
+
+    let mut capsule = el()
+        .key(key)
+        .role("slider")
+        .label(a11y_label)
+        .help("Drag horizontally to adjust • Double-click to reset")
+        .range_value(f64::from(value), f64::from(min), f64::from(max))
+        .range_step(kbd_step)
+        .a11y_value(value_fmt)
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::ResizeColumn)
+        .w(width)
+        .h(height)
+        .radius(k.radius.lg)
+        .fill(color::capsule_bg(k))
+        .hover(color::capsule_hover(k))
+        .border(border::HAIRLINE, k.c.border_base)
+        .clip_rounded(k.radius.lg);
+
+    // Subtle vertical center detent tick for bipolar sliders.
+    if bipolar {
+        let center_x = (reset_norm * width - size::CAPSULE_ZERO_TICK_W * 0.5).max(0.0);
+        capsule = capsule.child(
+            el().absolute(center_x, space::XS)
+                .size(size::CAPSULE_ZERO_TICK_W, (height - space::MD).max(2.0))
+                .fill(color::capsule_zero_tick(k))
+                .a11y_hidden(),
+        );
+    }
+
+    // Internal monochrome fill bar + crisp leading edge highlight when non-empty.
+    if fill_w >= 0.75 && (bipolar || modified) {
+        capsule = capsule
+            .child(
+                el().absolute(fill_left, 0.0)
+                    .size(fill_w, height)
+                    .fill(color::capsule_fill(k))
+                    .a11y_hidden(),
+            )
+            .child(
+                el().absolute(edge_x, 0.0)
+                    .size(size::CAPSULE_EDGE_W, height)
+                    .fill(color::capsule_edge(k))
+                    .a11y_hidden(),
+            );
+    }
+
+    let apply = move |s: &mut AppState, tx: &mut Tx, v: f32, done: bool| {
+        if refresh_histogram {
+            s.update_slider_tx(done, tx, |r| setter(r, v));
+        } else {
+            s.update_geometry_slider_tx(done, tx, |r| setter(r, v));
+        }
+    };
+
+    capsule
+        .child(content_row)
+        .on_drag(move |s: &mut AppState, d: &mut Drag, tx: &mut Tx| {
+            // Native AppKit double-click resets cleanly to default value.
+            if d.clicks >= 2 {
+                if d.phase == Phase::Down {
+                    apply(s, tx, reset_val, true);
+                }
+                return;
+            }
+            let w = d.w.max(1.0);
+            let next = capsule_value_from_norm(d.x / w, min, max, reset_val);
+            match d.phase {
+                Phase::Down | Phase::Move => apply(s, tx, next, false),
+                Phase::Up => apply(s, tx, next, true),
+            }
+        })
+        .on_key(move |s: &mut AppState, ev: &KeyEvent, tx: &mut Tx| {
+            let step = if ev.mods.shift {
+                span * 0.1
+            } else {
+                span * 0.025
+            };
+            match &ev.key {
+                Key::Left | Key::Down => {
+                    apply(s, tx, (value - step).clamp(min, max), true);
+                    true
+                }
+                Key::Right | Key::Up => {
+                    apply(s, tx, (value + step).clamp(min, max), true);
+                    true
+                }
+                Key::Backspace | Key::Delete => {
+                    apply(s, tx, reset_val, true);
+                    true
+                }
+                Key::Home => {
+                    apply(s, tx, min, true);
+                    true
+                }
+                Key::End => {
+                    apply(s, tx, max, true);
+                    true
+                }
+                _ => false,
+            }
+        })
+}
+
+/// Unified OpenCode Scrubbable Capsule photographic slider with tabular mono readout.
 #[allow(clippy::too_many_arguments)]
 fn develop_slider_inner(
     k: &Kit,
@@ -335,7 +494,7 @@ fn develop_slider_inner(
     let key_str = key.into();
     let modified = (value - reset_val).abs() > 0.005;
 
-    let mut label_row = row().items_center().gap(space::TIGHT);
+    let mut label_row = row().items_center().gap(space::SM);
     if let Some(col_dot) = dot_color {
         label_row = label_row.child(
             el().size(size::CHANNEL_DOT, size::CHANNEL_DOT)
@@ -344,57 +503,39 @@ fn develop_slider_inner(
                 .a11y_hidden(),
         );
     }
-    label_row = label_row.child(text(label).font(ty::control_label(k)).color(k.c.text_base));
+    label_row = label_row.child(text(label).font(ty::control_label(k)).color(if modified {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    }));
 
-    let header = row()
+    let content_row = row()
         .w_full()
-        .justify_between()
+        .h_full()
+        .px(space::LG)
         .items_center()
-        .child(
-            el().role("button")
-                .label(format!("Reset {label}"))
-                .help(format!("Click to reset {label}"))
-                .focusable(true)
-                .focus_ring(border::FOCUS_RING, border::FOCUS_OFFSET, k.c.border_focus)
-                .radius(k.radius.xs)
-                .cursor(Cursor::Pointer)
-                .child(label_row)
-                .on_press_tx(move |s: &mut AppState, tx| {
-                    if refresh_histogram {
-                        s.update_slider_tx(true, tx, |r| setter(r, reset_val));
-                    } else {
-                        s.update_geometry_slider_tx(true, tx, |r| setter(r, reset_val));
-                    }
-                }),
-        )
+        .justify_between()
+        .child(label_row)
         .child(text(&value_fmt).font(ty::mono_value(k)).color(if modified {
-            k.c.text_accent
+            k.c.text_base
         } else {
             k.c.text_muted
         }));
 
-    let slider = Slider::new(format!("{key_str}-slider"), value)
-        .range(range)
-        .label(label)
-        .hide_label()
-        .value_text(value_fmt)
-        .control_size(ControlSize::Mini)
-        .width(size::CARD_INNER_W)
-        .on_change_tx(move |s: &mut AppState, v: f32, done: bool, tx| {
-            if refresh_histogram {
-                s.update_slider_tx(done, tx, |r| setter(r, v));
-            } else {
-                s.update_geometry_slider_tx(done, tx, |r| setter(r, v));
-            }
-        })
-        .build(k);
-
-    col()
-        .key(key_str)
-        .w_full()
-        .gap(space::XXS)
-        .child(header)
-        .child(slider)
+    capsule_slider_el(
+        k,
+        key_str,
+        label.to_owned(),
+        size::CAPSULE_SLIDER_H,
+        size::CARD_INNER_W,
+        value,
+        range,
+        value_fmt,
+        reset_val,
+        content_row,
+        refresh_histogram,
+        setter,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -994,27 +1135,39 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
             });
         });
 
-    let luma_slider = Slider::new(format!("{}-luma", slot.key()), wheel.luma)
-        .range(-1.0..=1.0)
-        .label(format!("{} luminance", slot.title()))
-        .hide_label()
-        .value_text(format!("{:+.2}", wheel.luma))
-        .control_size(ControlSize::Mini)
-        .width(diameter)
-        .on_change_tx(move |s: &mut AppState, v: f32, done: bool, tx| {
-            s.update_slider_tx(done, tx, |r| {
-                slot.get_mut(r).luma = v;
-            });
-        })
-        .build(k);
+    let luma_fmt = format!("Y {:+.2}", wheel.luma);
+    let luma_modified = wheel.luma.abs() > 0.005;
+    let luma_content =
+        row()
+            .w_full()
+            .h_full()
+            .center()
+            .child(
+                text(&luma_fmt)
+                    .font(ty::mono_micro(k))
+                    .color(if luma_modified {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    }),
+            );
 
-    let luma_readout = text(format!("Y {:+.2}", wheel.luma))
-        .font(ty::mono_micro(k))
-        .color(if wheel.luma.abs() > 0.005 {
-            k.c.text_accent
-        } else {
-            k.c.text_faint
-        });
+    let luma_slider = capsule_slider_el(
+        k,
+        format!("{}-luma", slot.key()),
+        format!("{} luminance", slot.title()),
+        size::MINI_CAPSULE_SLIDER_H,
+        diameter,
+        wheel.luma,
+        -1.0..=1.0,
+        luma_fmt,
+        0.0,
+        luma_content,
+        true,
+        move |r, v| {
+            slot.get_mut(r).luma = v;
+        },
+    );
 
     col()
         .key(slot.key())
@@ -1024,7 +1177,6 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
         .child(title_btn)
         .child(disc)
         .child(luma_slider)
-        .child(luma_readout)
 }
 
 /// Capture One-style 3-Way Color Balance Wheels (Shadows / Midtones / Highlights).

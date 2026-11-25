@@ -82,6 +82,10 @@ pub mod size {
     pub const PILL_H: f32 = 24.0;
     pub const ASPECT_PILL_H: f32 = 26.0;
     pub const ACTION_PILL_H: f32 = 28.0;
+    pub const CAPSULE_SLIDER_H: f32 = 30.0;
+    pub const MINI_CAPSULE_SLIDER_H: f32 = 22.0;
+    pub const CAPSULE_ZERO_TICK_W: f32 = 1.0;
+    pub const CAPSULE_EDGE_W: f32 = 1.0;
     pub const MINI_AUTO_BTN: f32 = 20.0;
 
     pub const CURVE_PT: f32 = 8.0;
@@ -247,6 +251,32 @@ pub mod color {
         } else {
             k.c.border_base
         }
+    }
+
+    // Scrubbable Capsule slider tokens (monochrome neutral OpenCode discipline)
+    #[inline]
+    pub fn capsule_bg(k: &Kit) -> Color {
+        k.c.bg_base
+    }
+
+    #[inline]
+    pub fn capsule_hover(k: &Kit) -> Color {
+        k.c.layer_02
+    }
+
+    #[inline]
+    pub fn capsule_fill(k: &Kit) -> Color {
+        k.c.white.alpha(0.13)
+    }
+
+    #[inline]
+    pub fn capsule_edge(k: &Kit) -> Color {
+        k.c.white.alpha(0.24)
+    }
+
+    #[inline]
+    pub fn capsule_zero_tick(k: &Kit) -> Color {
+        k.c.white.alpha(0.10)
     }
 
     #[inline]
