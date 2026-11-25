@@ -24,37 +24,21 @@ impl Compositor<AppState> for DarkroomCompositor {
             return;
         };
 
-        // Upload linear Rgba16Float photo texture once per image generation.
+        // Upload linear Rgba16Float photo texture once per image generation and 256x1 curve LUT
+        // only when tone curve points change.
         let generation = f.rt.state.image_generation;
-        let image = f.rt.state.image.clone();
-        gpu.ensure_image_uploaded(f.device, f.queue, generation, &image);
+        gpu.ensure_image_uploaded(f.device, f.queue, generation, &f.rt.state.image);
+        gpu.ensure_curve_lut_uploaded(f.queue, &f.rt.state.recipe);
 
-        // Pre-compute the viewport slot rect and write uniforms + 256x1 tone curve LUT
-        // ahead of the render pass so zero extra command buffers are created mid-pass.
-        let recipe = f.rt.state.recipe.clone();
-        gpu.ensure_curve_lut_uploaded(f.queue, &recipe);
-        let camera = f.rt.state.camera;
-        let srgb_blend = f.srgb_blend();
-        let image_size = gpu.image_size();
-        let target_size = [f.size.0, f.size.1];
-
-        let slot_rect = f
-            .rt
-            .instances
-            .iter()
-            .find(|inst| inst.params[1] as u32 == 6 && inst.uv[0].to_bits() == PHOTO_VIEWPORT_MARK)
-            .map(|inst| inst.rect)
-            .unwrap_or([0.0, 0.0, f.size.0 as f32, f.size.1 as f32]);
-
-        let uniforms = DevelopUniforms::build(
-            slot_rect,
-            target_size,
-            image_size,
-            &camera,
-            &recipe,
-            srgb_blend,
+        // Pre-build Copy uniform block by borrowing recipe (zero per-frame heap allocations).
+        let base_uniforms = DevelopUniforms::build(
+            [0.0; 4],
+            [f.size.0, f.size.1],
+            gpu.image_size(),
+            &f.rt.state.camera,
+            &f.rt.state.recipe,
+            f.srgb_blend(),
         );
-        f.write_buffer(gpu.uniform_buffer(), 0, bytemuck::bytes_of(&uniforms));
 
         let device = f.device;
         let queue = f.queue;
@@ -66,21 +50,16 @@ impl Compositor<AppState> for DarkroomCompositor {
             if site.mark != PHOTO_VIEWPORT_MARK {
                 return;
             }
-            // Update uniforms with exact pass-local slot rect if inside an isolated layer or shifted origin.
-            let local_rect = [
+            let mut site_uniforms = base_uniforms;
+            site_uniforms.slot_rect = [
                 site.instance.rect[0] - site.origin[0],
                 site.instance.rect[1] - site.origin[1],
                 site.instance.rect[2],
                 site.instance.rect[3],
             ];
-            let site_uniforms = DevelopUniforms::build(
-                local_rect,
-                site.size,
-                image_size,
-                &camera,
-                &recipe,
-                site.srgb_blend,
-            );
+            site_uniforms.dims[0] = site.size[0] as f32;
+            site_uniforms.dims[1] = site.size[1] as f32;
+            site_uniforms.flags[3] = if site.srgb_blend { 1.0 } else { 0.0 };
             queue.write_buffer(gpu.uniform_buffer(), 0, bytemuck::bytes_of(&site_uniforms));
             gpu.draw(device, site.format, pass);
         });

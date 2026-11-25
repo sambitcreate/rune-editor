@@ -45,7 +45,7 @@ pub fn trigger_export_dialog(s: &AppState, tx: &mut Tx) {
         .as_deref()
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Alpine_Twilight_HDR".to_owned());
+        .unwrap_or_else(|| "Editorial_Portrait".to_owned());
 
     let options = FileDialogOptions {
         title: "Export Developed Photo".into(),
@@ -53,6 +53,7 @@ pub fn trigger_export_dialog(s: &AppState, tx: &mut Tx) {
         ..Default::default()
     }
     .filter("JPEG Image", &["jpg", "jpeg"])
+    .filter("WebP Image", &["webp"])
     .filter("16-bit PNG", &["png"])
     .filter("16-bit TIFF", &["tiff", "tif"]);
 
@@ -64,12 +65,15 @@ pub fn trigger_export_dialog(s: &AppState, tx: &mut Tx) {
 }
 
 /// Builds the full native macOS menu bar snapshot (App, File, Edit, View).
-/// Standard Window menu items (`Minimize ⌘M`, `Close ⌘W`) are installed by `App::standard_menus()`.
+/// Standard Window menu items (`Close ⌘W`) are installed by `App::standard_menus()`.
 pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
     let can_undo = s.history.can_undo();
     let can_redo = s.history.can_redo();
     let has_clipboard = s.catalog.has_clipboard();
     let is_split = s.camera.split_compare;
+    let exposure_warning = s.camera.exposure_warning;
+    let focus_mask = s.camera.focus_mask;
+    let crop_mode = s.camera.crop_mode;
     let show_filmstrip = s.show_filmstrip;
     let show_inspector = s.show_inspector;
 
@@ -167,6 +171,30 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .key_equivalent(sc("backslash"))
         .keys_first()
         .checked(is_split),
+        MenuItem::new("Exposure Clipping Warning", |s: &mut AppState, tx| {
+            s.toggle_exposure_warning_tx(tx)
+        })
+        .id("view-exposure-warning")
+        .menu("View")
+        .key_equivalent(sc("cmd+e"))
+        .keys_first()
+        .checked(exposure_warning),
+        MenuItem::new("Focus Mask", |s: &mut AppState, tx| {
+            s.toggle_focus_mask_tx(tx)
+        })
+        .id("view-focus-mask")
+        .menu("View")
+        .key_equivalent(sc("cmd+m"))
+        .keys_first()
+        .checked(focus_mask),
+        MenuItem::new("Crop & Geometry Mode", |s: &mut AppState, tx| {
+            s.toggle_crop_mode_tx(tx)
+        })
+        .id("view-crop-mode")
+        .menu("View")
+        .key_equivalent(sc("c"))
+        .keys_first()
+        .checked(crop_mode),
         MenuItem::separator().menu("View"),
         MenuItem::new("Toggle Filmstrip", |s: &mut AppState, tx| {
             s.show_filmstrip = !s.show_filmstrip;

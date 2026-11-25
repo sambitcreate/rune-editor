@@ -14,8 +14,7 @@ use rune_theme_opencode::icons;
 
 use crate::menu::trigger_open_folder;
 use crate::state::AppState;
-
-pub const FILMSTRIP_HEIGHT: f32 = 160.0;
+use crate::tokens::{border, color, radius, size, space, ty};
 
 pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
     let (total, picks, _rejects) = s.catalog.counts();
@@ -52,23 +51,26 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
     let header = row()
         .key("filmstrip-header")
         .w_full()
-        .h(34.0)
-        .px(12.0)
+        .h(size::FILMSTRIP_HEADER_H)
+        .px(space::XL)
         .items_center()
         .justify_between()
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
+        .border_sides(
+            [border::NONE, border::NONE, border::REGULAR, border::NONE],
+            k.c.border_muted,
+        )
         .child(
             row()
                 .items_center()
-                .gap(8.0)
+                .gap(space::MD)
                 .child(
-                    icon(&icons::FOLDER, 13.0)
+                    icon(&icons::FOLDER, size::ICON_MD)
                         .color(k.c.icon_muted)
                         .a11y_hidden(),
                 )
                 .child(
                     text(title_str)
-                        .font(k.ty.text_xsmall_medium)
+                        .font(ty::control_label_medium(k))
                         .color(k.c.text_base),
                 )
                 .child(
@@ -86,7 +88,7 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
         .child(
             row()
                 .items_center()
-                .gap(6.0)
+                .gap(space::SM)
                 .child(
                     Button::new("Open Folder…")
                         .variant(ButtonVariant::GhostMuted)
@@ -114,17 +116,21 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
     let mut strip = row()
         .key("filmstrip-items")
         .items_center()
-        .gap(10.0)
-        .px(12.0)
-        .py(8.0);
+        .gap(space::LG)
+        .px(space::XL)
+        .py(space::MD);
 
     if visible.is_empty() {
         strip = strip.child(
-            row().h(92.0).px(16.0).items_center().child(
-                text("No photos match this filter — press All to show every frame")
-                    .font(k.ty.text_xsmall)
-                    .color(k.c.text_muted),
-            ),
+            row()
+                .h(size::THUMB_EMPTY_H)
+                .px(space::HUD_Y)
+                .items_center()
+                .child(
+                    text("No photos match this filter — press All to show every frame")
+                        .font(ty::control_label(k))
+                        .color(k.c.text_muted),
+                ),
         );
     } else {
         for idx in visible {
@@ -145,9 +151,12 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
         .role("region")
         .label("Photo filmstrip")
         .w_full()
-        .h(FILMSTRIP_HEIGHT)
+        .h(size::FILMSTRIP_H)
         .fill(k.c.bg_deep)
-        .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_base)
+        .border_sides(
+            [border::REGULAR, border::NONE, border::NONE, border::NONE],
+            k.c.border_base,
+        )
         .child(header)
         .child(scroll_strip)
 }
@@ -166,41 +175,47 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
         .unwrap_or_else(|| format!("Photo {}", idx + 1));
 
     let mut preview = el()
-        .w(140.0)
-        .h(74.0)
+        .w(size::THUMB_PREVIEW_W)
+        .h(size::THUMB_PREVIEW_H)
         .radius(k.radius.sm)
         .fill(k.c.layer_01)
-        .border(0.5, k.c.border_muted);
+        .border(border::HAIRLINE, k.c.border_muted);
 
     if let Some(px) = s.thumbnails.get(&entry.path) {
         preview = preview.pixels_fit(px, SurfaceFit::Fill);
     }
 
-    // Top-right Pick / Reject badge overlay
     if picked {
         preview = preview.child(
             row()
-                .pin(None, Some(4.0), Some(4.0), None)
-                .size(16.0, 16.0)
+                .pin(None, Some(space::XS), Some(space::XS), None)
+                .size(size::FLAG_BADGE, size::FLAG_BADGE)
                 .center()
-                .radius(8.0)
+                .radius(radius::circle(size::FLAG_BADGE))
                 .fill(k.c.success.fg)
-                .child(icon(&icons::CHECK, 10.0).color(k.c.black).a11y_hidden()),
+                .child(
+                    icon(&icons::CHECK, size::ICON_XS)
+                        .color(k.c.black)
+                        .a11y_hidden(),
+                ),
         );
     } else if rejected {
         preview = preview.child(
             row()
-                .pin(None, Some(4.0), Some(4.0), None)
-                .size(16.0, 16.0)
+                .pin(None, Some(space::XS), Some(space::XS), None)
+                .size(size::FLAG_BADGE, size::FLAG_BADGE)
                 .center()
-                .radius(8.0)
+                .radius(radius::circle(size::FLAG_BADGE))
                 .fill(k.c.danger.fg)
-                .child(icon(&icons::CLOSE, 10.0).color(k.c.white).a11y_hidden()),
+                .child(
+                    icon(&icons::CLOSE, size::ICON_XS)
+                        .color(k.c.white)
+                        .a11y_hidden(),
+                ),
         );
     }
 
-    // Compact interactive 5-star rating row
-    let mut stars = row().items_center().gap(1.0);
+    let mut stars = row().items_center().gap(space::MICRO);
     for star in 1..=5u8 {
         let filled = star <= rating;
         stars = stars.child(
@@ -208,10 +223,10 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
                 .role("button")
                 .label(format!("Rate {name} {star} stars"))
                 .cursor(Cursor::Pointer)
-                .px(1.0)
+                .px(space::MICRO)
                 .child(
                     text(if filled { "★" } else { "☆" })
-                        .font(k.ty.small)
+                        .font(ty::caption(k))
                         .color(if filled {
                             k.c.warning.fg
                         } else {
@@ -227,10 +242,10 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
 
     let footer = col()
         .w_full()
-        .gap(2.0)
+        .gap(space::XXS)
         .child(
             text(&name)
-                .font(k.ty.small)
+                .font(ty::caption(k))
                 .color(if active {
                     k.c.text_base
                 } else {
@@ -245,21 +260,25 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
         .role("button")
         .label(format!("Select photo {name}"))
         .focusable(true)
-        .focus_ring(2.0, 1.0, k.c.border_focus)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
         .cursor(Cursor::Pointer)
-        .w(150.0)
-        .gap(4.0)
-        .padding(5.0)
+        .w(size::THUMB_CARD_W)
+        .gap(space::XS)
+        .padding(space::TIGHT)
         .radius(k.radius.md)
         .fill(if active { k.c.layer_02 } else { k.c.bg_base })
         .hover(k.c.hover)
         .border(
-            if active { 1.5 } else { 0.5 },
             if active {
-                k.c.border_focus
+                border::ACTIVE
             } else {
-                k.c.border_base
+                border::HAIRLINE
             },
+            color::pill_border(k, active),
         )
         .child(preview)
         .child(footer)
@@ -268,7 +287,7 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
         });
 
     if rejected && !active {
-        card.layer_opacity(0.55)
+        card.layer_opacity(color::REJECT_CARD_OPACITY)
     } else {
         card
     }

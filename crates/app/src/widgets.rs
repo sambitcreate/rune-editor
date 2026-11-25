@@ -1,42 +1,30 @@
-//! Pro Capture One / Lightroom darkroom inspector widgets styled natively with
-//! Anomaly OpenCode (`rune-theme-opencode`) tokens, `rune::Shape` vectors, and `rune::Pixels`.
+//! Pro Capture One / Lightroom darkroom inspector widgets styled exclusively with
+//! centralized Anomaly OpenCode tokens (`crate::tokens`).
 
 use rune::{
-    Color, Cursor, Drag, El, LineCap, Phase, ScrollSpec, Shape, TextStyle, Tx, col, el, icon, row,
-    text,
+    Color, Cursor, Drag, El, LineCap, Phase, ScrollSpec, Shape, Tx, col, el, icon, row, text,
 };
 use rune_editor_core::{
-    ColorWheel, DevelopRecipe, HISTOGRAM_BINS, HSL_BAND_COUNT, HSL_BAND_NAMES, ToneCurves,
-    default_curve_points,
+    BlackAndWhiteParams, ColorWheel, CompositionGrid, CropAspect, DevelopRecipe, HISTOGRAM_BINS,
+    HSL_BAND_COUNT, HSL_BAND_NAMES, LevelsParams, ToneCurves, default_curve_points,
 };
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl,
-    Slider,
+    Slider, Switch,
 };
 use rune_theme_opencode::icons;
 
 use crate::color_wheel_tex::{
-    hsl_band_swatch, pointer_to_wheel_xy, srgb, wheel_pixels, wheel_puck_color, wheel_xy_to_point,
+    pointer_to_wheel_xy, wheel_pixels, wheel_puck_color, wheel_xy_to_point,
 };
 use crate::state::{AppState, CurveChannel, InspectorTab};
+use crate::tokens::{self, border, color, radius, size, space, ty};
 
-pub const INSPECTOR_WIDTH: f32 = 336.0;
-const CARD_INNER_W: f32 = 288.0;
-
-fn mono_readout(k: &Kit, size: f32) -> TextStyle {
-    TextStyle {
-        size,
-        line_height: size + 4.0,
-        ..k.ty.mono
-    }
-    .features("'tnum' 1")
-}
-
-/// Pinned live RGB + Luminance histogram with anti-aliased vector area polygons and
-/// shadow/highlight clipping telemetry.
+/// Pinned live RGB + Luminance histogram with shadow/highlight clipping telemetry
+/// and a fixed-height live cursor `RGB • HSL • Lab` color readout footer.
 pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
-    let w = 292.0_f32;
-    let h = 68.0_f32;
+    let w = size::HISTOGRAM_W;
+    let h = size::HISTOGRAM_H;
     let step = w / (HISTOGRAM_BINS.saturating_sub(1).max(1)) as f32;
 
     let build_area = |bins: &[f32; HISTOGRAM_BINS]| -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
@@ -45,7 +33,7 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
         poly.push([0.0, h]);
         for (i, &val) in bins.iter().enumerate() {
             let x = i as f32 * step;
-            let y = h - (val.clamp(0.0, 1.0) * (h - 4.0));
+            let y = h - (val.clamp(0.0, 1.0) * (h - space::XS));
             line.push([x, y]);
             poly.push([x, y]);
         }
@@ -59,21 +47,26 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
     let (b_poly, b_line) = build_area(&s.histogram.b);
 
     let mut shape = Shape::new().view_box(w, h);
-    // Subtle quarter tonal-zone grid lines (Blacks / Shadows / Midtones / Highlights / Whites)
     for q in 1..4 {
         let gx = w * (q as f32 * 0.25);
-        shape = shape.line([gx, 2.0], [gx, h], 0.5, LineCap::Butt, k.c.border_muted);
+        shape = shape.line(
+            [gx, space::XXS],
+            [gx, h],
+            border::HAIRLINE,
+            LineCap::Butt,
+            k.c.border_muted,
+        );
     }
 
     shape = shape
-        .fill(l_poly, srgb(0.84, 0.85, 0.88).alpha(0.18))
-        .fill(r_poly, srgb(0.95, 0.34, 0.34).alpha(0.28))
-        .fill(g_poly, srgb(0.32, 0.86, 0.48).alpha(0.26))
-        .fill(b_poly, srgb(0.34, 0.58, 0.98).alpha(0.30))
-        .stroke(r_line, 1.0, srgb(0.96, 0.40, 0.40).alpha(0.82))
-        .stroke(g_line, 1.0, srgb(0.38, 0.88, 0.52).alpha(0.78))
-        .stroke(b_line, 1.0, srgb(0.42, 0.64, 0.98).alpha(0.82))
-        .stroke(l_line, 1.0, srgb(0.92, 0.92, 0.94).alpha(0.55));
+        .fill(l_poly, color::hist_luma_fill())
+        .fill(r_poly, color::hist_r_fill())
+        .fill(g_poly, color::hist_g_fill())
+        .fill(b_poly, color::hist_b_fill())
+        .stroke(r_line, border::REGULAR, color::hist_r_stroke())
+        .stroke(g_line, border::REGULAR, color::hist_g_stroke())
+        .stroke(b_line, border::REGULAR, color::hist_b_stroke())
+        .stroke(l_line, border::REGULAR, color::hist_luma_stroke());
 
     let shadow_clip = s.histogram.shadow_clip_pct;
     let highlight_clip = s.histogram.highlight_clip_pct;
@@ -94,21 +87,21 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
         .items_center()
         .child(
             text("HISTOGRAM")
-                .font(k.ty.small_medium)
+                .font(ty::section_header(k))
                 .color(k.c.text_muted),
         )
         .child(
             row()
                 .items_center()
-                .gap(8.0)
+                .gap(space::MD)
                 .child(
                     text(format!("BLK {shadow_clip:.1}%"))
-                        .font(mono_readout(k, 10.5))
+                        .font(ty::mono_compact(k))
                         .color(blk_color),
                 )
                 .child(
                     text(format!("WHT {highlight_clip:.1}%"))
-                        .font(mono_readout(k, 10.5))
+                        .font(ty::mono_compact(k))
                         .color(wht_color),
                 ),
         );
@@ -120,16 +113,73 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
         .radius(k.radius.sm)
         .shape(shape);
 
+    // Fixed-height 1-line color probe footer so hovering never causes layout jitter.
+    let probe_footer = if let Some(c) = s.cursor_readout {
+        let swatch = el()
+            .size(size::PROBE_SWATCH, size::PROBE_SWATCH)
+            .radius(radius::PROBE_SWATCH)
+            .fill(tokens::srgb(
+                c.rgb8[0] as f32 / 255.0,
+                c.rgb8[1] as f32 / 255.0,
+                c.rgb8[2] as f32 / 255.0,
+            ))
+            .border(border::HAIRLINE, k.c.border_strong)
+            .a11y_hidden();
+        row()
+            .key("color-probe-footer")
+            .w_full()
+            .h(size::PROBE_FOOTER_H)
+            .items_center()
+            .justify_between()
+            .gap(space::XS)
+            .child(
+                row().items_center().gap(space::XS).child(swatch).child(
+                    text(format!(
+                        "RGB {:>3} {:>3} {:>3}",
+                        c.rgb8[0], c.rgb8[1], c.rgb8[2]
+                    ))
+                    .font(ty::mono_probe(k))
+                    .color(k.c.text_base),
+                ),
+            )
+            .child(
+                text(format!(
+                    "HSL {:.0}° {:.0} {:.0} · Lab {:.0} {:+.0} {:+.0}",
+                    c.hsl[0], c.hsl[1], c.hsl[2], c.lab[0], c.lab[1], c.lab[2]
+                ))
+                .font(ty::mono_probe(k))
+                .color(k.c.text_muted),
+            )
+    } else {
+        row()
+            .key("color-probe-footer")
+            .w_full()
+            .h(size::PROBE_FOOTER_H)
+            .items_center()
+            .justify_between()
+            .child(
+                text("RGB · HSL · Lab")
+                    .font(ty::mono_micro(k))
+                    .color(k.c.text_faint),
+            )
+            .child(
+                text("Hover photo to sample")
+                    .font(ty::caption(k))
+                    .color(k.c.text_faint),
+            )
+    };
+
     col()
         .key("histogram-card")
         .w_full()
-        .gap(6.0)
-        .padding(10.0)
+        .gap(space::TIGHT)
+        .padding(space::LG)
         .radius(k.radius.lg)
         .fill(k.c.bg_deep)
-        .border(0.5, k.c.border_base)
+        .border(border::HAIRLINE, k.c.border_base)
         .child(header)
         .child(plot)
+        .child(probe_footer)
 }
 
 /// Collapsible OpenCode section card (Capture One accordion behavior).
@@ -139,7 +189,7 @@ fn collapsible_section_card(
     title: &'static str,
     open: bool,
     on_toggle: fn(&mut AppState),
-    reset_action: Option<El>,
+    header_actions: Option<El>,
     content: El,
 ) -> El {
     let chevron = if open {
@@ -153,13 +203,21 @@ fn collapsible_section_card(
         .label(format!("Toggle {title}"))
         .expanded(open)
         .focusable(true)
-        .focus_ring(2.0, 2.0, k.c.border_focus)
+        .focus_ring(border::FOCUS_RING, border::FOCUS_OFFSET, k.c.border_focus)
         .radius(k.radius.xs)
         .cursor(Cursor::Pointer)
         .items_center()
-        .gap(5.0)
-        .child(icon(chevron, 11.0).color(k.c.icon_muted).a11y_hidden())
-        .child(text(title).font(k.ty.small_medium).color(k.c.text_muted))
+        .gap(space::TIGHT)
+        .child(
+            icon(chevron, size::ICON_SM)
+                .color(k.c.icon_muted)
+                .a11y_hidden(),
+        )
+        .child(
+            text(title)
+                .font(ty::section_header(k))
+                .color(k.c.text_muted),
+        )
         .on_press(on_toggle);
 
     let mut header = row()
@@ -167,18 +225,18 @@ fn collapsible_section_card(
         .justify_between()
         .items_center()
         .child(toggle);
-    if let Some(btn) = reset_action {
-        header = header.child(btn);
+    if let Some(actions) = header_actions {
+        header = header.child(actions);
     }
 
     let mut card = col()
         .key(key)
         .w_full()
-        .gap(8.0)
-        .padding(10.0)
+        .gap(space::MD)
+        .padding(space::LG)
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
-        .border(0.5, k.c.border_base)
+        .border(border::HAIRLINE, k.c.border_base)
         .child(header);
     if open {
         card = card.child(content);
@@ -186,31 +244,31 @@ fn collapsible_section_card(
     card
 }
 
-/// Reusable OpenCode section card with tracked uppercase title and optional reset action.
+/// Reusable OpenCode section card with tracked uppercase title and optional header actions.
 fn section_card(
     k: &Kit,
     key: &'static str,
     title: &'static str,
-    reset_action: Option<El>,
+    header_actions: Option<El>,
     content: El,
 ) -> El {
-    let mut header = row()
-        .w_full()
-        .justify_between()
-        .items_center()
-        .child(text(title).font(k.ty.small_medium).color(k.c.text_muted));
-    if let Some(btn) = reset_action {
-        header = header.child(btn);
+    let mut header = row().w_full().justify_between().items_center().child(
+        text(title)
+            .font(ty::section_header(k))
+            .color(k.c.text_muted),
+    );
+    if let Some(actions) = header_actions {
+        header = header.child(actions);
     }
 
     col()
         .key(key)
         .w_full()
-        .gap(8.0)
-        .padding(10.0)
+        .gap(space::MD)
+        .padding(space::LG)
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
-        .border(0.5, k.c.border_base)
+        .border(border::HAIRLINE, k.c.border_base)
         .child(header)
         .child(content)
 }
@@ -231,7 +289,114 @@ fn mini_reset_btn(
         .build(k)
 }
 
-/// OpenCode-styled photographic slider with click-to-reset label and tabular mono value readout.
+/// Capture One-style compact `A` (Auto) pill button for tool card headers.
+fn mini_auto_btn(
+    k: &Kit,
+    key: &'static str,
+    help: &'static str,
+    on_press: impl Fn(&mut AppState, &mut Tx) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(help)
+        .help(help)
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .size(size::MINI_AUTO_BTN, size::MINI_AUTO_BTN)
+        .center()
+        .radius(k.radius.sm)
+        .fill(k.c.bg_base)
+        .hover(k.c.hover)
+        .border(border::HAIRLINE, k.c.border_base)
+        .child(text("A").font(ty::mono_compact(k)).color(k.c.text_muted))
+        .on_press_tx(on_press)
+}
+
+/// Unified OpenCode photographic slider with click-to-reset label and tabular mono readout.
+#[allow(clippy::too_many_arguments)]
+fn develop_slider_inner(
+    k: &Kit,
+    key: impl Into<String>,
+    label: &'static str,
+    dot_color: Option<Color>,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    value_fmt: String,
+    reset_val: f32,
+    refresh_histogram: bool,
+    setter: impl Fn(&mut DevelopRecipe, f32) + Copy + 'static,
+) -> El {
+    let key_str = key.into();
+    let modified = (value - reset_val).abs() > 0.005;
+
+    let mut label_row = row().items_center().gap(space::TIGHT);
+    if let Some(col_dot) = dot_color {
+        label_row = label_row.child(
+            el().size(size::CHANNEL_DOT, size::CHANNEL_DOT)
+                .radius(radius::circle(size::CHANNEL_DOT))
+                .fill(col_dot)
+                .a11y_hidden(),
+        );
+    }
+    label_row = label_row.child(text(label).font(ty::control_label(k)).color(k.c.text_base));
+
+    let header = row()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .child(
+            el().role("button")
+                .label(format!("Reset {label}"))
+                .help(format!("Click to reset {label}"))
+                .focusable(true)
+                .focus_ring(border::FOCUS_RING, border::FOCUS_OFFSET, k.c.border_focus)
+                .radius(k.radius.xs)
+                .cursor(Cursor::Pointer)
+                .child(label_row)
+                .on_press_tx(move |s: &mut AppState, tx| {
+                    if refresh_histogram {
+                        s.update_slider_tx(true, tx, |r| setter(r, reset_val));
+                    } else {
+                        s.update_geometry_slider_tx(true, tx, |r| setter(r, reset_val));
+                    }
+                }),
+        )
+        .child(text(&value_fmt).font(ty::mono_value(k)).color(if modified {
+            k.c.text_accent
+        } else {
+            k.c.text_muted
+        }));
+
+    let slider = Slider::new(format!("{key_str}-slider"), value)
+        .range(range)
+        .label(label)
+        .hide_label()
+        .value_text(value_fmt)
+        .control_size(ControlSize::Mini)
+        .width(size::CARD_INNER_W)
+        .on_change_tx(move |s: &mut AppState, v: f32, done: bool, tx| {
+            if refresh_histogram {
+                s.update_slider_tx(done, tx, |r| setter(r, v));
+            } else {
+                s.update_geometry_slider_tx(done, tx, |r| setter(r, v));
+            }
+        })
+        .build(k);
+
+    col()
+        .key(key_str)
+        .w_full()
+        .gap(space::XXS)
+        .child(header)
+        .child(slider)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn develop_slider(
     k: &Kit,
@@ -243,71 +408,172 @@ fn develop_slider(
     reset_val: f32,
     setter: fn(&mut DevelopRecipe, f32),
 ) -> El {
-    let modified = (value - reset_val).abs() > 0.005;
-    let header = row()
-        .w_full()
-        .justify_between()
-        .items_center()
-        .child(
-            el().role("button")
-                .label(format!("Reset {label}"))
-                .help(format!("Click to reset {label}"))
-                .focusable(true)
-                .focus_ring(2.0, 2.0, k.c.border_focus)
-                .radius(k.radius.xs)
-                .cursor(Cursor::Pointer)
-                .child(text(label).font(k.ty.text_xsmall).color(k.c.text_base))
-                .on_press_tx(move |s: &mut AppState, tx| {
-                    s.update_slider_tx(true, tx, |r| setter(r, reset_val));
-                }),
-        )
-        .child(
-            text(&value_fmt)
-                .font(mono_readout(k, 11.0))
-                .color(if modified {
-                    k.c.text_accent
-                } else {
-                    k.c.text_muted
-                }),
-        );
-
-    let slider = Slider::new(format!("{key}-slider"), value)
-        .range(range)
-        .label(label)
-        .hide_label()
-        .value_text(value_fmt)
-        .control_size(ControlSize::Mini)
-        .width(CARD_INNER_W)
-        .on_change_tx(move |s: &mut AppState, v: f32, done: bool, tx| {
-            s.update_slider_tx(done, tx, |r| setter(r, v));
-        })
-        .build(k);
-
-    col().key(key).w_full().gap(2.0).child(header).child(slider)
+    develop_slider_inner(
+        k, key, label, None, value, range, value_fmt, reset_val, true, setter,
+    )
 }
 
 fn channel_color(ch: CurveChannel, k: &Kit) -> Color {
     match ch {
         CurveChannel::Luma => k.c.text_base,
-        CurveChannel::Red => srgb(0.95, 0.36, 0.36),
-        CurveChannel::Green => srgb(0.35, 0.86, 0.48),
-        CurveChannel::Blue => srgb(0.38, 0.62, 0.98),
+        CurveChannel::Red => color::channel_red(),
+        CurveChannel::Green => color::channel_green(),
+        CurveChannel::Blue => color::channel_blue(),
     }
+}
+
+/// Interactive Levels card with mini luma histogram + shadow/midtone/highlight ticks,
+/// Auto Levels (`A`) action, and Input/Output point sliders.
+fn levels_section(s: &AppState, k: &Kit) -> El {
+    let lv = s.recipe.levels.sanitized();
+    let w = size::CARD_INNER_W;
+    let h = size::LEVELS_STRIP_H;
+    let step = w / (HISTOGRAM_BINS.saturating_sub(1).max(1)) as f32;
+
+    let mut poly = Vec::with_capacity(HISTOGRAM_BINS + 2);
+    poly.push([0.0, h]);
+    for (i, &val) in s.histogram.luma.iter().enumerate() {
+        poly.push([i as f32 * step, h - val.clamp(0.0, 1.0) * (h - space::XS)]);
+    }
+    poly.push([w, h]);
+
+    let bx = lv.in_black * w;
+    let wx = lv.in_white * w;
+    let mx = bx + (wx - bx) * (0.5 - lv.in_mid * 0.35).clamp(0.05, 0.95);
+
+    let shape = Shape::new()
+        .view_box(w, h)
+        .fill(poly, color::levels_hist_fill(k))
+        .line(
+            [bx, 0.0],
+            [bx, h],
+            border::ACTIVE,
+            LineCap::Butt,
+            k.c.info.fg,
+        )
+        .line(
+            [mx, space::XXS],
+            [mx, h],
+            border::REGULAR,
+            LineCap::Butt,
+            k.c.text_muted,
+        )
+        .line(
+            [wx, 0.0],
+            [wx, h],
+            border::ACTIVE,
+            LineCap::Butt,
+            k.c.text_accent,
+        );
+
+    let strip = el()
+        .key("levels-strip")
+        .w(w)
+        .h(h)
+        .radius(k.radius.sm)
+        .fill(k.c.bg_deep)
+        .border(border::HAIRLINE, k.c.border_base)
+        .shape(shape);
+
+    let controls = col()
+        .w_full()
+        .gap(space::TIGHT)
+        .child(strip)
+        .child(develop_slider(
+            k,
+            "sl-lvl-in-black",
+            "In Shadow",
+            lv.in_black,
+            0.0..=0.95,
+            format!("{:.0}", lv.in_black * 255.0),
+            0.0,
+            |rec, v| {
+                rec.levels.in_black = v.min(rec.levels.in_white - 0.02).clamp(0.0, 0.95);
+            },
+        ))
+        .child(develop_slider(
+            k,
+            "sl-lvl-in-mid",
+            "In Midtone",
+            lv.in_mid,
+            -1.0..=1.0,
+            format!("{:+.0}", lv.in_mid * 100.0),
+            0.0,
+            |rec, v| rec.levels.in_mid = v,
+        ))
+        .child(develop_slider(
+            k,
+            "sl-lvl-in-white",
+            "In Highlight",
+            lv.in_white,
+            0.05..=1.0,
+            format!("{:.0}", lv.in_white * 255.0),
+            1.0,
+            |rec, v| {
+                rec.levels.in_white = v.max(rec.levels.in_black + 0.02).clamp(0.05, 1.0);
+            },
+        ))
+        .child(develop_slider(
+            k,
+            "sl-lvl-out-black",
+            "Out Shadow",
+            lv.out_black,
+            0.0..=1.0,
+            format!("{:.0}", lv.out_black * 255.0),
+            0.0,
+            |rec, v| rec.levels.out_black = v,
+        ))
+        .child(develop_slider(
+            k,
+            "sl-lvl-out-white",
+            "Out Highlight",
+            lv.out_white,
+            0.0..=1.0,
+            format!("{:.0}", lv.out_white * 255.0),
+            1.0,
+            |rec, v| rec.levels.out_white = v,
+        ));
+
+    let actions = row()
+        .items_center()
+        .gap(space::XS)
+        .child(mini_auto_btn(
+            k,
+            "btn-auto-levels",
+            "Auto Levels (0.1% clip)",
+            |s, tx| s.auto_levels_tx(tx),
+        ))
+        .child(mini_reset_btn(
+            k,
+            "Reset Levels",
+            lv.is_identity(),
+            |s, tx| {
+                s.update_slider_tx(true, tx, |rec| rec.levels = LevelsParams::default());
+            },
+        ));
+
+    collapsible_section_card(
+        k,
+        "sec-levels",
+        "LEVELS",
+        s.levels_open,
+        |s| s.levels_open = !s.levels_open,
+        Some(actions),
+        controls,
+    )
 }
 
 /// Interactive Tone Curve Editor with Fritsch-Carlson monotonic cubic spline preview,
 /// Luma / R / G / B channel switcher, background histogram silhouette, and draggable handles.
 fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
-    let cw = CARD_INNER_W;
-    let ch = 144.0_f32;
+    let cw = size::CARD_INNER_W;
+    let ch = size::CURVE_H;
     let active_ch = s.curve_channel;
     let active_pts = active_ch.points(&s.recipe.curves);
     let active_color = channel_color(active_ch, k);
 
-    // Build background shape: faint luma histogram + 4x4 grid + diagonal + ghost curves + active spline
     let mut shape = Shape::new().view_box(cw, ch);
 
-    // Faint luma histogram silhouette inside curve box
     let step = cw / (HISTOGRAM_BINS.saturating_sub(1).max(1)) as f32;
     let mut hist_poly = Vec::with_capacity(HISTOGRAM_BINS + 2);
     hist_poly.push([0.0, ch]);
@@ -315,32 +581,35 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
         hist_poly.push([i as f32 * step, ch - val.clamp(0.0, 1.0) * (ch * 0.72)]);
     }
     hist_poly.push([cw, ch]);
-    shape = shape.fill(hist_poly, k.c.white.alpha(0.06));
+    shape = shape.fill(hist_poly, color::curve_bg_hist(k));
 
-    // 4x4 photographic gridlines
     for i in 1..4 {
         let f = i as f32 * 0.25;
         shape = shape
             .line(
                 [cw * f, 0.0],
                 [cw * f, ch],
-                0.5,
+                border::HAIRLINE,
                 LineCap::Butt,
                 k.c.border_muted,
             )
             .line(
                 [0.0, ch * f],
                 [cw, ch * f],
-                0.5,
+                border::HAIRLINE,
                 LineCap::Butt,
                 k.c.border_muted,
             );
     }
 
-    // Identity diagonal reference
-    shape = shape.line([0.0, ch], [cw, 0.0], 0.75, LineCap::Butt, k.c.border_base);
+    shape = shape.line(
+        [0.0, ch],
+        [cw, 0.0],
+        border::THIN,
+        LineCap::Butt,
+        k.c.border_base,
+    );
 
-    // Ghost strokes for other modified channels
     for other in CurveChannel::ALL {
         if other == active_ch {
             continue;
@@ -356,10 +625,13 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
                 [x * cw, (1.0 - y) * ch]
             })
             .collect();
-        shape = shape.stroke(sampled, 1.25, channel_color(other, k).alpha(0.32));
+        shape = shape.stroke(
+            sampled,
+            border::CURVE_GHOST,
+            color::curve_ghost(channel_color(other, k)),
+        );
     }
 
-    // Active channel monotonic cubic spline
     let spline_pts: Vec<[f32; 2]> = (0..=64)
         .map(|i| {
             let x = i as f32 / 64.0;
@@ -367,9 +639,8 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
             [x * cw, (1.0 - y) * ch]
         })
         .collect();
-    shape = shape.stroke(spline_pts, 1.75, active_color);
+    shape = shape.stroke(spline_pts, border::CURVE_ACTIVE, active_color);
 
-    // Interactive curve canvas with draggable handles
     let mut canvas_box = el()
         .key("tone-curve-canvas")
         .role("group")
@@ -378,7 +649,7 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
         .h(ch)
         .radius(k.radius.md)
         .fill(k.c.bg_deep)
-        .border(0.5, k.c.border_base)
+        .border(border::HAIRLINE, k.c.border_base)
         .cursor(Cursor::Crosshair)
         .shape(shape)
         .on_drag(move |s: &mut AppState, d: &mut Drag, tx: &mut Tx| {
@@ -392,7 +663,6 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
                         s.drag_undo_snapshot = Some(s.recipe.clone());
                     }
                     let pts = ch_sel.points_mut(&mut s.recipe.curves);
-                    // Find closest existing point within 14pt radius
                     let mut best: Option<(usize, f32)> = None;
                     for (idx, p) in pts.iter().enumerate() {
                         let px = p[0] * d.w;
@@ -416,7 +686,6 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
                     };
                     s.dragging_curve_pt = Some(grabbed);
                     s.recipe.preset_name = None;
-                    s.bump_curve_generation();
                     s.recompute_histogram();
                 }
                 Phase::Move => {
@@ -435,8 +704,6 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
                             };
                             pts[idx] = [clamped_x, ny];
                             s.recipe.preset_name = None;
-                            s.bump_curve_generation();
-                            s.catalog.update_active_recipe(s.recipe.clone());
                             s.recompute_histogram();
                             tx.instant();
                         }
@@ -444,6 +711,7 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
                 }
                 Phase::Up => {
                     s.dragging_curve_pt = None;
+                    s.catalog.update_active_recipe(s.recipe.clone());
                     if let Some(prev) = s.drag_undo_snapshot.take()
                         && prev != s.recipe
                     {
@@ -454,33 +722,35 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
             }
         });
 
-    // Control point handles overlaid at exact spline coordinates
     for (idx, &[px, py]) in active_pts.iter().enumerate() {
         let is_dragged = s.dragging_curve_pt == Some(idx);
-        let size = if is_dragged { 10.0 } else { 8.0 };
-        let cx = (px * cw - size * 0.5).clamp(1.0, cw - size - 1.0);
-        let cy = ((1.0 - py) * ch - size * 0.5).clamp(1.0, ch - size - 1.0);
+        let pt_sz = if is_dragged {
+            size::CURVE_PT_DRAG
+        } else {
+            size::CURVE_PT
+        };
+        let cx = (px * cw - pt_sz * 0.5).clamp(space::MICRO, cw - pt_sz - space::MICRO);
+        let cy = ((1.0 - py) * ch - pt_sz * 0.5).clamp(space::MICRO, ch - pt_sz - space::MICRO);
         canvas_box = canvas_box.child(
             el().key(format!("curve-pt-{idx}"))
                 .absolute(cx, cy)
-                .size(size, size)
-                .radius(size * 0.5)
+                .size(pt_sz, pt_sz)
+                .radius(radius::circle(pt_sz))
                 .fill(if is_dragged {
                     active_color
                 } else {
                     k.c.bg_base
                 })
-                .border(1.5, active_color)
+                .border(border::ACTIVE, active_color)
                 .a11y_hidden(),
         );
     }
 
-    // Channel pill switcher row
     let mut ch_row = row()
         .role("radiogroup")
         .label("Tone curve channel")
         .items_center()
-        .gap(4.0);
+        .gap(space::XS);
     for ch_opt in CurveChannel::ALL {
         let active = ch_opt == active_ch;
         let dot_col = channel_color(ch_opt, k);
@@ -490,27 +760,36 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
             .label(format!("{} curve channel", ch_opt.label()))
             .checked(active)
             .focusable(true)
-            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .focus_ring(
+                border::FOCUS_RING,
+                border::FOCUS_OFFSET_TIGHT,
+                k.c.border_focus,
+            )
             .cursor(Cursor::Pointer)
             .items_center()
-            .gap(5.0)
-            .h(24.0)
-            .px(8.0)
+            .gap(space::TIGHT)
+            .h(size::PILL_H)
+            .px(space::MD)
             .radius(k.radius.sm)
-            .fill(if active { k.c.layer_03 } else { k.c.bg_base })
+            .fill(color::pill_fill(k, active))
             .hover(k.c.hover)
             .border(
-                0.5,
+                border::HAIRLINE,
                 if active {
                     k.c.border_strong
                 } else {
                     k.c.border_muted
                 },
             )
-            .child(el().size(6.0, 6.0).radius(3.0).fill(dot_col).a11y_hidden())
+            .child(
+                el().size(size::CHANNEL_DOT, size::CHANNEL_DOT)
+                    .radius(radius::circle(size::CHANNEL_DOT))
+                    .fill(dot_col)
+                    .a11y_hidden(),
+            )
             .child(
                 text(ch_opt.short_label())
-                    .font(k.ty.small_medium)
+                    .font(ty::section_header(k))
                     .color(if active {
                         k.c.text_base
                     } else {
@@ -532,18 +811,18 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
         .child(ch_row)
         .child(
             text(format!("{} pts", active_pts.len()))
-                .font(mono_readout(k, 10.5))
+                .font(ty::mono_compact(k))
                 .color(k.c.text_faint),
         );
 
     let body = col()
         .w_full()
-        .gap(8.0)
+        .gap(space::MD)
         .child(controls_row)
         .child(canvas_box)
         .child(
             text("Click curve to add point  •  Drag handles to shape")
-                .font(k.ty.small)
+                .font(ty::caption(k))
                 .color(k.c.text_faint),
         );
 
@@ -604,44 +883,53 @@ impl WheelSlot {
 }
 
 fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
-    let diameter = 88.0_f32;
+    let diameter = size::WHEEL_DIAMETER;
     let wheel = slot.get(&s.recipe);
     let puck_pt = wheel_xy_to_point(wheel.hue_x, wheel.hue_y, diameter);
     let center = [diameter * 0.5, diameter * 0.5];
+    let arm = size::WHEEL_CROSSHAIR_ARM;
     let modified = !wheel.is_neutral();
 
     let mut overlay = Shape::new()
         .view_box(diameter, diameter)
-        // Subtle center crosshair
         .line(
-            [center[0] - 5.0, center[1]],
-            [center[0] + 5.0, center[1]],
-            0.75,
+            [center[0] - arm, center[1]],
+            [center[0] + arm, center[1]],
+            border::THIN,
             LineCap::Round,
-            k.c.white.alpha(0.28),
+            color::wheel_crosshair(k),
         )
         .line(
-            [center[0], center[1] - 5.0],
-            [center[0], center[1] + 5.0],
-            0.75,
+            [center[0], center[1] - arm],
+            [center[0], center[1] + arm],
+            border::THIN,
             LineCap::Round,
-            k.c.white.alpha(0.28),
+            color::wheel_crosshair(k),
         );
 
-    // Tether line from center to puck when offset
     if wheel.hue_x.hypot(wheel.hue_y) > 0.02 {
-        overlay = overlay.line(center, puck_pt, 1.25, LineCap::Round, k.c.white.alpha(0.65));
+        overlay = overlay.line(
+            center,
+            puck_pt,
+            border::CURVE_GHOST,
+            LineCap::Round,
+            color::wheel_tether(k),
+        );
     }
 
-    let puck_size = 11.0_f32;
+    let puck_size = size::WHEEL_PUCK;
     let puck = el()
         .key(format!("{}-puck", slot.key()))
         .absolute(puck_pt[0] - puck_size * 0.5, puck_pt[1] - puck_size * 0.5)
         .size(puck_size, puck_size)
-        .radius(puck_size * 0.5)
+        .radius(radius::circle(puck_size))
         .fill(wheel_puck_color(wheel.hue_x, wheel.hue_y))
-        .border(1.5, k.c.white)
-        .shadow(1.0, 3.0, k.c.black.alpha(0.6))
+        .border(border::ACTIVE, k.c.white)
+        .shadow(
+            border::PUCK_SHADOW_Y,
+            border::PUCK_SHADOW_BLUR,
+            color::puck_shadow(k),
+        )
         .a11y_hidden();
 
     let disc = el()
@@ -650,12 +938,12 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
         .label(format!("{} color balance wheel", slot.title()))
         .help(format!("Drag to tint {} hue and chroma", slot.title()))
         .focusable(true)
-        .focus_ring(2.0, 2.0, k.c.border_focus)
+        .focus_ring(border::FOCUS_RING, border::FOCUS_OFFSET, k.c.border_focus)
         .size(diameter, diameter)
-        .radius(diameter * 0.5)
+        .radius(radius::circle(diameter))
         .pixels(wheel_pixels())
         .border(
-            1.0,
+            border::REGULAR,
             if modified {
                 k.c.border_strong
             } else {
@@ -683,13 +971,17 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
         .label(format!("Reset {} wheel", slot.title()))
         .help(format!("Click to reset {} color wheel", slot.title()))
         .focusable(true)
-        .focus_ring(2.0, 1.0, k.c.border_focus)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
         .cursor(Cursor::Pointer)
         .items_center()
-        .gap(4.0)
+        .gap(space::XS)
         .child(
             text(slot.title())
-                .font(k.ty.small_medium)
+                .font(ty::section_header(k))
                 .color(if modified {
                     k.c.text_base
                 } else {
@@ -717,7 +1009,7 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
         .build(k);
 
     let luma_readout = text(format!("Y {:+.2}", wheel.luma))
-        .font(mono_readout(k, 10.0))
+        .font(ty::mono_micro(k))
         .color(if wheel.luma.abs() > 0.005 {
             k.c.text_accent
         } else {
@@ -728,7 +1020,7 @@ fn single_color_wheel(s: &AppState, k: &Kit, slot: WheelSlot) -> El {
         .key(slot.key())
         .w(diameter)
         .items_center()
-        .gap(6.0)
+        .gap(space::SM)
         .child(title_btn)
         .child(disc)
         .child(luma_slider)
@@ -766,6 +1058,106 @@ fn color_wheels_section(s: &AppState, k: &Kit) -> El {
     )
 }
 
+/// Collapsible 6-Channel Black & White Color Sensitivity Mixer.
+fn bw_section(s: &AppState, k: &Kit) -> El {
+    type BwChannelSpec = (
+        &'static str,
+        &'static str,
+        Color,
+        f32,
+        fn(&mut DevelopRecipe, f32),
+    );
+    let bw = s.recipe.bw;
+    let channels: [BwChannelSpec; 6] = [
+        ("sl-bw-red", "Red", color::channel_red(), bw.red, |r, v| {
+            r.bw.red = v;
+        }),
+        (
+            "sl-bw-yellow",
+            "Yellow",
+            color::channel_yellow(),
+            bw.yellow,
+            |r, v| r.bw.yellow = v,
+        ),
+        (
+            "sl-bw-green",
+            "Green",
+            color::channel_green(),
+            bw.green,
+            |r, v| r.bw.green = v,
+        ),
+        (
+            "sl-bw-cyan",
+            "Cyan",
+            color::channel_cyan(),
+            bw.cyan,
+            |r, v| r.bw.cyan = v,
+        ),
+        (
+            "sl-bw-blue",
+            "Blue",
+            color::channel_blue(),
+            bw.blue,
+            |r, v| r.bw.blue = v,
+        ),
+        (
+            "sl-bw-magenta",
+            "Magenta",
+            color::channel_magenta(),
+            bw.magenta,
+            |r, v| r.bw.magenta = v,
+        ),
+    ];
+
+    let mut body = col().w_full().gap(space::TIGHT);
+    for (key, label, dot, val, setter) in channels {
+        body = body.child(develop_slider_inner(
+            k,
+            key,
+            label,
+            Some(dot),
+            val,
+            -1.0..=1.0,
+            format!("{:+.0}", val * 100.0),
+            0.0,
+            true,
+            setter,
+        ));
+    }
+
+    let enable_sw = Switch::new(bw.enabled)
+        .label("Enable Black & White")
+        .hide_label()
+        .on_toggle_tx(|s: &mut AppState, tx| {
+            let next_on = !s.recipe.bw.enabled;
+            if next_on {
+                s.bw_open = true;
+            }
+            s.update_slider_tx(true, tx, |rec| rec.bw.enabled = next_on);
+        })
+        .build(k);
+
+    let reset = mini_reset_btn(k, "Reset Black & White", bw.is_neutral(), |s, tx| {
+        s.update_slider_tx(true, tx, |rec| rec.bw = BlackAndWhiteParams::default());
+    });
+
+    let actions = row()
+        .items_center()
+        .gap(space::SM)
+        .child(enable_sw)
+        .child(reset);
+
+    collapsible_section_card(
+        k,
+        "sec-bw",
+        "BLACK & WHITE",
+        s.bw_open,
+        |s| s.bw_open = !s.bw_open,
+        Some(actions),
+        body,
+    )
+}
+
 /// Capture One-style 8-Band Color Editor (HSL) with circular hue swatches.
 fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
     let active_idx = s.selected_hsl_band.min(HSL_BAND_COUNT - 1);
@@ -783,7 +1175,7 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
     for i in 0..HSL_BAND_COUNT {
         let selected = i == active_idx;
         let modified = !s.recipe.hsl[i].is_neutral();
-        let swatch_col = hsl_band_swatch(i);
+        let swatch_col = color::hsl_band_swatch(i);
 
         let btn = col()
             .key(format!("hsl-swatch-{i}"))
@@ -795,15 +1187,19 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
                 HSL_BAND_NAMES[i]
             ))
             .focusable(true)
-            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .focus_ring(
+                border::FOCUS_RING,
+                border::FOCUS_OFFSET_TIGHT,
+                k.c.border_focus,
+            )
             .cursor(Cursor::Pointer)
             .items_center()
-            .gap(3.0)
+            .gap(space::TINY)
             .child(
                 row()
-                    .size(26.0, 26.0)
+                    .size(size::SWATCH_RING, size::SWATCH_RING)
                     .center()
-                    .radius(13.0)
+                    .radius(radius::circle(size::SWATCH_RING))
                     .fill(if selected {
                         k.c.layer_03
                     } else {
@@ -811,7 +1207,11 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
                     })
                     .hover(k.c.hover)
                     .border(
-                        if selected { 1.5 } else { 0.5 },
+                        if selected {
+                            border::ACTIVE
+                        } else {
+                            border::HAIRLINE
+                        },
                         if selected {
                             k.c.border_focus
                         } else {
@@ -819,16 +1219,16 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
                         },
                     )
                     .child(
-                        el().size(14.0, 14.0)
-                            .radius(7.0)
+                        el().size(size::SWATCH_DOT, size::SWATCH_DOT)
+                            .radius(radius::circle(size::SWATCH_DOT))
                             .fill(swatch_col)
-                            .border(0.5, k.c.white.alpha(0.25))
+                            .border(border::HAIRLINE, color::swatch_rim(k))
                             .a11y_hidden(),
                     ),
             )
             .child(
-                el().size(4.0, 4.0)
-                    .radius(2.0)
+                el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                    .radius(radius::circle(size::MODIFIED_DOT))
                     .fill(if modified {
                         k.c.text_accent
                     } else {
@@ -850,16 +1250,16 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
         .child(
             row()
                 .items_center()
-                .gap(6.0)
+                .gap(space::SM)
                 .child(
-                    el().size(8.0, 8.0)
-                        .radius(4.0)
-                        .fill(hsl_band_swatch(active_idx))
+                    el().size(size::BAND_DOT, size::BAND_DOT)
+                        .radius(radius::circle(size::BAND_DOT))
+                        .fill(color::hsl_band_swatch(active_idx))
                         .a11y_hidden(),
                 )
                 .child(
                     text(format!("{band_name} Band"))
-                        .font(k.ty.text_xsmall_medium)
+                        .font(ty::control_label_medium(k))
                         .color(k.c.text_base),
                 ),
         )
@@ -874,32 +1274,41 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
             },
         ));
 
-    let hue_slider = hsl_band_slider(
+    let hue_slider = develop_slider_inner(
         k,
-        "sl-hsl-hue",
+        format!("sl-hsl-hue-{active_idx}"),
         "Hue",
+        None,
         band.hue,
+        -1.0..=1.0,
         format!("{:+.0}°", band.hue * 30.0),
-        active_idx,
-        |b, v| b.hue = v,
+        0.0,
+        true,
+        move |r, v| r.hsl[active_idx].hue = v,
     );
-    let sat_slider = hsl_band_slider(
+    let sat_slider = develop_slider_inner(
         k,
-        "sl-hsl-sat",
+        format!("sl-hsl-sat-{active_idx}"),
         "Saturation",
+        None,
         band.saturation,
+        -1.0..=1.0,
         format!("{:+.0}", band.saturation * 100.0),
-        active_idx,
-        |b, v| b.saturation = v,
+        0.0,
+        true,
+        move |r, v| r.hsl[active_idx].saturation = v,
     );
-    let lum_slider = hsl_band_slider(
+    let lum_slider = develop_slider_inner(
         k,
-        "sl-hsl-lum",
+        format!("sl-hsl-lum-{active_idx}"),
         "Luminance",
+        None,
         band.luminance,
+        -1.0..=1.0,
         format!("{:+.0}", band.luminance * 100.0),
-        active_idx,
-        |b, v| b.luminance = v,
+        0.0,
+        true,
+        move |r, v| r.hsl[active_idx].luminance = v,
     );
 
     let all_hsl_neutral = s.recipe.hsl.iter().all(|b| b.is_neutral());
@@ -911,7 +1320,7 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
 
     let body = col()
         .w_full()
-        .gap(7.0)
+        .gap(space::CONTROL)
         .child(swatch_row)
         .child(band_header)
         .child(hue_slider)
@@ -921,63 +1330,13 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
     section_card(k, "sec-hsl", "COLOR EDITOR (HSL)", Some(reset_all), body)
 }
 
-fn hsl_band_slider(
-    k: &Kit,
-    key: &'static str,
-    label: &'static str,
-    value: f32,
-    value_fmt: String,
-    band_idx: usize,
-    setter: fn(&mut rune_editor_core::HslBand, f32),
-) -> El {
-    let modified = value.abs() > 0.005;
-    let header = row()
-        .w_full()
-        .justify_between()
-        .items_center()
-        .child(
-            el().role("button")
-                .label(format!("Reset {label}"))
-                .focusable(true)
-                .focus_ring(2.0, 2.0, k.c.border_focus)
-                .cursor(Cursor::Pointer)
-                .child(text(label).font(k.ty.text_xsmall).color(k.c.text_base))
-                .on_press_tx(move |s: &mut AppState, tx| {
-                    s.update_slider_tx(true, tx, |r| setter(&mut r.hsl[band_idx], 0.0));
-                }),
-        )
-        .child(
-            text(&value_fmt)
-                .font(mono_readout(k, 11.0))
-                .color(if modified {
-                    k.c.text_accent
-                } else {
-                    k.c.text_muted
-                }),
-        );
-
-    let slider = Slider::new(format!("{key}-{band_idx}"), value)
-        .range(-1.0..=1.0)
-        .label(label)
-        .hide_label()
-        .value_text(value_fmt)
-        .control_size(ControlSize::Mini)
-        .width(CARD_INNER_W)
-        .on_change_tx(move |s: &mut AppState, v: f32, done: bool, tx| {
-            s.update_slider_tx(done, tx, |r| setter(&mut r.hsl[band_idx], v));
-        })
-        .build(k);
-
-    col().key(key).w_full().gap(2.0).child(header).child(slider)
-}
-
 fn light_tab_content(s: &AppState, k: &Kit) -> El {
     let r = &s.recipe;
 
     let wb_neutral = r.temperature.abs() < 0.005 && r.tint.abs() < 0.005;
     let wb_controls = col()
         .w_full()
-        .gap(6.0)
+        .gap(space::SM)
         .child(develop_slider(
             k,
             "sl-temp",
@@ -998,22 +1357,49 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             0.0,
             |rec, v| rec.tint = v,
         ));
-    let wb_reset = mini_reset_btn(k, "Reset White Balance", wb_neutral, |s, tx| {
-        s.update_slider_tx(true, tx, |rec| {
-            rec.temperature = 0.0;
-            rec.tint = 0.0;
-        });
-    });
+    let wb_picker = IconButton::new(&icons::SELECT_ELEMENT)
+        .variant(if s.wb_eyedropper_active {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Mini)
+        .label("Pick White Balance Eyedropper")
+        .help("Click any neutral gray pixel on the photo to neutralize white balance")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_wb_eyedropper_tx(tx))
+        .build(k);
+    let wb_actions = row()
+        .items_center()
+        .gap(space::XS)
+        .child(wb_picker)
+        .child(mini_auto_btn(
+            k,
+            "btn-auto-wb",
+            "Auto White Balance",
+            |s, tx| s.auto_white_balance_tx(tx),
+        ))
+        .child(mini_reset_btn(
+            k,
+            "Reset White Balance",
+            wb_neutral,
+            |s, tx| {
+                s.update_slider_tx(true, tx, |rec| {
+                    rec.temperature = 0.0;
+                    rec.tint = 0.0;
+                });
+            },
+        ));
 
     let tone_neutral = r.exposure.abs() < 0.005
         && r.contrast.abs() < 0.005
+        && r.brightness.abs() < 0.005
         && r.highlights.abs() < 0.005
         && r.shadows.abs() < 0.005
         && r.whites.abs() < 0.005
         && r.blacks.abs() < 0.005;
     let tone_controls = col()
         .w_full()
-        .gap(5.0)
+        .gap(space::TIGHT)
         .child(develop_slider(
             k,
             "sl-exposure",
@@ -1033,6 +1419,16 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             format!("{:+.0}", r.contrast * 100.0),
             0.0,
             |rec, v| rec.contrast = v,
+        ))
+        .child(develop_slider(
+            k,
+            "sl-brightness",
+            "Brightness",
+            r.brightness,
+            -1.0..=1.0,
+            format!("{:+.0}", r.brightness * 100.0),
+            0.0,
+            |rec, v| rec.brightness = v,
         ))
         .child(develop_slider(
             k,
@@ -1074,27 +1470,42 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             0.0,
             |rec, v| rec.blacks = v,
         ));
-    let tone_reset = mini_reset_btn(k, "Reset Light & Tone", tone_neutral, |s, tx| {
-        s.update_slider_tx(true, tx, |rec| {
-            rec.exposure = 0.0;
-            rec.contrast = 0.0;
-            rec.highlights = 0.0;
-            rec.shadows = 0.0;
-            rec.whites = 0.0;
-            rec.blacks = 0.0;
-        });
-    });
+    let tone_actions = row()
+        .items_center()
+        .gap(space::XS)
+        .child(mini_auto_btn(
+            k,
+            "btn-auto-tone",
+            "Auto Exposure & Tone",
+            |s, tx| s.auto_tone_tx(tx),
+        ))
+        .child(mini_reset_btn(
+            k,
+            "Reset Exposure & Tone",
+            tone_neutral,
+            |s, tx| {
+                s.update_slider_tx(true, tx, |rec| {
+                    rec.exposure = 0.0;
+                    rec.contrast = 0.0;
+                    rec.brightness = 0.0;
+                    rec.highlights = 0.0;
+                    rec.shadows = 0.0;
+                    rec.whites = 0.0;
+                    rec.blacks = 0.0;
+                });
+            },
+        ));
 
     col()
         .w_full()
-        .gap(8.0)
+        .gap(space::MD)
         .child(collapsible_section_card(
             k,
             "sec-wb",
             "WHITE BALANCE",
             s.wb_open,
             |s| s.wb_open = !s.wb_open,
-            Some(wb_reset),
+            Some(wb_actions),
             wb_controls,
         ))
         .child(collapsible_section_card(
@@ -1103,9 +1514,10 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             "EXPOSURE & TONE",
             s.tone_open,
             |s| s.tone_open = !s.tone_open,
-            Some(tone_reset),
+            Some(tone_actions),
             tone_controls,
         ))
+        .child(levels_section(s, k))
         .child(tone_curve_editor(s, k))
 }
 
@@ -1114,7 +1526,7 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
     let presence_neutral = r.vibrance.abs() < 0.005 && r.saturation.abs() < 0.005;
     let presence_controls = col()
         .w_full()
-        .gap(7.0)
+        .gap(space::CONTROL)
         .child(develop_slider(
             k,
             "sl-vibrance",
@@ -1149,7 +1561,7 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(10.0)
+        .gap(space::LG)
         .child(color_wheels_section(s, k))
         .child(section_card(
             k,
@@ -1158,16 +1570,20 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
             Some(presence_reset),
             presence_controls,
         ))
+        .child(bw_section(s, k))
         .child(hsl_editor_section(s, k))
 }
 
 fn detail_tab_content(s: &AppState, k: &Kit) -> El {
     let r = &s.recipe;
-    let detail_neutral =
-        r.clarity.abs() < 0.005 && r.sharpen.abs() < 0.005 && r.noise_reduction.abs() < 0.005;
+    let detail_neutral = r.clarity.abs() < 0.005
+        && r.structure.abs() < 0.005
+        && r.dehaze.abs() < 0.005
+        && r.sharpen.abs() < 0.005
+        && r.noise_reduction.abs() < 0.005;
     let detail_controls = col()
         .w_full()
-        .gap(10.0)
+        .gap(space::MD)
         .child(develop_slider(
             k,
             "sl-clarity",
@@ -1177,6 +1593,26 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             format!("{:+.0}", r.clarity * 100.0),
             0.0,
             |rec, v| rec.clarity = v,
+        ))
+        .child(develop_slider(
+            k,
+            "sl-structure",
+            "Structure",
+            r.structure,
+            -1.0..=1.0,
+            format!("{:+.0}", r.structure * 100.0),
+            0.0,
+            |rec, v| rec.structure = v,
+        ))
+        .child(develop_slider(
+            k,
+            "sl-dehaze",
+            "Dehaze",
+            r.dehaze,
+            -1.0..=1.0,
+            format!("{:+.0}", r.dehaze * 100.0),
+            0.0,
+            |rec, v| rec.dehaze = v,
         ))
         .child(develop_slider(
             k,
@@ -1201,6 +1637,8 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
     let detail_reset = mini_reset_btn(k, "Reset Detail", detail_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |rec| {
             rec.clarity = 0.0;
+            rec.structure = 0.0;
+            rec.dehaze = 0.0;
             rec.sharpen = 0.0;
             rec.noise_reduction = 0.0;
         });
@@ -1209,7 +1647,7 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
     let fx_neutral = r.vignette.abs() < 0.005 && r.grain.abs() < 0.005;
     let fx_controls = col()
         .w_full()
-        .gap(10.0)
+        .gap(space::MD)
         .child(develop_slider(
             k,
             "sl-vignette",
@@ -1239,11 +1677,11 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(10.0)
+        .gap(space::LG)
         .child(section_card(
             k,
             "sec-detail",
-            "DETAIL & SHARPENING",
+            "DETAIL & ATMOSPHERE",
             Some(detail_reset),
             detail_controls,
         ))
@@ -1256,15 +1694,233 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn crop_pill_btn(
+    k: &Kit,
+    key: impl Into<String>,
+    role: &'static str,
+    aria_label: impl Into<String>,
+    text_label: &'static str,
+    height: f32,
+    active: bool,
+    rest_text_color: Color,
+    on_press: impl Fn(&mut AppState, &mut Tx) + 'static,
+) -> El {
+    let mut pill = row()
+        .key(key.into())
+        .role(role)
+        .label(aria_label.into())
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .grow(1.0)
+        .min_w(0.0)
+        .h(height)
+        .center()
+        .radius(k.radius.sm)
+        .fill(color::pill_fill(k, active))
+        .hover(k.c.hover)
+        .border(
+            if active {
+                border::REGULAR
+            } else {
+                border::HAIRLINE
+            },
+            color::pill_border(k, active),
+        )
+        .child(
+            text(text_label)
+                .font(ty::section_header(k))
+                .color(if active {
+                    k.c.text_accent
+                } else {
+                    rest_text_color
+                }),
+        )
+        .on_press_tx(on_press);
+    if role == "radio" {
+        pill = pill.checked(active);
+    }
+    pill
+}
+
+fn crop_tab_content(s: &AppState, k: &Kit) -> El {
+    let geo = s.recipe.geometry;
+    let [out_w, out_h] = geo.cropped_output_size(s.image.width, s.image.height);
+
+    let mut aspect_rows = col().w_full().gap(space::TIGHT);
+    for chunk in CropAspect::ALL.chunks(4) {
+        let mut r = row().w_full().gap(space::TIGHT);
+        for &preset in chunk {
+            let active = geo.aspect_preset == preset;
+            r = r.child(crop_pill_btn(
+                k,
+                format!("aspect-{}", preset.label()),
+                "radio",
+                format!("Crop aspect {}", preset.label()),
+                preset.label(),
+                size::ASPECT_PILL_H,
+                active,
+                k.c.text_muted,
+                move |s, tx| s.set_crop_aspect_tx(preset, tx),
+            ));
+        }
+        aspect_rows = aspect_rows.child(r);
+    }
+
+    let crop_toggle = row()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .child(
+            col()
+                .gap(space::MICRO)
+                .child(
+                    text("Interactive Crop Frame")
+                        .font(ty::control_label(k))
+                        .color(k.c.text_base),
+                )
+                .child(
+                    text(format!("Output {out_w}×{out_h} px"))
+                        .font(ty::mono_compact(k))
+                        .color(k.c.text_muted),
+                ),
+        )
+        .child(
+            Switch::new(s.camera.crop_mode)
+                .label("Interactive Crop Frame")
+                .hide_label()
+                .on_toggle_tx(|s: &mut AppState, tx| s.toggle_crop_mode_tx(tx))
+                .build(k),
+        );
+
+    let crop_reset = mini_reset_btn(k, "Reset Crop & Geometry", geo.is_identity(), |s, tx| {
+        s.update_geometry_slider_tx(true, tx, |rec| rec.geometry.reset());
+    });
+
+    let crop_body = col()
+        .w_full()
+        .gap(space::MD)
+        .child(crop_toggle)
+        .child(aspect_rows)
+        .child(
+            text("Drag corners or edges on photo  •  Press C to apply")
+                .font(ty::caption(k))
+                .color(k.c.text_faint),
+        );
+
+    let straighten = develop_slider_inner(
+        k,
+        "sl-straighten",
+        "Straighten",
+        None,
+        geo.sanitized_straighten_deg(),
+        -45.0..=45.0,
+        format!("{:+.1}°", geo.sanitized_straighten_deg()),
+        0.0,
+        false,
+        |rec, v| rec.geometry.straighten_deg = v,
+    );
+
+    let rot_btn = |key: &'static str,
+                   label: &'static str,
+                   active: bool,
+                   on_press: fn(&mut AppState, &mut Tx)| {
+        crop_pill_btn(
+            k,
+            key,
+            "button",
+            label,
+            label,
+            size::ACTION_PILL_H,
+            active,
+            k.c.text_base,
+            on_press,
+        )
+    };
+
+    let xform_row = row()
+        .w_full()
+        .gap(space::TIGHT)
+        .child(rot_btn("btn-rot-ccw", "↺ 90°", false, |s, tx| {
+            s.update_geometry_slider_tx(true, tx, |r| {
+                r.geometry.rotate_90 = (r.geometry.rotate_90 - 1).rem_euclid(4);
+            });
+        }))
+        .child(rot_btn("btn-rot-cw", "↻ 90°", false, |s, tx| {
+            s.update_geometry_slider_tx(true, tx, |r| {
+                r.geometry.rotate_90 = (r.geometry.rotate_90 + 1).rem_euclid(4);
+            });
+        }))
+        .child(rot_btn("btn-flip-h", "Flip H", geo.flip_h, |s, tx| {
+            s.update_geometry_slider_tx(true, tx, |r| r.geometry.flip_h = !r.geometry.flip_h);
+        }))
+        .child(rot_btn("btn-flip-v", "Flip V", geo.flip_v, |s, tx| {
+            s.update_geometry_slider_tx(true, tx, |r| r.geometry.flip_v = !r.geometry.flip_v);
+        }));
+
+    let rot_body = col()
+        .w_full()
+        .gap(space::MD)
+        .child(straighten)
+        .child(xform_row);
+
+    let grid_idx = CompositionGrid::ALL
+        .iter()
+        .position(|&g| g == geo.grid)
+        .unwrap_or(1);
+    let grid_labels = ["Off", "Thirds", "Golden", "Diag"];
+    let grid_seg = SegmentedControl::new(&grid_labels, Some(grid_idx))
+        .label("Composition grid overlay")
+        .width(None)
+        .on_pick(|s: &mut AppState, i, tx| {
+            let next_grid = CompositionGrid::ALL
+                .get(i)
+                .copied()
+                .unwrap_or(CompositionGrid::RuleOfThirds);
+            s.update_geometry_slider_tx(true, tx, |r| r.geometry.grid = next_grid);
+        })
+        .build(k);
+
+    col()
+        .w_full()
+        .gap(space::LG)
+        .child(section_card(
+            k,
+            "sec-crop",
+            "CROP & ASPECT",
+            Some(crop_reset),
+            crop_body,
+        ))
+        .child(section_card(
+            k,
+            "sec-rotate",
+            "ROTATE & FLIP",
+            None,
+            rot_body,
+        ))
+        .child(section_card(
+            k,
+            "sec-grid",
+            "COMPOSITION GRID",
+            None,
+            grid_seg,
+        ))
+}
+
 fn presets_tab_content(s: &AppState, k: &Kit) -> El {
-    let mut grid_rows = col().w_full().gap(6.0);
+    let mut grid_rows = col().w_full().gap(space::SM);
     for chunk in s.presets.chunks(2) {
-        let mut r = row().w_full().gap(6.0);
+        let mut r = row().w_full().gap(space::SM);
         for preset in chunk {
             let active = s.recipe.preset_name.as_deref() == Some(preset.name);
             let id = preset.id;
             let name = preset.name;
-            let subtitle = if preset.recipe.saturation <= -0.95 {
+            let subtitle = if preset.recipe.bw.enabled || preset.recipe.saturation <= -0.95 {
                 "Monochrome"
             } else if preset.recipe.temperature > 0.1 {
                 "Warm Analog"
@@ -1281,29 +1937,37 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
                 .role("button")
                 .label(format!("Apply style {name}"))
                 .focusable(true)
-                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .focus_ring(
+                    border::FOCUS_RING,
+                    border::FOCUS_OFFSET_TIGHT,
+                    k.c.border_focus,
+                )
                 .cursor(Cursor::Pointer)
                 .grow(1.0)
                 .min_w(0.0)
-                .gap(2.0)
-                .padding(10.0)
+                .gap(space::XXS)
+                .padding(space::LG)
                 .radius(k.radius.md)
-                .fill(if active { k.c.layer_03 } else { k.c.bg_base })
+                .fill(color::pill_fill(k, active))
                 .hover(k.c.hover)
                 .border(
-                    if active { 1.0 } else { 0.5 },
                     if active {
-                        k.c.border_focus
+                        border::REGULAR
                     } else {
-                        k.c.border_base
+                        border::HAIRLINE
                     },
+                    color::pill_border(k, active),
                 )
-                .child(text(name).font(k.ty.text_xsmall_medium).color(if active {
-                    k.c.text_accent
-                } else {
-                    k.c.text_base
-                }))
-                .child(text(subtitle).font(k.ty.small).color(k.c.text_faint))
+                .child(
+                    text(name)
+                        .font(ty::control_label_medium(k))
+                        .color(if active {
+                            k.c.text_accent
+                        } else {
+                            k.c.text_base
+                        }),
+                )
+                .child(text(subtitle).font(ty::caption(k)).color(k.c.text_faint))
                 .on_press_tx(move |s: &mut AppState, tx| s.apply_preset_tx(id, tx));
 
             r = r.child(card);
@@ -1313,7 +1977,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
 
     let clipboard_actions = row()
         .w_full()
-        .gap(8.0)
+        .gap(space::MD)
         .child(
             Button::new("Copy Look")
                 .variant(ButtonVariant::Neutral)
@@ -1333,7 +1997,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
                 .build(k),
         );
 
-    let reset_all_row = row().w_full().gap(8.0).child(
+    let reset_all_row = row().w_full().gap(space::MD).child(
         Button::new("Reset All Adjustments")
             .variant(ButtonVariant::Danger)
             .control_size(ControlSize::Regular)
@@ -1346,7 +2010,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(10.0)
+        .gap(space::LG)
         .child(section_card(
             k,
             "sec-styles",
@@ -1361,7 +2025,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             None,
             col()
                 .w_full()
-                .gap(8.0)
+                .gap(space::MD)
                 .child(clipboard_actions)
                 .child(reset_all_row),
         ))
@@ -1378,6 +2042,7 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
         .controls(1, "inspector-tabpanel")
         .controls(2, "inspector-tabpanel")
         .controls(3, "inspector-tabpanel")
+        .controls(4, "inspector-tabpanel")
         .on_pick(|s: &mut AppState, i, _| {
             s.active_tab = InspectorTab::from_index(i);
         })
@@ -1386,9 +2051,12 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
     let pinned_header = col()
         .key("inspector-pinned")
         .w_full()
-        .gap(8.0)
-        .padding(10.0)
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_base)
+        .gap(space::MD)
+        .padding(space::LG)
+        .border_sides(
+            [border::NONE, border::NONE, border::REGULAR, border::NONE],
+            k.c.border_base,
+        )
         .child(histogram_panel(s, k))
         .child(tabs);
 
@@ -1396,6 +2064,7 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
         InspectorTab::Light => light_tab_content(s, k),
         InspectorTab::Color => color_tab_content(s, k),
         InspectorTab::Detail => detail_tab_content(s, k),
+        InspectorTab::Crop => crop_tab_content(s, k),
         InspectorTab::Presets => presets_tab_content(s, k),
     };
 
@@ -1407,7 +2076,7 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
             InspectorTab::LABELS[s.active_tab.index()]
         ))
         .w_full()
-        .padding(10.0)
+        .padding(space::LG)
         .child(tab_body);
 
     let scroll_viewport = el()
@@ -1416,16 +2085,19 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec::default())
-        .clip_fade(0.0, 0.0, 0.0, 14.0)
+        .clip_fade(0.0, 0.0, 0.0, size::SCROLL_FADE)
         .child(scroll_content);
 
     col()
         .key("develop-inspector")
-        .w(INSPECTOR_WIDTH)
+        .w(size::INSPECTOR_W)
         .h_full()
         .min_h(0.0)
         .fill(k.c.bg_base)
-        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_base)
+        .border_sides(
+            [border::NONE, border::NONE, border::NONE, border::REGULAR],
+            k.c.border_base,
+        )
         .child(pinned_header)
         .child(k.scroll_bar(scroll_viewport))
 }

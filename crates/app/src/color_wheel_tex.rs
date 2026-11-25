@@ -1,36 +1,12 @@
-//! High-DPI circular color wheel texture and 8-band HSL swatch palette for the
-//! Capture One-style Color inspector.
+//! High-DPI circular color wheel texture and geometry helpers for the
+//! Capture One-style 3-Way Color Balance inspector.
 
 use std::f32::consts::TAU;
 use std::sync::OnceLock;
 
-use rune::color::srgb_decode;
 use rune::{Color, Pixels};
 
-/// Constructs a linear `rune::Color` from sRGB `(r, g, b)` components in `0.0..=1.0`.
-#[inline]
-pub fn srgb(r: f32, g: f32, b: f32) -> Color {
-    Color {
-        r: srgb_decode(r),
-        g: srgb_decode(g),
-        b: srgb_decode(b),
-        a: 1.0,
-    }
-}
-
-/// Display swatch colors for the 8 HSL bands (calibrated sRGB for OpenCode dark chrome).
-pub fn hsl_band_swatch(index: usize) -> Color {
-    match index {
-        0 => srgb(0.92, 0.28, 0.28), // Red
-        1 => srgb(0.94, 0.56, 0.22), // Orange
-        2 => srgb(0.92, 0.82, 0.26), // Yellow
-        3 => srgb(0.32, 0.80, 0.42), // Green
-        4 => srgb(0.24, 0.78, 0.84), // Aqua / Cyan
-        5 => srgb(0.32, 0.56, 0.96), // Blue
-        6 => srgb(0.62, 0.40, 0.94), // Purple
-        _ => srgb(0.88, 0.34, 0.72), // Magenta
-    }
-}
+use crate::tokens;
 
 /// Returns a cached 160x160 anti-aliased Capture One-style color balance wheel texture.
 ///
@@ -60,24 +36,19 @@ pub fn build_color_wheel_rgba(size: u32) -> Vec<u8> {
             let dy = (y as f32 + 0.5 - half) / outer_r;
             let r = (dx * dx + dy * dy).sqrt();
 
-            // Smooth anti-aliased disc edge (1.5 px feather)
             let edge_px = (1.0 - r) * outer_r;
             let alpha = (edge_px + 0.75).clamp(0.0, 1.0);
             if alpha <= 0.0 {
                 continue;
             }
 
-            // Angle: +X = 0 deg (Red), counter-clockwise in screen Y-up -> use -dy
             let angle = (-dy).atan2(dx).rem_euclid(TAU);
-            let hue = angle / TAU; // 0..1
+            let hue = angle / TAU;
 
-            // Keep center neutral darkroom gray (#1f1f1f) and saturate smoothly toward rim
-            // with a subtle vibrant outer hue ring for immediate chromatic orientation.
             let sat_curve = r.clamp(0.0, 1.0).powf(1.15);
             let is_rim = ((r - 0.88) / 0.12).clamp(0.0, 1.0);
             let (hr, hg, hb) = hsv_to_rgb(hue, 0.82, 0.88);
 
-            // Base darkroom neutral center -> chromatic fill -> crisper outer hue ring
             let base = 0.145;
             let mix_amt = sat_curve * 0.56 + is_rim * 0.28;
             let cr = (base + (hr - base) * mix_amt).clamp(0.0, 1.0);
@@ -114,7 +85,6 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 
 /// Maps pointer `(px, py)` in a `diameter x diameter` wheel widget to normalized
 /// `(hue_x, hue_y)` clamped to the unit disk (`x^2 + y^2 <= 1.0`).
-/// Screen Y is inverted so +Y is upward on the wheel.
 pub fn pointer_to_wheel_xy(px: f32, py: f32, diameter: f32) -> (f32, f32) {
     let r = (diameter * 0.5).max(1.0);
     let usable = (r - 4.0).max(1.0);
@@ -139,9 +109,9 @@ pub fn wheel_xy_to_point(hue_x: f32, hue_y: f32, diameter: f32) -> [f32; 2] {
 pub fn wheel_puck_color(hue_x: f32, hue_y: f32) -> Color {
     let mag = (hue_x * hue_x + hue_y * hue_y).sqrt().clamp(0.0, 1.0);
     if mag < 0.02 {
-        return srgb(0.85, 0.85, 0.88);
+        return tokens::color::wheel_neutral_puck();
     }
     let hue = hue_y.atan2(hue_x).rem_euclid(TAU) / TAU;
     let (r, g, b) = hsv_to_rgb(hue, 0.35 + 0.65 * mag, 0.96);
-    srgb(r, g, b)
+    tokens::srgb(r, g, b)
 }

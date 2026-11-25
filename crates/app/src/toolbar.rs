@@ -13,37 +13,40 @@ use rune_theme_opencode::icons;
 
 use crate::menu::{trigger_export_dialog, trigger_open_dialog, trigger_open_folder};
 use crate::state::AppState;
-
-pub const TITLEBAR_HEIGHT: f32 = 48.0;
+use crate::tokens::{border, size, space, ty};
 
 pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
-    let left_pad = insets.leading + 14.0;
-    let right_pad = insets.trailing + 14.0;
-    let band_h = insets.height.max(TITLEBAR_HEIGHT);
+    let left_pad = insets.leading + space::XXL;
+    let right_pad = insets.trailing + space::XXL;
+    let band_h = insets.height.max(size::TITLEBAR_H);
 
     // Left cluster: monochrome brand glyph + title + document filename + badges
     let mut left = row()
         .key("toolbar-left")
         .items_center()
-        .gap(8.0)
+        .gap(space::MD)
         .min_w(0.0)
         .shrink()
         .no_window_drag()
         .child(
             row()
                 .items_center()
-                .gap(6.0)
-                .child(icon(&icons::PHOTO, 15.0).color(k.c.icon_base).a11y_hidden())
+                .gap(space::SM)
+                .child(
+                    icon(&icons::PHOTO, size::ICON_LG)
+                        .color(k.c.icon_base)
+                        .a11y_hidden(),
+                )
                 .child(
                     text("Rune Darkroom")
-                        .font(k.ty.ui_medium)
+                        .font(ty::brand_title(k))
                         .color(k.c.text_base),
                 ),
         )
         .child(el_v_divider(k))
         .child(
             text(s.image.display_name.as_str())
-                .font(k.ty.text_xsmall)
+                .font(ty::control_label(k))
                 .color(k.c.text_muted)
                 .truncate(),
         );
@@ -54,7 +57,7 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         left = left.child(Badge::new("16-BIT").variant(BadgeVariant::Subtle).build(k));
     }
 
-    // Center cluster: OpenCode SegmentedControl for Zoom + Before/After Split toggle
+    // Center cluster: Zoom + Compare + Capture One Viewer Diagnostics (Clipping, Focus Mask, Crop)
     let zoom_sel = if (s.camera.zoom - 1.0).abs() < 0.03 {
         Some(0)
     } else if (s.camera.zoom - 1.5).abs() < 0.15 {
@@ -94,13 +97,56 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         })
         .build(k);
 
+    let clip_btn = IconButton::new(&icons::WARNING)
+        .variant(if s.camera.exposure_warning {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("Exposure Clipping Warning")
+        .help("Highlight overexposed (red) and crushed shadow (blue) pixels")
+        .shortcut("cmd+e")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_exposure_warning_tx(tx))
+        .build(k);
+
+    let focus_btn = IconButton::new(&icons::EYE)
+        .variant(if s.camera.focus_mask {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("Focus Mask")
+        .help("Highlight sharp in-focus edges in green")
+        .shortcut("cmd+m")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_focus_mask_tx(tx))
+        .build(k);
+
+    let crop_btn = IconButton::new(&icons::OUTLINE_MAXIMIZE)
+        .variant(if s.camera.crop_mode {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("Crop & Geometry")
+        .help("Toggle interactive crop, straighten and composition grid")
+        .shortcut("C")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_crop_mode_tx(tx))
+        .build(k);
+
     let center = row()
         .key("toolbar-center")
         .items_center()
-        .gap(8.0)
+        .gap(space::SM)
         .no_window_drag()
         .child(zoom_seg)
-        .child(split_btn);
+        .child(split_btn)
+        .child(el_v_divider(k))
+        .child(clip_btn)
+        .child(focus_btn)
+        .child(crop_btn);
 
     // Right cluster: Open / Folder / Undo / Redo / Filmstrip / Inspector / Export CTA
     let open_photo = IconButton::new(&icons::OPEN_FILE)
@@ -189,7 +235,7 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
     let right = row()
         .key("toolbar-right")
         .items_center()
-        .gap(4.0)
+        .gap(space::XS)
         .no_window_drag()
         .child(open_photo)
         .child(open_folder)
@@ -210,11 +256,14 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         .h(band_h)
         .pl(left_pad)
         .pr(right_pad)
-        .gap(12.0)
+        .gap(space::LG)
         .center_y()
         .justify_between()
         .fill(k.c.bg_deep)
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_base)
+        .border_sides(
+            [border::NONE, border::NONE, border::REGULAR, border::NONE],
+            k.c.border_base,
+        )
         .window_drag()
         .child(left)
         .child(center)
@@ -223,8 +272,8 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
 
 fn el_v_divider(k: &Kit) -> El {
     row()
-        .px(2.0)
-        .h(16.0)
+        .px(space::XXS)
+        .h(size::DIVIDER_TOOLBAR_H)
         .items_center()
         .child(Divider::vertical().build(k))
 }
