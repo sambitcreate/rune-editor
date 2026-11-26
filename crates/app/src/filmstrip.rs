@@ -217,10 +217,11 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
         }
     }
 
-    let scroll_strip = el()
+    let scroll_strip = row()
         .key("filmstrip-scroll")
         .w_full()
         .grow(1.0)
+        .min_w(0.0)
         .min_h(0.0)
         .scroll_x()
         .child(strip);

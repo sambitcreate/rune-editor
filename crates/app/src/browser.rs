@@ -295,7 +295,7 @@ pub fn grid_browser_view(s: &AppState, k: &Kit) -> El {
         }
     }
 
-    let scroll_vp = el()
+    let scroll_vp = col()
         .key("grid-browser-scroll")
         .w_full()
         .grow(1.0)

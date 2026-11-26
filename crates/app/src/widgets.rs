@@ -22,8 +22,8 @@ use crate::color_wheel_tex::{
     hsv_to_rgb, pointer_to_wheel_xy, wheel_pixels, wheel_puck_color, wheel_xy_to_point,
 };
 use crate::state::{
-    AppState, ColorBalanceView, ColorEditorMode, CurveChannel, InspectorTab, LevelsChannel,
-    descriptor_default, descriptor_range, scalar_default, scalar_range,
+    AppState, ColorBalanceView, ColorEditorMode, CurveChannel, InfoTip, InspectorTab,
+    LevelsChannel, descriptor_default, descriptor_range, scalar_default, scalar_range,
 };
 use crate::tokens::{self, border, color, radius, size, space, ty};
 
@@ -100,14 +100,32 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
         .on_press_tx(|s: &mut AppState, tx| s.toggle_readout_picker_tx(tx))
         .build(k);
 
+    let hist_tip = InfoTip {
+        title: "RGB & Luma Histogram",
+        shortcut: Some("⌘E"),
+        description: "Live 16-bit linear tonal distribution with shadow (BLK) and highlight (WHT) clipping telemetry plus hover RGB/HSL/Lab probe.",
+        cli_key: "rd analyze <photo>  ·  MCP: rune_analyze_photo",
+        tier: "Tier 0 · Scope",
+    };
+
     let header = row()
         .w_full()
         .justify_between()
         .items_center()
         .child(
-            text("HISTOGRAM")
-                .font(ty::section_header(k))
-                .color(k.c.text_muted),
+            row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    text("HISTOGRAM")
+                        .font(ty::section_header(k))
+                        .color(k.c.text_muted),
+                )
+                .child(info_badge(
+                    k,
+                    hist_tip,
+                    s.hovered_info.is_some_and(|h| h.title == hist_tip.title),
+                )),
         )
         .child(
             row()
@@ -197,8 +215,8 @@ pub fn histogram_panel(s: &AppState, k: &Kit) -> El {
     let mut card = col()
         .key("histogram-card")
         .w_full()
-        .gap(space::TIGHT)
-        .padding(space::LG)
+        .gap(space::ROW_GAP)
+        .padding(space::CARD_PAD)
         .radius(k.radius.lg)
         .fill(k.c.bg_deep)
         .border(border::HAIRLINE, k.c.border_base)
@@ -309,8 +327,244 @@ fn card_header_divider(k: &Kit) -> El {
         .a11y_hidden()
 }
 
-/// Collapsible Capture One / OpenCode tool card with disclosure chevron, uppercase title,
-/// subtle modified indicator dot, and compact right-aligned actions.
+/// Reusable `15pt` circular Tier 2 `ⓘ` hover info badge.
+/// Hovering updates transient `AppState.hovered_info` (never dirties recipe or undo history).
+pub(crate) fn info_badge(k: &Kit, tip: InfoTip, hovered: bool) -> El {
+    let sz = size::INFO_BADGE_SIZE;
+    row()
+        .key(format!("info-badge-{}", tip.title))
+        .role("button")
+        .label(format!("Info: {}", tip.title))
+        .help(tip.description)
+        .cursor(Cursor::Default)
+        .size(sz, sz)
+        .center()
+        .radius(radius::circle(sz))
+        .fill(if hovered {
+            k.c.text_accent.alpha(0.18)
+        } else {
+            color::info_badge_bg()
+        })
+        .border(
+            border::REGULAR,
+            if hovered {
+                k.c.text_accent
+            } else {
+                color::info_badge_border()
+            },
+        )
+        .child(text("i").font(ty::mono_probe(k)).color(if hovered {
+            k.c.text_accent
+        } else {
+            k.c.text_muted
+        }))
+        .on_hover_change(move |s: &mut AppState, inside, _tx| {
+            if inside {
+                s.set_hovered_info(tip);
+            } else {
+                s.clear_hovered_info(tip.title);
+            }
+        })
+}
+
+/// Floating frosted darkroom info card rendered whenever `state.hovered_info` is `Some(...)`.
+/// Positioned cleanly at top-right of the photo canvas (or bottom-left of Settings/Export)
+/// so it never overlaps macOS traffic lights or clips off-screen.
+pub fn floating_info_popover(s: &AppState, k: &Kit) -> Option<El> {
+    let tip = s.hovered_info?;
+
+    let mut header = row()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .child(
+            text(tip.title)
+                .font(ty::brand_title(k))
+                .color(k.c.text_base)
+                .truncate(),
+        );
+
+    let mut badges = row().items_center().gap(space::XS);
+    if let Some(sc) = tip.shortcut {
+        badges = badges.child(
+            el().px(space::SM)
+                .py(space::MICRO)
+                .radius(k.radius.xs)
+                .fill(k.c.bg_deep)
+                .border(border::HAIRLINE, k.c.border_strong)
+                .child(text(sc).font(ty::mono_probe(k)).color(k.c.text_base)),
+        );
+    }
+    badges = badges.child(
+        el().px(space::SM)
+            .py(space::MICRO)
+            .radius(k.radius.xs)
+            .fill(k.c.layer_02)
+            .border(border::HAIRLINE, k.c.border_muted)
+            .child(text(tip.tier).font(ty::mono_probe(k)).color(k.c.text_muted)),
+    );
+    header = header.child(badges);
+
+    let card = col()
+        .key("floating-info-popover")
+        .role("tooltip")
+        .label(tip.title)
+        .w(size::INFO_POPOVER_W)
+        .padding(space::CARD_PAD)
+        .gap(space::ROW_GAP)
+        .radius(k.radius.lg)
+        .continuous_corners()
+        .backdrop_blur(size::HUD_BLUR_STRONG)
+        .fill(color::popover_bg())
+        .border(border::HAIRLINE, k.c.border_strong)
+        .child(header)
+        .child(
+            text(tip.description)
+                .font(ty::caption(k))
+                .color(k.c.text_muted)
+                .wrap(),
+        )
+        .child(
+            el().w_full()
+                .px(space::MD)
+                .py(space::XS)
+                .radius(k.radius.sm)
+                .fill(k.c.bg_deep)
+                .border(border::HAIRLINE, k.c.border_muted)
+                .child(
+                    text(tip.cli_key)
+                        .font(ty::mono_probe(k))
+                        .color(k.c.text_accent)
+                        .wrap(),
+                ),
+        );
+
+    let pinned = if s.show_settings || s.show_export {
+        card.pin(
+            Some(size::SETTINGS_SIDEBAR_W + space::MODAL_PAD),
+            None,
+            None,
+            Some(size::STATUS_BAR_H + space::HUD_Y),
+        )
+    } else {
+        let right_offset = if s.show_inspector {
+            size::INSPECTOR_W + space::HUD_X
+        } else {
+            space::HUD_X
+        };
+        card.pin(
+            None,
+            Some(size::TITLEBAR_H + space::HUD_Y),
+            Some(right_offset),
+            None,
+        )
+    };
+
+    Some(k.elevate(pinned, &k.elevation.floating))
+}
+
+/// Reusable inline Tier 1 `Advanced ▸` progressive disclosure toggle row.
+/// Displays an accent modified-count pill whenever hidden Tier 1 controls are non-default.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn advanced_disclosure_row(
+    k: &Kit,
+    key: &'static str,
+    label: &'static str,
+    is_open: bool,
+    modified_count: usize,
+    total_count: usize,
+    on_toggle: fn(&mut AppState),
+) -> El {
+    let chevron = if is_open {
+        &icons::CHEVRON_DOWN
+    } else {
+        &icons::CHEVRON_RIGHT
+    };
+
+    let mut right_el = row().items_center().gap(space::XS);
+    if modified_count > 0 {
+        right_el = right_el.child(
+            row()
+                .items_center()
+                .gap(space::XS)
+                .px(space::SM)
+                .h(18.0)
+                .radius(radius::circle(18.0))
+                .fill(k.c.text_accent.alpha(0.16))
+                .border(border::HAIRLINE, k.c.text_accent.alpha(0.45))
+                .child(
+                    el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                        .radius(radius::circle(size::MODIFIED_DOT))
+                        .fill(k.c.text_accent)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(format!("{modified_count} active"))
+                        .font(ty::mono_probe(k))
+                        .color(k.c.text_accent),
+                ),
+        );
+    } else if total_count > 0 {
+        right_el = right_el.child(
+            text(format!("{total_count}"))
+                .font(ty::mono_probe(k))
+                .color(k.c.text_faint),
+        );
+    }
+
+    row()
+        .key(key)
+        .role("button")
+        .label(format!("Toggle {label}"))
+        .expanded(is_open)
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .w_full()
+        .h(size::PILL_H)
+        .px(space::MD)
+        .items_center()
+        .justify_between()
+        .radius(k.radius.md)
+        .fill(if is_open { k.c.layer_02 } else { k.c.bg_base })
+        .hover(k.c.layer_02)
+        .border(
+            border::HAIRLINE,
+            if is_open || modified_count > 0 {
+                k.c.border_base
+            } else {
+                k.c.border_muted
+            },
+        )
+        .child(
+            row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    icon(chevron, size::ICON_XS)
+                        .color(k.c.icon_muted)
+                        .a11y_hidden(),
+                )
+                .child(text(label).font(ty::control_label(k)).color(
+                    if is_open || modified_count > 0 {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    },
+                )),
+        )
+        .child(right_el)
+        .on_press(on_toggle)
+}
+
+/// Collapsible Capture One / OpenCode `Studio Airy` tool card with disclosure chevron,
+/// uppercase title, subtle modified indicator dot, trailing `ⓘ` hover info badge, and
+/// compact right-aligned actions.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collapsible_section_card(
     k: &Kit,
@@ -319,6 +573,8 @@ pub(crate) fn collapsible_section_card(
     open: bool,
     modified: bool,
     on_toggle: fn(&mut AppState),
+    hovered_info: Option<InfoTip>,
+    info: InfoTip,
     header_actions: Option<El>,
     content: El,
 ) -> El {
@@ -337,7 +593,7 @@ pub(crate) fn collapsible_section_card(
         .radius(k.radius.xs)
         .cursor(Cursor::Pointer)
         .items_center()
-        .gap(space::TIGHT)
+        .gap(space::SM)
         .child(
             icon(chevron, size::ICON_SM)
                 .color(k.c.icon_muted)
@@ -358,11 +614,21 @@ pub(crate) fn collapsible_section_card(
     }
     let toggle = toggle.on_press(on_toggle);
 
+    let title_cluster = row()
+        .items_center()
+        .gap(space::SM)
+        .child(toggle)
+        .child(info_badge(
+            k,
+            info,
+            hovered_info.is_some_and(|h| h.title == info.title),
+        ));
+
     let mut header = row()
         .w_full()
         .justify_between()
         .items_center()
-        .child(toggle);
+        .child(title_cluster);
     if let Some(actions) = header_actions {
         header = header.child(actions);
     }
@@ -370,8 +636,8 @@ pub(crate) fn collapsible_section_card(
     let mut card = col()
         .key(key)
         .w_full()
-        .gap(space::MD)
-        .padding(space::LG)
+        .gap(space::CARD_HEADER_GAP)
+        .padding(space::CARD_PAD)
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(border::HAIRLINE, k.c.border_base)
@@ -650,7 +916,7 @@ pub(crate) fn develop_slider_sized(
     let content_row = row()
         .w_full()
         .h_full()
-        .px(space::LG)
+        .px(space::XL)
         .items_center()
         .justify_between()
         .child(label_row)
@@ -865,9 +1131,12 @@ fn levels_section(s: &AppState, k: &Kit) -> El {
     }
 
     let ch_tag = active_ch.short_label();
-    let controls = col()
+    let out_mod_count =
+        usize::from(ch_lv.out_black > 0.005) + usize::from((1.0 - ch_lv.out_white).abs() > 0.005);
+
+    let mut controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(ch_row)
         .child(strip)
         .child(develop_slider_inner(
@@ -906,30 +1175,43 @@ fn levels_section(s: &AppState, k: &Kit) -> El {
             true,
             move |rec, v| active_ch.set_in_white(&mut rec.levels, v),
         ))
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            format!("sl-lvl-{ch_tag}-out-black"),
-            "Out Shadow",
-            None,
-            ch_lv.out_black,
-            0.0..=1.0,
-            format!("{:.0}", ch_lv.out_black * 255.0),
-            0.0,
-            true,
-            move |rec, v| active_ch.set_out_black(&mut rec.levels, v),
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-lvl-{ch_tag}-out-white"),
-            "Out Highlight",
-            None,
-            ch_lv.out_white,
-            0.0..=1.0,
-            format!("{:.0}", ch_lv.out_white * 255.0),
-            1.0,
-            true,
-            move |rec, v| active_ch.set_out_white(&mut rec.levels, v),
+            "adv-levels-output",
+            "Output Levels",
+            s.levels_advanced_open,
+            out_mod_count,
+            2,
+            |s| s.levels_advanced_open = !s.levels_advanced_open,
         ));
+
+    if s.levels_advanced_open {
+        controls = controls
+            .child(develop_slider_inner(
+                k,
+                format!("sl-lvl-{ch_tag}-out-black"),
+                "Out Shadow",
+                None,
+                ch_lv.out_black,
+                0.0..=1.0,
+                format!("{:.0}", ch_lv.out_black * 255.0),
+                0.0,
+                true,
+                move |rec, v| active_ch.set_out_black(&mut rec.levels, v),
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-lvl-{ch_tag}-out-white"),
+                "Out Highlight",
+                None,
+                ch_lv.out_white,
+                0.0..=1.0,
+                format!("{:.0}", ch_lv.out_white * 255.0),
+                1.0,
+                true,
+                move |rec, v| active_ch.set_out_white(&mut rec.levels, v),
+            ));
+    }
 
     let actions = row()
         .items_center()
@@ -956,6 +1238,14 @@ fn levels_section(s: &AppState, k: &Kit) -> El {
         s.levels_open,
         !lv_all.is_identity(),
         |s| s.levels_open = !s.levels_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Per-Channel Levels",
+            shortcut: None,
+            description: "Remaps black, midtone gamma, and white points across RGB or individual R/G/B channels. Click A for 0.1% Auto Levels.",
+            cli_key: "levels.{in_black,in_mid,in_white,out_black,out_white}",
+            tier: "Tier 1 · Levels",
+        },
         Some(actions),
         controls,
     )
@@ -1299,14 +1589,9 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
 
     let body = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::ROW_GAP)
         .child(controls_row)
-        .child(canvas_box)
-        .child(
-            text("Click to add  •  Drag  •  Double-click removes")
-                .font(ty::caption(k))
-                .color(k.c.text_faint),
-        );
+        .child(canvas_box);
 
     let reset = mini_reset_btn(k, "Reset active curve channel", channel_is_flat, |s, tx| {
         s.reset_active_curve_channel_tx(tx);
@@ -1319,6 +1604,14 @@ fn tone_curve_editor(s: &AppState, k: &Kit) -> El {
         s.curve_open,
         any_curve_modified,
         |s| s.curve_open = !s.curve_open,
+        s.hovered_info,
+        InfoTip {
+            title: "5-Tab Tone Curve",
+            shortcut: None,
+            description: "Fritsch-Carlson monotonic cubic spline across RGB, Luma, and R/G/B channels. Click graph to add a point, drag to shape, double-click to remove.",
+            cli_key: "curves.{rgb,luma,red,green,blue}  ·  MCP: rune_edit_photo",
+            tier: "Tier 1 · Spline",
+        },
         Some(reset),
         body,
     )
@@ -1667,7 +1960,7 @@ fn color_wheels_section(s: &AppState, k: &Kit) -> El {
 
     let body = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::GROUP_GAP)
         .child(mode_switcher)
         .child(content);
 
@@ -1687,6 +1980,14 @@ fn color_wheels_section(s: &AppState, k: &Kit) -> El {
         s.color_balance_open,
         !all_neutral,
         |s| s.color_balance_open = !s.color_balance_open,
+        s.hovered_info,
+        InfoTip {
+            title: "3-Way & Master Color Balance",
+            shortcut: None,
+            description: "Applies independent hue/chroma tints and luminance offsets across Shadows, Midtones, Highlights, or the Master wheel. Click a wheel title to reset.",
+            cli_key: "{shadows,midtones,highlights,master}_wheel  ·  MCP: rune_edit_photo",
+            tier: "Tier 0 · Color",
+        },
         Some(reset),
         body,
     )
@@ -1750,7 +2051,7 @@ fn bw_section(s: &AppState, k: &Kit) -> El {
         ),
     ];
 
-    let mut body = col().w_full().gap(space::TIGHT);
+    let mut body = col().w_full().gap(space::ROW_GAP);
     for (key, label, dot, val, setter) in channels {
         body = body.child(develop_slider_inner(
             k,
@@ -1767,66 +2068,70 @@ fn bw_section(s: &AppState, k: &Kit) -> El {
     }
 
     if bw.enabled {
-        let shadow_dot = split_tone_hue_dot(bw.split_shadow_hue, bw.split_shadow_sat);
-        let highlight_dot = split_tone_hue_dot(bw.split_highlight_hue, bw.split_highlight_sat);
-        body = body
-            .child(el().w_full().h(space::XXS).a11y_hidden())
-            .child(card_header_divider(k))
-            .child(
-                row().w_full().justify_between().items_center().child(
-                    text("SPLIT TONES")
-                        .font(ty::section_header(k))
-                        .color(k.c.text_muted),
-                ),
-            )
-            .child(develop_slider_inner(
-                k,
-                "sl-bw-split-sh-hue",
-                "Shadow Hue",
-                Some(shadow_dot),
-                bw.split_shadow_hue,
-                0.0..=360.0,
-                format!("{:.0}°", bw.split_shadow_hue),
-                0.0,
-                true,
-                |r, v| r.bw.split_shadow_hue = v.clamp(0.0, 360.0),
-            ))
-            .child(develop_slider_inner(
-                k,
-                "sl-bw-split-sh-sat",
-                "Shadow Sat",
-                None,
-                bw.split_shadow_sat,
-                0.0..=1.0,
-                format!("{:.0}", bw.split_shadow_sat * 100.0),
-                0.0,
-                true,
-                |r, v| r.bw.split_shadow_sat = v.clamp(0.0, 1.0),
-            ))
-            .child(develop_slider_inner(
-                k,
-                "sl-bw-split-hi-hue",
-                "Highlight Hue",
-                Some(highlight_dot),
-                bw.split_highlight_hue,
-                0.0..=360.0,
-                format!("{:.0}°", bw.split_highlight_hue),
-                0.0,
-                true,
-                |r, v| r.bw.split_highlight_hue = v.clamp(0.0, 360.0),
-            ))
-            .child(develop_slider_inner(
-                k,
-                "sl-bw-split-hi-sat",
-                "Highlight Sat",
-                None,
-                bw.split_highlight_sat,
-                0.0..=1.0,
-                format!("{:.0}", bw.split_highlight_sat * 100.0),
-                0.0,
-                true,
-                |r, v| r.bw.split_highlight_sat = v.clamp(0.0, 1.0),
-            ));
+        let split_mod =
+            usize::from(bw.split_shadow_sat > 0.005) + usize::from(bw.split_highlight_sat > 0.005);
+        body = body.child(advanced_disclosure_row(
+            k,
+            "adv-bw-split",
+            "Split Tones",
+            s.bw_split_open,
+            split_mod,
+            4,
+            |s| s.bw_split_open = !s.bw_split_open,
+        ));
+        if s.bw_split_open {
+            let shadow_dot = split_tone_hue_dot(bw.split_shadow_hue, bw.split_shadow_sat);
+            let highlight_dot = split_tone_hue_dot(bw.split_highlight_hue, bw.split_highlight_sat);
+            body = body
+                .child(develop_slider_inner(
+                    k,
+                    "sl-bw-split-sh-hue",
+                    "Shadow Hue",
+                    Some(shadow_dot),
+                    bw.split_shadow_hue,
+                    0.0..=360.0,
+                    format!("{:.0}°", bw.split_shadow_hue),
+                    0.0,
+                    true,
+                    |r, v| r.bw.split_shadow_hue = v.clamp(0.0, 360.0),
+                ))
+                .child(develop_slider_inner(
+                    k,
+                    "sl-bw-split-sh-sat",
+                    "Shadow Sat",
+                    None,
+                    bw.split_shadow_sat,
+                    0.0..=1.0,
+                    format!("{:.0}", bw.split_shadow_sat * 100.0),
+                    0.0,
+                    true,
+                    |r, v| r.bw.split_shadow_sat = v.clamp(0.0, 1.0),
+                ))
+                .child(develop_slider_inner(
+                    k,
+                    "sl-bw-split-hi-hue",
+                    "Highlight Hue",
+                    Some(highlight_dot),
+                    bw.split_highlight_hue,
+                    0.0..=360.0,
+                    format!("{:.0}°", bw.split_highlight_hue),
+                    0.0,
+                    true,
+                    |r, v| r.bw.split_highlight_hue = v.clamp(0.0, 360.0),
+                ))
+                .child(develop_slider_inner(
+                    k,
+                    "sl-bw-split-hi-sat",
+                    "Highlight Sat",
+                    None,
+                    bw.split_highlight_sat,
+                    0.0..=1.0,
+                    format!("{:.0}", bw.split_highlight_sat * 100.0),
+                    0.0,
+                    true,
+                    |r, v| r.bw.split_highlight_sat = v.clamp(0.0, 1.0),
+                ));
+        }
     }
 
     let enable_sw = Switch::new(bw.enabled)
@@ -1858,6 +2163,14 @@ fn bw_section(s: &AppState, k: &Kit) -> El {
         s.bw_open,
         !bw.is_neutral(),
         |s| s.bw_open = !s.bw_open,
+        s.hovered_info,
+        InfoTip {
+            title: "6-Channel Black & White",
+            shortcut: None,
+            description: "Simulates panchromatic monochrome emulsion with 6 color filter channels plus optional silver/selenium Split Tones.",
+            cli_key: "bw.{enabled,red,yellow,green,cyan,blue,magenta,split_*}",
+            tier: "Tier 1 · Monochrome",
+        },
         Some(actions),
         body,
     )
@@ -2028,7 +2341,7 @@ fn color_editor_basic_body(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(space::CONTROL)
+        .gap(space::ROW_GAP)
         .child(swatch_row)
         .child(band_header)
         .child(hue_slider)
@@ -2199,60 +2512,20 @@ fn color_editor_advanced_body(s: &AppState, k: &Kit) -> El {
                 .build(k),
         );
 
-    col()
+    let range_mod = usize::from(
+        (slice.hue_range - descriptor_default("advanced_color.0.hue_range")).abs() > 0.5,
+    ) + usize::from(
+        (slice.sat_range - descriptor_default("advanced_color.0.sat_range")).abs() > 0.01,
+    ) + usize::from(
+        (slice.smoothness - descriptor_default("advanced_color.0.smoothness")).abs() > 0.01,
+    ) + usize::from(slice.uniformity.abs() > 0.005);
+
+    let mut body = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(slice_row)
         .child(slice_header)
         .child(view_range_row)
-        .child(develop_slider_inner(
-            k,
-            format!("sl-adv-{idx}-hue-range"),
-            "Hue Range",
-            None,
-            slice.hue_range,
-            descriptor_range("advanced_color.0.hue_range"),
-            format!("{:.0}°", slice.hue_range),
-            descriptor_default("advanced_color.0.hue_range"),
-            true,
-            move |r, v| r.advanced_color[idx].hue_range = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-adv-{idx}-sat-range"),
-            "Sat Range",
-            None,
-            slice.sat_range,
-            descriptor_range("advanced_color.0.sat_range"),
-            format!("{:.0}%", slice.sat_range * 100.0),
-            descriptor_default("advanced_color.0.sat_range"),
-            true,
-            move |r, v| r.advanced_color[idx].sat_range = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-adv-{idx}-smooth"),
-            "Smoothness",
-            None,
-            slice.smoothness,
-            descriptor_range("advanced_color.0.smoothness"),
-            format!("{:.0}", slice.smoothness * 100.0),
-            descriptor_default("advanced_color.0.smoothness"),
-            true,
-            move |r, v| r.advanced_color[idx].smoothness = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-adv-{idx}-uniformity"),
-            "Uniformity",
-            None,
-            slice.uniformity,
-            descriptor_range("advanced_color.0.uniformity"),
-            format!("{:.0}", slice.uniformity * 100.0),
-            descriptor_default("advanced_color.0.uniformity"),
-            true,
-            move |r, v| r.advanced_color[idx].uniformity = v,
-        ))
         .child(develop_slider_inner(
             k,
             format!("sl-adv-{idx}-hue"),
@@ -2289,6 +2562,68 @@ fn color_editor_advanced_body(s: &AppState, k: &Kit) -> El {
             true,
             move |r, v| r.advanced_color[idx].lightness = v,
         ))
+        .child(advanced_disclosure_row(
+            k,
+            "adv-color-range-row",
+            "Range & Uniformity",
+            s.color_adv_range_open,
+            range_mod,
+            4,
+            |s| s.color_adv_range_open = !s.color_adv_range_open,
+        ));
+
+    if s.color_adv_range_open {
+        body = body
+            .child(develop_slider_inner(
+                k,
+                format!("sl-adv-{idx}-hue-range"),
+                "Hue Range",
+                None,
+                slice.hue_range,
+                descriptor_range("advanced_color.0.hue_range"),
+                format!("{:.0}°", slice.hue_range),
+                descriptor_default("advanced_color.0.hue_range"),
+                true,
+                move |r, v| r.advanced_color[idx].hue_range = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-adv-{idx}-sat-range"),
+                "Sat Range",
+                None,
+                slice.sat_range,
+                descriptor_range("advanced_color.0.sat_range"),
+                format!("{:.0}%", slice.sat_range * 100.0),
+                descriptor_default("advanced_color.0.sat_range"),
+                true,
+                move |r, v| r.advanced_color[idx].sat_range = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-adv-{idx}-smooth"),
+                "Smoothness",
+                None,
+                slice.smoothness,
+                descriptor_range("advanced_color.0.smoothness"),
+                format!("{:.0}", slice.smoothness * 100.0),
+                descriptor_default("advanced_color.0.smoothness"),
+                true,
+                move |r, v| r.advanced_color[idx].smoothness = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-adv-{idx}-uniformity"),
+                "Uniformity",
+                None,
+                slice.uniformity,
+                descriptor_range("advanced_color.0.uniformity"),
+                format!("{:.0}", slice.uniformity * 100.0),
+                descriptor_default("advanced_color.0.uniformity"),
+                true,
+                move |r, v| r.advanced_color[idx].uniformity = v,
+            ));
+    }
+    body
 }
 
 /// Skin Tone Uniformity body (tab 3 of Capture One's Color Editor).
@@ -2374,9 +2709,14 @@ fn color_editor_skin_tone_body(s: &AppState, k: &Kit) -> El {
                 .build(k),
         );
 
-    col()
+    let skin_adv_mod = usize::from(st.amount_hue.abs() > 0.005)
+        + usize::from(st.amount_sat.abs() > 0.005)
+        + usize::from(st.amount_lightness.abs() > 0.005)
+        + usize::from((st.smoothness - descriptor_default("skin_tone.smoothness")).abs() > 0.01);
+
+    let mut body = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(target_header)
         .child(view_range_row)
         .child(
@@ -2420,59 +2760,68 @@ fn color_editor_skin_tone_body(s: &AppState, k: &Kit) -> El {
             true,
             |r, v| r.skin_tone.uniformity_lightness = v,
         ))
-        .child(
-            text("AMOUNT")
-                .font(ty::section_header(k))
-                .color(k.c.text_muted),
-        )
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            "sl-skin-amt-hue",
-            "Hue",
-            None,
-            st.amount_hue,
-            descriptor_range("skin_tone.amount_hue"),
-            format!("{:+.0}°", st.amount_hue * 35.0),
-            descriptor_default("skin_tone.amount_hue"),
-            true,
-            |r, v| r.skin_tone.amount_hue = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-skin-amt-sat",
-            "Saturation",
-            None,
-            st.amount_sat,
-            descriptor_range("skin_tone.amount_sat"),
-            format!("{:+.0}", st.amount_sat * 100.0),
-            descriptor_default("skin_tone.amount_sat"),
-            true,
-            |r, v| r.skin_tone.amount_sat = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-skin-amt-lum",
-            "Lightness",
-            None,
-            st.amount_lightness,
-            descriptor_range("skin_tone.amount_lightness"),
-            format!("{:+.0}", st.amount_lightness * 100.0),
-            descriptor_default("skin_tone.amount_lightness"),
-            true,
-            |r, v| r.skin_tone.amount_lightness = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-skin-smooth",
-            "Smoothness",
-            None,
-            st.smoothness,
-            descriptor_range("skin_tone.smoothness"),
-            format!("{:.0}", st.smoothness * 100.0),
-            descriptor_default("skin_tone.smoothness"),
-            true,
-            |r, v| r.skin_tone.smoothness = v,
-        ))
+            "adv-skin-amount-row",
+            "Amount & Smoothness",
+            s.skin_tone_advanced_open,
+            skin_adv_mod,
+            4,
+            |s| s.skin_tone_advanced_open = !s.skin_tone_advanced_open,
+        ));
+
+    if s.skin_tone_advanced_open {
+        body = body
+            .child(develop_slider_inner(
+                k,
+                "sl-skin-amt-hue",
+                "Hue",
+                None,
+                st.amount_hue,
+                descriptor_range("skin_tone.amount_hue"),
+                format!("{:+.0}°", st.amount_hue * 35.0),
+                descriptor_default("skin_tone.amount_hue"),
+                true,
+                |r, v| r.skin_tone.amount_hue = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-skin-amt-sat",
+                "Saturation",
+                None,
+                st.amount_sat,
+                descriptor_range("skin_tone.amount_sat"),
+                format!("{:+.0}", st.amount_sat * 100.0),
+                descriptor_default("skin_tone.amount_sat"),
+                true,
+                |r, v| r.skin_tone.amount_sat = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-skin-amt-lum",
+                "Lightness",
+                None,
+                st.amount_lightness,
+                descriptor_range("skin_tone.amount_lightness"),
+                format!("{:+.0}", st.amount_lightness * 100.0),
+                descriptor_default("skin_tone.amount_lightness"),
+                true,
+                |r, v| r.skin_tone.amount_lightness = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-skin-smooth",
+                "Smoothness",
+                None,
+                st.smoothness,
+                descriptor_range("skin_tone.smoothness"),
+                format!("{:.0}", st.smoothness * 100.0),
+                descriptor_default("skin_tone.smoothness"),
+                true,
+                |r, v| r.skin_tone.smoothness = v,
+            ));
+    }
+    body
 }
 
 /// Capture One Pro 3-tab Color Editor (`Basic | Advanced | Skin Tone`).
@@ -2577,7 +2926,7 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
 
     let body = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::CARD_HEADER_GAP)
         .child(mode_row)
         .child(mode_body);
 
@@ -2592,6 +2941,14 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
             if !s.hsl_open {
                 s.camera.view_color_range = -1;
             }
+        },
+        s.hovered_info,
+        InfoTip {
+            title: "3-Tab Color Editor",
+            shortcut: None,
+            description: "Targeted 8-band Basic HSL, 4-slice Advanced color targeting with View Range mask, and Capture One Skin Tone Uniformity.",
+            cli_key: "hsl.*  ·  advanced_color.*  ·  skin_tone.*",
+            tier: "Tier 1 · Selective Color",
         },
         Some(reset_btn),
         body,
@@ -2611,7 +2968,7 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         .role("radiogroup")
         .label("Processing mode")
         .w_full()
-        .gap(space::TIGHT);
+        .gap(space::PILL_GAP);
     for mode in ProcessingMode::ALL {
         let active = active_mode == mode;
         mode_row = mode_row.child(crop_pill_btn(
@@ -2632,10 +2989,10 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         .role("radiogroup")
         .label("Base characteristics film curve")
         .w_full()
-        .gap(space::TIGHT);
+        .gap(space::PILL_GAP);
 
     for chunk in FilmCurve::ALL.chunks(2) {
-        let mut r = row().w_full().gap(space::TIGHT);
+        let mut r = row().w_full().gap(space::PILL_GAP);
         for &curve in chunk {
             let active = active_curve == curve;
             r = r.child(crop_pill_btn(
@@ -2655,7 +3012,7 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
 
     let body = col()
         .w_full()
-        .gap(space::SM)
+        .gap(space::ROW_GAP)
         .child(
             row()
                 .w_full()
@@ -2709,6 +3066,14 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         s.base_open,
         !is_default,
         |s| s.base_open = !s.base_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Base Characteristics",
+            shortcut: None,
+            description: "Selects scene-referred Photography vs. C-41 Film Negative pipeline and the base film response curve (Standard, High Contrast, Extra Shadow, Linear).",
+            cli_key: "processing_mode  ·  film_curve",
+            tier: "Tier 0 · Pipeline",
+        },
         Some(reset),
         body,
     )
@@ -2790,9 +3155,14 @@ fn film_negative_section(s: &AppState, k: &Kit) -> El {
             |s, tx| s.convert_film_negative_auto_tx(tx),
         ));
 
-    let body = col()
+    let def_fn = FilmNegativeParams::default();
+    let fn_rgb_mod = usize::from((fn_params.base_r - def_fn.base_r).abs() > 0.01)
+        + usize::from((fn_params.base_g - def_fn.base_g).abs() > 0.01)
+        + usize::from((fn_params.base_b - def_fn.base_b).abs() > 0.01);
+
+    let mut body = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(base_row)
         .child(action_row)
         .child(develop_slider_inner(
@@ -2843,42 +3213,55 @@ fn film_negative_section(s: &AppState, k: &Kit) -> El {
             true,
             |rec, v| rec.film_negative.white_clip = v,
         ))
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            "sl-fn-base-r",
-            "Base Red",
-            Some(color::channel_red()),
-            fn_params.base_r,
-            descriptor_range("film_negative.base_r"),
-            format!("{:.2}", fn_params.base_r),
-            descriptor_default("film_negative.base_r"),
-            true,
-            |rec, v| rec.film_negative.base_r = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-fn-base-g",
-            "Base Green",
-            Some(color::channel_green()),
-            fn_params.base_g,
-            descriptor_range("film_negative.base_g"),
-            format!("{:.2}", fn_params.base_g),
-            descriptor_default("film_negative.base_g"),
-            true,
-            |rec, v| rec.film_negative.base_g = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-fn-base-b",
-            "Base Blue",
-            Some(color::channel_blue()),
-            fn_params.base_b,
-            descriptor_range("film_negative.base_b"),
-            format!("{:.2}", fn_params.base_b),
-            descriptor_default("film_negative.base_b"),
-            true,
-            |rec, v| rec.film_negative.base_b = v,
+            "adv-film-neg-rgb",
+            "Base Mask RGB",
+            s.film_neg_advanced_open,
+            fn_rgb_mod,
+            3,
+            |s| s.film_neg_advanced_open = !s.film_neg_advanced_open,
         ));
+
+    if s.film_neg_advanced_open {
+        body = body
+            .child(develop_slider_inner(
+                k,
+                "sl-fn-base-r",
+                "Base Red",
+                Some(color::channel_red()),
+                fn_params.base_r,
+                descriptor_range("film_negative.base_r"),
+                format!("{:.2}", fn_params.base_r),
+                descriptor_default("film_negative.base_r"),
+                true,
+                |rec, v| rec.film_negative.base_r = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-fn-base-g",
+                "Base Green",
+                Some(color::channel_green()),
+                fn_params.base_g,
+                descriptor_range("film_negative.base_g"),
+                format!("{:.2}", fn_params.base_g),
+                descriptor_default("film_negative.base_g"),
+                true,
+                |rec, v| rec.film_negative.base_g = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-fn-base-b",
+                "Base Blue",
+                Some(color::channel_blue()),
+                fn_params.base_b,
+                descriptor_range("film_negative.base_b"),
+                format!("{:.2}", fn_params.base_b),
+                descriptor_default("film_negative.base_b"),
+                true,
+                |rec, v| rec.film_negative.base_b = v,
+            ));
+    }
 
     let reset = mini_reset_btn(k, "Reset Film Negative", is_default, |s, tx| {
         s.reset_film_negative_tx(tx);
@@ -2891,6 +3274,14 @@ fn film_negative_section(s: &AppState, k: &Kit) -> El {
         s.film_neg_open,
         !is_default || fn_params != FilmNegativeParams::default(),
         |s| s.film_neg_open = !s.film_neg_open,
+        s.hovered_info,
+        InfoTip {
+            title: "C-41 Film Negative Inversion",
+            shortcut: None,
+            description: "Neutralizes the orange C-41 film base mask in linear space and maps negative transmittance to positive density and contrast.",
+            cli_key: "film_negative.{base_r,base_g,base_b,density,contrast,black_clip,white_clip}",
+            tier: "Tier 0 · Analog",
+        },
         Some(reset),
         body,
     )
@@ -2910,7 +3301,7 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
     };
     let kelvin = temperature_to_kelvin(r.temperature);
 
-    // 7 standard Capture One illuminant presets across 2 balanced rows (zero truncation).
+    // Compact White Balance Preset picker (inline disclosure keeps WB calm by default).
     let wb_presets_row1 = [
         WbPreset::AsShot,
         WbPreset::Daylight,
@@ -2919,7 +3310,7 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
     ];
     let wb_presets_row2 = [WbPreset::Tungsten, WbPreset::Fluorescent, WbPreset::Flash];
     let build_wb_row = |presets: &[WbPreset]| {
-        let mut row_el = row().w_full().gap(space::XS);
+        let mut row_el = row().w_full().gap(space::PILL_GAP);
         for &preset in presets {
             let active = effective_wb_preset == preset;
             row_el = row_el.child(crop_pill_btn(
@@ -2937,22 +3328,34 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
         row_el
     };
 
-    let wb_preset_block = col()
-        .key("wb-presets")
-        .role("radiogroup")
-        .label("White balance preset")
+    let wb_preset_toggle = row()
+        .key("wb-preset-toggle")
+        .role("button")
+        .label("Toggle White Balance Illuminant Presets")
+        .expanded(s.wb_presets_open)
+        .cursor(Cursor::Pointer)
         .w_full()
-        .gap(space::XS)
+        .h(size::PILL_H)
+        .px(space::MD)
+        .items_center()
+        .justify_between()
+        .radius(k.radius.md)
+        .fill(if s.wb_presets_open {
+            k.c.layer_02
+        } else {
+            k.c.bg_base
+        })
+        .hover(k.c.layer_02)
+        .border(border::HAIRLINE, k.c.border_base)
+        .child(
+            text("Preset")
+                .font(ty::control_label(k))
+                .color(k.c.text_muted),
+        )
         .child(
             row()
-                .w_full()
-                .justify_between()
                 .items_center()
-                .child(
-                    text("Preset")
-                        .font(ty::control_label(k))
-                        .color(k.c.text_muted),
-                )
+                .gap(space::SM)
                 .child(
                     text(effective_wb_preset.label())
                         .font(ty::mono_compact(k))
@@ -2961,14 +3364,39 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
                         } else {
                             k.c.text_base
                         }),
+                )
+                .child(
+                    icon(
+                        if s.wb_presets_open {
+                            &icons::CHEVRON_DOWN
+                        } else {
+                            &icons::CHEVRON_RIGHT
+                        },
+                        size::ICON_XS,
+                    )
+                    .color(k.c.icon_muted)
+                    .a11y_hidden(),
                 ),
         )
-        .child(build_wb_row(&wb_presets_row1))
-        .child(build_wb_row(&wb_presets_row2));
+        .on_press(|s: &mut AppState| s.wb_presets_open = !s.wb_presets_open);
+
+    let mut wb_preset_block = col()
+        .key("wb-presets")
+        .role("radiogroup")
+        .label("White balance preset")
+        .w_full()
+        .gap(space::PILL_GAP)
+        .child(wb_preset_toggle);
+
+    if s.wb_presets_open {
+        wb_preset_block = wb_preset_block
+            .child(build_wb_row(&wb_presets_row1))
+            .child(build_wb_row(&wb_presets_row2));
+    }
 
     let wb_controls = col()
         .w_full()
-        .gap(space::SM)
+        .gap(space::ROW_GAP)
         .child(wb_preset_block)
         .child(develop_scalar_slider(
             k,
@@ -3035,9 +3463,13 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
         && r.shadows.abs() < 0.005
         && r.whites.abs() < 0.005
         && r.blacks.abs() < 0.005;
-    let tone_controls = col()
+    let tone_adv_mod = usize::from(r.brightness.abs() > 0.005)
+        + usize::from(r.whites.abs() > 0.005)
+        + usize::from(r.blacks.abs() > 0.005);
+
+    let mut tone_controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-exposure",
@@ -3058,15 +3490,6 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
         ))
         .child(develop_scalar_slider(
             k,
-            "sl-brightness",
-            "brightness",
-            "Brightness",
-            r.brightness,
-            format!("{:+.0}", r.brightness * 100.0),
-            |rec, v| rec.brightness = v,
-        ))
-        .child(develop_scalar_slider(
-            k,
             "sl-highlights",
             "highlights",
             "Highlights",
@@ -3083,24 +3506,47 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             format!("{:+.0}", r.shadows * 100.0),
             |rec, v| rec.shadows = v,
         ))
-        .child(develop_scalar_slider(
+        .child(advanced_disclosure_row(
             k,
-            "sl-whites",
-            "whites",
-            "Whites",
-            r.whites,
-            format!("{:+.0}", r.whites * 100.0),
-            |rec, v| rec.whites = v,
-        ))
-        .child(develop_scalar_slider(
-            k,
-            "sl-blacks",
-            "blacks",
-            "Blacks",
-            r.blacks,
-            format!("{:+.0}", r.blacks * 100.0),
-            |rec, v| rec.blacks = v,
+            "adv-tone-fine",
+            "Fine Range",
+            s.tone_advanced_open,
+            tone_adv_mod,
+            3,
+            |s| s.tone_advanced_open = !s.tone_advanced_open,
         ));
+
+    if s.tone_advanced_open {
+        tone_controls = tone_controls
+            .child(develop_scalar_slider(
+                k,
+                "sl-brightness",
+                "brightness",
+                "Brightness",
+                r.brightness,
+                format!("{:+.0}", r.brightness * 100.0),
+                |rec, v| rec.brightness = v,
+            ))
+            .child(develop_scalar_slider(
+                k,
+                "sl-whites",
+                "whites",
+                "Whites",
+                r.whites,
+                format!("{:+.0}", r.whites * 100.0),
+                |rec, v| rec.whites = v,
+            ))
+            .child(develop_scalar_slider(
+                k,
+                "sl-blacks",
+                "blacks",
+                "Blacks",
+                r.blacks,
+                format!("{:+.0}", r.blacks * 100.0),
+                |rec, v| rec.blacks = v,
+            ));
+    }
+
     let tone_actions = row()
         .items_center()
         .gap(space::XS)
@@ -3129,7 +3575,7 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
 
     let mut stack = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::CARD_GAP)
         .child(base_characteristics_section(s, k));
     if s.recipe.processing_mode == ProcessingMode::FilmNegative {
         stack = stack.child(film_negative_section(s, k));
@@ -3142,6 +3588,14 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             s.wb_open,
             !wb_neutral,
             |s| s.wb_open = !s.wb_open,
+            s.hovered_info,
+            InfoTip {
+                title: "White Balance",
+                shortcut: Some("T / Y"),
+                description: "Calibrates color temperature (Kelvin) and green/magenta tint in linear scene-referred space. Use the eyedropper on neutral gray or click A for Auto WB.",
+                cli_key: "wb_preset  ·  temperature [-1..1]  ·  tint [-1..1]",
+                tier: "Tier 0 · Light",
+            },
             Some(wb_actions),
             wb_controls,
         ))
@@ -3152,6 +3606,14 @@ fn light_tab_content(s: &AppState, k: &Kit) -> El {
             s.tone_open,
             !tone_neutral,
             |s| s.tone_open = !s.tone_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Exposure & Tone",
+                shortcut: Some("Q / W / A / S"),
+                description: "Scene-referred EV exposure, midtone contrast, and highlight/shadow recovery. Expand Fine Range for Brightness, Whites, and Blacks.",
+                cli_key: "exposure  ·  contrast  ·  highlights  ·  shadows  ·  brightness  ·  whites  ·  blacks",
+                tier: "Tier 0 · Tone",
+            },
             Some(tone_actions),
             tone_controls,
         ))
@@ -3164,7 +3626,7 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
     let presence_neutral = r.vibrance.abs() < 0.005 && r.saturation.abs() < 0.005;
     let presence_controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-vibrance",
@@ -3197,7 +3659,7 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::CARD_GAP)
         .child(color_wheels_section(s, k))
         .child(collapsible_section_card(
             k,
@@ -3206,6 +3668,14 @@ fn color_tab_content(s: &AppState, k: &Kit) -> El {
             s.presence_open,
             !presence_neutral,
             |s| s.presence_open = !s.presence_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Presence (Vibrance & Saturation)",
+                shortcut: Some("R"),
+                description: "Skin-protecting Vibrance boosts muted tones gently, while Saturation scales chroma uniformly across the full gamut.",
+                cli_key: "vibrance [-1..1]  ·  saturation [-1..1]",
+                tier: "Tier 0 · Color",
+            },
             Some(presence_reset),
             presence_controls,
         ))
@@ -3227,7 +3697,7 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         .role("radiogroup")
         .label("Clarity method")
         .w_full()
-        .gap(space::XS);
+        .gap(space::PILL_GAP);
     for method in ClarityMethod::ALL {
         let active = r.clarity_method == method;
         method_row = method_row.child(crop_pill_btn(
@@ -3243,30 +3713,10 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         ));
     }
 
-    let clarity_controls = col()
+    let clarity_method_mod = usize::from(r.clarity_method != ClarityMethod::Natural);
+    let mut clarity_controls = col()
         .w_full()
-        .gap(space::TIGHT)
-        .child(
-            row()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    text("Method")
-                        .font(ty::control_label(k))
-                        .color(k.c.text_muted),
-                )
-                .child(
-                    text(r.clarity_method.label())
-                        .font(ty::mono_compact(k))
-                        .color(if r.clarity_method == ClarityMethod::Natural {
-                            k.c.text_faint
-                        } else {
-                            k.c.text_base
-                        }),
-                ),
-        )
-        .child(method_row)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-clarity",
@@ -3293,7 +3743,20 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             r.dehaze,
             format!("{:+.0}", r.dehaze * 100.0),
             |rec, v| rec.dehaze = v,
+        ))
+        .child(advanced_disclosure_row(
+            k,
+            "adv-clarity-method",
+            "Clarity Method",
+            s.clarity_advanced_open,
+            clarity_method_mod,
+            4,
+            |s| s.clarity_advanced_open = !s.clarity_advanced_open,
         ));
+    if s.clarity_advanced_open {
+        clarity_controls = clarity_controls.child(method_row);
+    }
+
     let clarity_reset = mini_reset_btn(k, "Reset Clarity & Dehaze", clarity_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |rec| {
             rec.clarity_method = ClarityMethod::Natural;
@@ -3303,15 +3766,18 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         });
     });
 
-    // 2. SHARPENING (Amount, Radius, Threshold, Halo Suppression)
+    // 2. SHARPENING (Amount at Tier 0; Radius, Threshold, Halo Suppression in Tier 1 Precision)
     let def_radius = scalar_default("sharpen_radius");
     let sharpen_neutral = r.sharpen.abs() < 0.005
         && (r.sharpen_radius - def_radius).abs() < 0.01
         && r.sharpen_threshold.abs() < 0.005
         && r.sharpen_halo.abs() < 0.005;
-    let sharpen_controls = col()
+    let sharpen_adv_mod = usize::from((r.sharpen_radius - def_radius).abs() > 0.01)
+        + usize::from(r.sharpen_threshold.abs() > 0.005)
+        + usize::from(r.sharpen_halo.abs() > 0.005);
+    let mut sharpen_controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-sharpen",
@@ -3321,33 +3787,45 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             format!("{:.0}", r.sharpen * 100.0),
             |rec, v| rec.sharpen = v,
         ))
-        .child(develop_scalar_slider(
+        .child(advanced_disclosure_row(
             k,
-            "sl-sharpen-radius",
-            "sharpen_radius",
-            "Radius",
-            r.sharpen_radius,
-            format!("{:.1} px", r.sharpen_radius),
-            |rec, v| rec.sharpen_radius = v,
-        ))
-        .child(develop_scalar_slider(
-            k,
-            "sl-sharpen-threshold",
-            "sharpen_threshold",
-            "Threshold",
-            r.sharpen_threshold,
-            format!("{:.0}", r.sharpen_threshold * 100.0),
-            |rec, v| rec.sharpen_threshold = v,
-        ))
-        .child(develop_scalar_slider(
-            k,
-            "sl-sharpen-halo",
-            "sharpen_halo",
-            "Halo Suppression",
-            r.sharpen_halo,
-            format!("{:.0}", r.sharpen_halo * 100.0),
-            |rec, v| rec.sharpen_halo = v,
+            "adv-sharpen-precision",
+            "Precision",
+            s.sharpen_advanced_open,
+            sharpen_adv_mod,
+            3,
+            |s| s.sharpen_advanced_open = !s.sharpen_advanced_open,
         ));
+    if s.sharpen_advanced_open {
+        sharpen_controls = sharpen_controls
+            .child(develop_scalar_slider(
+                k,
+                "sl-sharpen-radius",
+                "sharpen_radius",
+                "Radius",
+                r.sharpen_radius,
+                format!("{:.1} px", r.sharpen_radius),
+                |rec, v| rec.sharpen_radius = v,
+            ))
+            .child(develop_scalar_slider(
+                k,
+                "sl-sharpen-threshold",
+                "sharpen_threshold",
+                "Threshold",
+                r.sharpen_threshold,
+                format!("{:.0}", r.sharpen_threshold * 100.0),
+                |rec, v| rec.sharpen_threshold = v,
+            ))
+            .child(develop_scalar_slider(
+                k,
+                "sl-sharpen-halo",
+                "sharpen_halo",
+                "Halo Suppression",
+                r.sharpen_halo,
+                format!("{:.0}", r.sharpen_halo * 100.0),
+                |rec, v| rec.sharpen_halo = v,
+            ));
+    }
     let sharpen_reset = mini_reset_btn(k, "Reset Sharpening", sharpen_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |rec| {
             rec.sharpen = scalar_default("sharpen");
@@ -3361,7 +3839,7 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
     let nr_neutral = r.noise_reduction.abs() < 0.005 && r.nr_color.abs() < 0.005;
     let nr_controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-denoise",
@@ -3387,19 +3865,21 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         });
     });
 
-    // 4. FILM GRAIN (Type selector + Impact + Granularity)
+    // 4. FILM GRAIN (Impact at Tier 0; 6 Grain Types + Granularity in Tier 1 Grain Structure)
     let def_grain_size = scalar_default("grain_size");
     let grain_neutral = r.grain_type == GrainType::Fine
         && r.grain.abs() < 0.005
         && (r.grain_size - def_grain_size).abs() < 0.005;
+    let grain_adv_mod = usize::from(r.grain_type != GrainType::Fine)
+        + usize::from((r.grain_size - def_grain_size).abs() > 0.005);
     let mut grain_type_grid = col()
         .key("grain-type-grid")
         .role("radiogroup")
         .label("Film grain type")
         .w_full()
-        .gap(space::XS);
+        .gap(space::PILL_GAP);
     for chunk in GrainType::ALL.chunks(3) {
-        let mut row_el = row().w_full().gap(space::XS);
+        let mut row_el = row().w_full().gap(space::PILL_GAP);
         for &gt in chunk {
             let active = r.grain_type == gt;
             row_el = row_el.child(crop_pill_btn(
@@ -3417,28 +3897,9 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         grain_type_grid = grain_type_grid.child(row_el);
     }
 
-    let grain_controls = col()
+    let mut grain_controls = col()
         .w_full()
-        .gap(space::TIGHT)
-        .child(
-            row()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    text("Type")
-                        .font(ty::control_label(k))
-                        .color(k.c.text_muted),
-                )
-                .child(text(r.grain_type.label()).font(ty::mono_compact(k)).color(
-                    if r.grain_type == GrainType::Fine {
-                        k.c.text_faint
-                    } else {
-                        k.c.text_base
-                    },
-                )),
-        )
-        .child(grain_type_grid)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-grain",
@@ -3448,15 +3909,28 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             format!("{:.0}", r.grain * 100.0),
             |rec, v| rec.grain = v,
         ))
-        .child(develop_scalar_slider(
+        .child(advanced_disclosure_row(
             k,
-            "sl-grain-size",
-            "grain_size",
-            "Granularity",
-            r.grain_size,
-            format!("{:.0}", r.grain_size * 100.0),
-            |rec, v| rec.grain_size = v,
+            "adv-grain-structure",
+            "Grain Structure",
+            s.grain_advanced_open,
+            grain_adv_mod,
+            7,
+            |s| s.grain_advanced_open = !s.grain_advanced_open,
         ));
+    if s.grain_advanced_open {
+        grain_controls = grain_controls
+            .child(grain_type_grid)
+            .child(develop_scalar_slider(
+                k,
+                "sl-grain-size",
+                "grain_size",
+                "Granularity",
+                r.grain_size,
+                format!("{:.0}", r.grain_size * 100.0),
+                |rec, v| rec.grain_size = v,
+            ));
+    }
     let grain_reset = mini_reset_btn(k, "Reset Film Grain", grain_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |rec| {
             rec.grain_type = GrainType::Fine;
@@ -3465,15 +3939,16 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
         });
     });
 
-    // 5. VIGNETTING (Crop-aware Method + Amount)
+    // 5. VIGNETTING (Amount at Tier 0; Crop-aware Method in Tier 1)
     let vignette_neutral =
         r.vignette.abs() < 0.005 && r.vignette_method == VignetteMethod::EllipticOnCrop;
+    let vignette_adv_mod = usize::from(r.vignette_method != VignetteMethod::EllipticOnCrop);
     let mut vignette_method_row = row()
         .key("vignette-method-row")
         .role("radiogroup")
         .label("Vignette method")
         .w_full()
-        .gap(space::XS);
+        .gap(space::PILL_GAP);
     for method in VignetteMethod::ALL {
         let active = r.vignette_method == method;
         vignette_method_row = vignette_method_row.child(crop_pill_btn(
@@ -3488,30 +3963,9 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             move |s, tx| s.set_vignette_method_tx(method, tx),
         ));
     }
-    let vignette_controls = col()
+    let mut vignette_controls = col()
         .w_full()
-        .gap(space::TIGHT)
-        .child(
-            row()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    text("Method")
-                        .font(ty::control_label(k))
-                        .color(k.c.text_muted),
-                )
-                .child(
-                    text(r.vignette_method.label())
-                        .font(ty::mono_compact(k))
-                        .color(if r.vignette_method == VignetteMethod::EllipticOnCrop {
-                            k.c.text_faint
-                        } else {
-                            k.c.text_base
-                        }),
-                ),
-        )
-        .child(vignette_method_row)
+        .gap(space::ROW_GAP)
         .child(develop_scalar_slider(
             k,
             "sl-vignette",
@@ -3520,7 +3974,19 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             r.vignette,
             format!("{:+.0}", r.vignette * 100.0),
             |rec, v| rec.vignette = v,
+        ))
+        .child(advanced_disclosure_row(
+            k,
+            "adv-vignette-method",
+            "Vignette Method",
+            s.vignette_advanced_open,
+            vignette_adv_mod,
+            3,
+            |s| s.vignette_advanced_open = !s.vignette_advanced_open,
         ));
+    if s.vignette_advanced_open {
+        vignette_controls = vignette_controls.child(vignette_method_row);
+    }
     let vignette_reset = mini_reset_btn(k, "Reset Vignetting", vignette_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |rec| {
             rec.vignette = scalar_default("vignette");
@@ -3530,7 +3996,7 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::CARD_GAP)
         .child(collapsible_section_card(
             k,
             "sec-clarity",
@@ -3538,6 +4004,14 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             s.clarity_open,
             !clarity_neutral,
             |s| s.clarity_open = !s.clarity_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Clarity, Structure & Dehaze",
+                shortcut: Some("Z"),
+                description: "Midtone local contrast (Clarity), fine micro-texture (Structure), and atmospheric contrast recovery (Dehaze) across 4 Capture One algorithms.",
+                cli_key: "clarity  ·  structure  ·  dehaze  ·  clarity_method",
+                tier: "Tier 0 · Detail",
+            },
             Some(clarity_reset),
             clarity_controls,
         ))
@@ -3548,6 +4022,14 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             s.sharpen_open,
             !sharpen_neutral,
             |s| s.sharpen_open = !s.sharpen_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Unsharp Mask & Halo Suppression",
+                shortcut: None,
+                description: "Edge-aware sharpening with configurable radius, flat-surface noise threshold, and bright-edge halo suppression.",
+                cli_key: "sharpen  ·  sharpen_radius  ·  sharpen_threshold  ·  sharpen_halo",
+                tier: "Tier 1 · Detail",
+            },
             Some(sharpen_reset),
             sharpen_controls,
         ))
@@ -3558,6 +4040,14 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             s.nr_open,
             !nr_neutral,
             |s| s.nr_open = !s.nr_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Noise Reduction",
+                shortcut: None,
+                description: "Separates edge-preserving luminance grain smoothing from chroma color-blotch denoising.",
+                cli_key: "noise_reduction [0..1]  ·  nr_color [0..1]",
+                tier: "Tier 1 · Detail",
+            },
             Some(nr_reset),
             nr_controls,
         ))
@@ -3568,6 +4058,14 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             s.grain_open,
             !grain_neutral,
             |s| s.grain_open = !s.grain_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Silver-Halide Film Grain",
+                shortcut: None,
+                description: "Organic luminance-weighted grain across 6 analog emulsion profiles (Fine, Silver Rich, Soft, Cubic, Tabular, Harsh).",
+                cli_key: "grain  ·  grain_size  ·  grain_type",
+                tier: "Tier 1 · Texture",
+            },
             Some(grain_reset),
             grain_controls,
         ))
@@ -3578,6 +4076,14 @@ fn detail_tab_content(s: &AppState, k: &Kit) -> El {
             s.vignette_open,
             !vignette_neutral,
             |s| s.vignette_open = !s.vignette_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Optical Vignetting",
+                shortcut: None,
+                description: "Subtle natural corner darkening or brightening anchored to the active crop rectangle or full frame.",
+                cli_key: "vignette [-1..1]  ·  vignette_method",
+                tier: "Tier 1 · Optics",
+            },
             Some(vignette_reset),
             vignette_controls,
         ))
@@ -3641,10 +4147,9 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
     let geo = s.recipe.geometry;
     let [out_w, out_h] = geo.cropped_output_size(s.image.width, s.image.height);
 
-    let mut aspect_rows = col().w_full().gap(space::TIGHT);
-    for chunk in CropAspect::ALL.chunks(4) {
-        let mut r = row().w_full().gap(space::TIGHT);
-        for &preset in chunk {
+    let build_aspect_row = |presets: &[CropAspect]| {
+        let mut r = row().w_full().gap(space::PILL_GAP);
+        for &preset in presets {
             let active = geo.aspect_preset == preset;
             r = r.child(crop_pill_btn(
                 k,
@@ -3658,8 +4163,11 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
                 move |s, tx| s.set_crop_aspect_tx(preset, tx),
             ));
         }
-        aspect_rows = aspect_rows.child(r);
-    }
+        r
+    };
+    let primary_aspects = &CropAspect::ALL[..4.min(CropAspect::ALL.len())];
+    let more_aspects = &CropAspect::ALL[4.min(CropAspect::ALL.len())..];
+    let more_aspect_active = usize::from(more_aspects.contains(&geo.aspect_preset));
 
     let crop_toggle = row()
         .w_full()
@@ -3691,16 +4199,27 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
         s.update_geometry_slider_tx(true, tx, |rec| rec.geometry.reset());
     });
 
-    let crop_body = col()
+    let mut crop_body = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::ROW_GAP)
         .child(crop_toggle)
-        .child(aspect_rows)
-        .child(
-            text("Drag corners or edges on photo  •  Press C to apply")
-                .font(ty::caption(k))
-                .color(k.c.text_faint),
-        );
+        .child(build_aspect_row(primary_aspects));
+    if !more_aspects.is_empty() {
+        crop_body = crop_body.child(advanced_disclosure_row(
+            k,
+            "adv-crop-ratios",
+            "More Ratios",
+            s.crop_advanced_open,
+            more_aspect_active,
+            more_aspects.len(),
+            |s| s.crop_advanced_open = !s.crop_advanced_open,
+        ));
+        if s.crop_advanced_open {
+            for chunk in more_aspects.chunks(4) {
+                crop_body = crop_body.child(build_aspect_row(chunk));
+            }
+        }
+    }
 
     let straighten = develop_slider_inner(
         k,
@@ -3734,7 +4253,7 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
 
     let xform_row = row()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::PILL_GAP)
         .child(rot_btn("btn-rot-ccw", "↺ 90°", false, |s, tx| {
             s.update_geometry_slider_tx(true, tx, |r| {
                 r.geometry.rotate_90 = (r.geometry.rotate_90 - 1).rem_euclid(4);
@@ -3754,7 +4273,7 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
 
     let rot_body = col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::ROW_GAP)
         .child(straighten)
         .child(xform_row);
 
@@ -3776,9 +4295,13 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
         .build(k);
 
     let ks_neutral = geo.is_keystone_identity();
-    let ks_body = col()
+    let ks_adv_mod = usize::from(geo.keystone_aspect.abs() > 0.005)
+        + usize::from(
+            (geo.keystone_amount - descriptor_default("geometry.keystone_amount")).abs() > 0.01,
+        );
+    let mut ks_body = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_slider_inner(
             k,
             "sl-ks-vertical",
@@ -3803,30 +4326,42 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             false,
             |r, v| r.geometry.keystone_horizontal = v,
         ))
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            "sl-ks-aspect",
-            "Aspect",
-            None,
-            geo.keystone_aspect,
-            descriptor_range("geometry.keystone_aspect"),
-            format!("{:+.0}", geo.keystone_aspect * 100.0),
-            descriptor_default("geometry.keystone_aspect"),
-            false,
-            |r, v| r.geometry.keystone_aspect = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-ks-amount",
-            "Amount",
-            None,
-            geo.keystone_amount,
-            descriptor_range("geometry.keystone_amount"),
-            format!("{:.0}%", geo.keystone_amount * 100.0),
-            descriptor_default("geometry.keystone_amount"),
-            false,
-            |r, v| r.geometry.keystone_amount = v,
+            "adv-keystone-fine",
+            "Fine Keystone",
+            s.keystone_advanced_open,
+            ks_adv_mod,
+            2,
+            |s| s.keystone_advanced_open = !s.keystone_advanced_open,
         ));
+    if s.keystone_advanced_open {
+        ks_body = ks_body
+            .child(develop_slider_inner(
+                k,
+                "sl-ks-aspect",
+                "Aspect",
+                None,
+                geo.keystone_aspect,
+                descriptor_range("geometry.keystone_aspect"),
+                format!("{:+.0}", geo.keystone_aspect * 100.0),
+                descriptor_default("geometry.keystone_aspect"),
+                false,
+                |r, v| r.geometry.keystone_aspect = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-ks-amount",
+                "Amount",
+                None,
+                geo.keystone_amount,
+                descriptor_range("geometry.keystone_amount"),
+                format!("{:.0}%", geo.keystone_amount * 100.0),
+                descriptor_default("geometry.keystone_amount"),
+                false,
+                |r, v| r.geometry.keystone_amount = v,
+            ));
+    }
     let ks_reset = mini_reset_btn(k, "Reset Keystone", ks_neutral, |s, tx| {
         s.update_geometry_slider_tx(true, tx, |r| {
             r.geometry.keystone_vertical = descriptor_default("geometry.keystone_vertical");
@@ -3838,9 +4373,11 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
 
     let lens = s.recipe.lens.sanitized();
     let lens_neutral = lens.is_identity();
-    let lens_body = col()
+    let lens_adv_mod = usize::from(lens.purple_fringing.abs() > 0.005)
+        + usize::from(lens.light_falloff.abs() > 0.005);
+    let mut lens_body = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_slider_inner(
             k,
             "sl-lens-distortion",
@@ -3865,30 +4402,42 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             false,
             |r, v| r.lens.chromatic_aberration = v,
         ))
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            "sl-lens-fringe",
-            "Purple Fringing",
-            None,
-            lens.purple_fringing,
-            descriptor_range("lens.purple_fringing"),
-            format!("{:.0}", lens.purple_fringing * 100.0),
-            descriptor_default("lens.purple_fringing"),
-            true,
-            |r, v| r.lens.purple_fringing = v,
-        ))
-        .child(develop_slider_inner(
-            k,
-            "sl-lens-falloff",
-            "Light Falloff",
-            None,
-            lens.light_falloff,
-            descriptor_range("lens.light_falloff"),
-            format!("{:.0}", lens.light_falloff * 100.0),
-            descriptor_default("lens.light_falloff"),
-            true,
-            |r, v| r.lens.light_falloff = v,
+            "adv-lens-edge",
+            "Edge Cleanup",
+            s.lens_advanced_open,
+            lens_adv_mod,
+            2,
+            |s| s.lens_advanced_open = !s.lens_advanced_open,
         ));
+    if s.lens_advanced_open {
+        lens_body = lens_body
+            .child(develop_slider_inner(
+                k,
+                "sl-lens-fringe",
+                "Purple Fringing",
+                None,
+                lens.purple_fringing,
+                descriptor_range("lens.purple_fringing"),
+                format!("{:.0}", lens.purple_fringing * 100.0),
+                descriptor_default("lens.purple_fringing"),
+                true,
+                |r, v| r.lens.purple_fringing = v,
+            ))
+            .child(develop_slider_inner(
+                k,
+                "sl-lens-falloff",
+                "Light Falloff",
+                None,
+                lens.light_falloff,
+                descriptor_range("lens.light_falloff"),
+                format!("{:.0}", lens.light_falloff * 100.0),
+                descriptor_default("lens.light_falloff"),
+                true,
+                |r, v| r.lens.light_falloff = v,
+            ));
+    }
     let lens_reset = mini_reset_btn(k, "Reset Lens Correction", lens_neutral, |s, tx| {
         s.update_slider_tx(true, tx, |r| {
             r.lens = LensParams::default();
@@ -3903,7 +4452,7 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
 
     col()
         .w_full()
-        .gap(space::MD)
+        .gap(space::CARD_GAP)
         .child(collapsible_section_card(
             k,
             "sec-crop",
@@ -3911,6 +4460,14 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             s.crop_open,
             crop_modified,
             |s| s.crop_open = !s.crop_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Crop & Aspect Ratio",
+                shortcut: Some("C"),
+                description: "Non-destructive crop frame with aspect presets. Drag corners or edges directly on the photo, then press C to apply.",
+                cli_key: "geometry.{crop,aspect_preset}",
+                tier: "Tier 0 · Geometry",
+            },
             Some(crop_reset),
             crop_body,
         ))
@@ -3921,6 +4478,14 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             s.rotate_open,
             rot_modified,
             |s| s.rotate_open = !s.rotate_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Rotate, Straighten & Flip",
+                shortcut: None,
+                description: "Continuous horizon straighten (-45° to +45°) paired with lossless 90° quarter-turns and horizontal/vertical flips.",
+                cli_key: "geometry.{straighten_deg,rotate_90,flip_h,flip_v}",
+                tier: "Tier 0 · Geometry",
+            },
             None,
             rot_body,
         ))
@@ -3931,6 +4496,14 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             s.keystone_open,
             !ks_neutral,
             |s| s.keystone_open = !s.keystone_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Keystone Perspective Homography",
+                shortcut: None,
+                description: "Corrects converging vertical and horizontal architectural lines with aspect compensation and strength blending.",
+                cli_key: "geometry.keystone_{vertical,horizontal,aspect,amount}",
+                tier: "Tier 1 · Optics",
+            },
             Some(ks_reset),
             ks_body,
         ))
@@ -3941,6 +4514,14 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             s.lens_open,
             !lens_neutral,
             |s| s.lens_open = !s.lens_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Optical Lens Correction",
+                shortcut: None,
+                description: "Brown-Conrady barrel/pincushion distortion, lateral chromatic aberration, purple fringing, and lens light falloff recovery.",
+                cli_key: "lens.{distortion,chromatic_aberration,purple_fringing,light_falloff}",
+                tier: "Tier 1 · Optics",
+            },
             Some(lens_reset),
             lens_body,
         ))
@@ -3949,8 +4530,16 @@ fn crop_tab_content(s: &AppState, k: &Kit) -> El {
             "sec-grid",
             "COMPOSITION GRID",
             s.grid_open,
-            false,
+            geo.grid != CompositionGrid::None,
             |s| s.grid_open = !s.grid_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Composition Grid Overlay",
+                shortcut: None,
+                description: "Displays Rule of Thirds, Golden Ratio, or Diagonal guides over the photo viewport (also toggled in the titlebar Overlays ▾ popover).",
+                cli_key: "geometry.grid",
+                tier: "Tier 1 · Guides",
+            },
             None,
             grid_seg,
         ))
@@ -4027,6 +4616,14 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
         s.variants_open,
         v_count > 1 || s.compare_reference.is_some(),
         |s| s.variants_open = !s.variants_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Virtual Variants",
+            shortcut: Some("⌘⏎"),
+            description: "Stores multiple independent non-destructive looks inside one photo sidecar. Press ⌘⏎ to pin the active variant as a side-by-side Compare Reference.",
+            cli_key: "MCP: rune_manage_workflow (new/clone/select/compare variant)",
+            tier: "Tier 1 · Workflow",
+        },
         Some(
             text(format!("V{}/{v_count}", v_active + 1))
                 .font(ty::mono_compact(k))
@@ -4034,7 +4631,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
         ),
         col()
             .w_full()
-            .gap(space::SM)
+            .gap(space::ROW_GAP)
             .child(variant_pills)
             .child(variant_actions),
     );
@@ -4196,21 +4793,17 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
                 .build(k),
         );
 
-    let mut user_styles_body = col()
-        .w_full()
-        .gap(space::SM)
-        .child(stack_row)
-        .child(strength_capsule)
-        .child(save_row);
+    let stack_mod =
+        usize::from(s.stack_styles) + usize::from((s.style_strength - 1.0).abs() > 0.01);
+    let mut user_styles_body = col().w_full().gap(space::ROW_GAP).child(save_row);
     if s.user_styles.is_empty() {
         user_styles_body = user_styles_body.child(
-            text("No saved user styles yet — enter a name above to save current look")
+            text("No saved user styles yet.")
                 .font(ty::caption(k))
-                .color(k.c.text_faint)
-                .wrap(),
+                .color(k.c.text_faint),
         );
     } else {
-        let mut list = col().w_full().gap(space::XS);
+        let mut list = col().w_full().gap(space::PILL_GAP);
         for (idx, st) in s.user_styles.iter().enumerate() {
             let item = row()
                 .key(format!("user-style-{idx}"))
@@ -4219,7 +4812,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
                 .justify_between()
                 .gap(space::XS)
                 .px(space::MD)
-                .py(space::TIGHT)
+                .py(space::SM)
                 .radius(k.radius.sm)
                 .fill(k.c.bg_base)
                 .hover(k.c.hover)
@@ -4253,6 +4846,18 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             list = list.child(item);
         }
         user_styles_body = user_styles_body.child(list);
+    }
+    user_styles_body = user_styles_body.child(advanced_disclosure_row(
+        k,
+        "adv-user-styles-blend",
+        "Blending & Stacking",
+        s.user_styles_advanced_open,
+        stack_mod,
+        2,
+        |s| s.user_styles_advanced_open = !s.user_styles_advanced_open,
+    ));
+    if s.user_styles_advanced_open {
+        user_styles_body = user_styles_body.child(stack_row).child(strength_capsule);
     }
 
     // 4. SELECTIVE ADJUSTMENTS CLIPBOARD
@@ -4342,10 +4947,27 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             .build(k),
     );
 
+    let mut clipboard_body = col()
+        .w_full()
+        .gap(space::ROW_GAP)
+        .child(clipboard_actions)
+        .child(autoselect_btn)
+        .child(advanced_disclosure_row(
+            k,
+            "adv-clipboard-groups",
+            "Selective Groups",
+            s.clipboard_groups_open,
+            s.clipboard_groups.len(),
+            ALL_CLIPBOARD_GROUPS.len(),
+            |s| s.clipboard_groups_open = !s.clipboard_groups_open,
+        ));
+    if s.clipboard_groups_open {
+        clipboard_body = clipboard_body.child(group_grid).child(reset_all_row);
+    }
+
     col()
         .w_full()
-        .gap(space::MD)
-        .child(variants_card)
+        .gap(space::CARD_GAP)
         .child(collapsible_section_card(
             k,
             "sec-styles",
@@ -4353,9 +4975,18 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             s.styles_open,
             s.recipe.preset_name.is_some(),
             |s| s.styles_open = !s.styles_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Built-In Darkroom Styles",
+                shortcut: None,
+                description: "Non-destructive calibrated film and editorial looks. Enable Stack Styles under User Styles to blend multiple styles additively.",
+                cli_key: "rd edit <photo> --preset <id> --mix 0.8",
+                tier: "Tier 0 · Styles",
+            },
             None,
             styles_body,
         ))
+        .child(variants_card)
         .child(collapsible_section_card(
             k,
             "sec-user-styles",
@@ -4363,6 +4994,14 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             s.user_styles_open,
             !s.user_styles.is_empty(),
             |s| s.user_styles_open = !s.user_styles_open,
+            s.hovered_info,
+            InfoTip {
+                title: "User Styles & Stacking",
+                shortcut: None,
+                description: "Save custom grades as reusable user styles in ~/.config/rune-darkroom/styles and stack them with adjustable blend strength.",
+                cli_key: "MCP: rune_manage_workflow (save/apply/stack user styles)",
+                tier: "Tier 1 · Styles",
+            },
             Some(
                 text(format!("{}", s.user_styles.len()))
                     .font(ty::mono_compact(k))
@@ -4377,6 +5016,14 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
             s.clipboard_open,
             s.catalog.has_clipboard(),
             |s| s.clipboard_open = !s.clipboard_open,
+            s.hovered_info,
+            InfoTip {
+                title: "Selective Adjustments Clipboard",
+                shortcut: Some("⌘⇧C / ⌘⇧V"),
+                description: "Copy adjustments from the active photo and paste only selected groups (WB, Tone, Color, Detail, Layers, etc.) onto other shots.",
+                cli_key: "MCP: rune_manage_workflow (copy/apply clipboard)",
+                tier: "Tier 1 · Batch",
+            },
             Some(
                 text(format!(
                     "{}/{}",
@@ -4386,13 +5033,7 @@ fn presets_tab_content(s: &AppState, k: &Kit) -> El {
                 .font(ty::mono_compact(k))
                 .color(k.c.text_faint),
             ),
-            col()
-                .w_full()
-                .gap(space::SM)
-                .child(autoselect_btn)
-                .child(group_grid)
-                .child(clipboard_actions)
-                .child(reset_all_row),
+            clipboard_body,
         ))
 }
 
@@ -4471,8 +5112,8 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
     let pinned_header = col()
         .key("inspector-pinned")
         .w_full()
-        .gap(space::MD)
-        .padding(space::LG)
+        .gap(space::CARD_HEADER_GAP)
+        .padding(space::CARD_PAD)
         .border_sides(
             [border::NONE, border::NONE, border::REGULAR, border::NONE],
             k.c.border_base,
@@ -4497,16 +5138,16 @@ pub fn right_inspector(s: &AppState, k: &Kit) -> El {
             InspectorTab::LABELS[s.active_tab.index()]
         ))
         .w_full()
-        .padding(space::LG)
+        .padding(space::CARD_PAD)
         .child(tab_body);
 
-    let scroll_viewport = el()
+    let scroll_viewport = col()
         .key("inspector-scroll")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec::default())
-        .clip_fade(0.0, 0.0, 0.0, size::SCROLL_FADE)
+        .scroll_edge_fade(size::SCROLL_FADE)
         .child(scroll_content);
 
     col()

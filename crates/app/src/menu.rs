@@ -1,11 +1,13 @@
-//! Native macOS Menu Bar (`rune::MenuItem`) following Apple macOS HIG menu ordering
-//! and keyboard shortcuts, with live enabled/checked synchronization.
+//! Native macOS Menu Bar (`rune::MenuItem`) following Apple macOS HIG 5-menu ordering
+//! (`File`, `Edit`, `Image`, `View`, `Window`) with ≤8 scannable top-level items per menu,
+//! clean submenus, and live enabled/checked synchronization.
 
 use rune::file_dialog::FileDialogOptions;
 use rune::{MenuItem, Shortcut, Tx};
+use rune_editor_core::ColorTag;
 use rune_editor_decode::SUPPORTED_EXTENSIONS;
 
-use crate::state::AppState;
+use crate::state::{AppState, ProofMargin};
 
 fn sc(s: &str) -> Shortcut {
     s.parse().expect("valid menu shortcut")
@@ -90,8 +92,8 @@ pub fn trigger_export_dialog(s: &AppState, tx: &mut Tx) {
     });
 }
 
-/// Builds the full native macOS menu bar snapshot (App, File, Edit, View).
-/// Standard Window menu items (`Close ⌘W`) are installed by `App::standard_menus()`.
+/// Builds the full native macOS 5-menu snapshot (`App`, `File`, `Edit`, `Image`, `View`, `Window`).
+/// Standard Window items (`Close ⌘W`, Minimize, Zoom) are installed by `App::standard_menus()`.
 pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
     let can_undo = s.history.can_undo();
     let can_redo = s.history.can_redo();
@@ -110,8 +112,27 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
     let show_filmstrip = s.show_filmstrip;
     let show_inspector = s.show_inspector;
     let has_disk_photo = !s.demo_mode && s.image.source_path.is_some();
-    let proof_margin_active = s.proof_margin != crate::state::ProofMargin::Compact;
-    let proof_margin_label = format!("Proof Margin: {}", s.proof_margin.label());
+    let active_tag = s
+        .catalog
+        .active_entry()
+        .map_or(ColorTag::None, |e| e.effective_color_tag());
+    let proof_margin = s.proof_margin;
+
+    // Color Tag submenu items (⌥0..⌥7)
+    let color_tag_items: Vec<MenuItem<AppState>> = ColorTag::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, tag)| {
+            let chord = format!("alt+{i}");
+            MenuItem::with_action(tag.label(), move |s: &mut AppState, tx| {
+                s.set_active_color_tag_tx(tag, tx);
+            })
+            .id(format!("image-tag-{}", tag.cli_slug()))
+            .key_equivalent(sc(&chord))
+            .keys_first()
+            .checked(active_tag == tag)
+        })
+        .collect();
 
     vec![
         // App menu
@@ -125,7 +146,7 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         })
         .id("app-settings")
         .key_equivalent(sc("cmd+,")),
-        // File menu
+        // 1. File menu (≤8 top-level items)
         MenuItem::new("Open Photo…", |_: &mut AppState, tx| {
             trigger_open_dialog(tx)
         })
@@ -138,31 +159,28 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .id("file-open-folder")
         .menu("File")
         .key_equivalent(sc("cmd+shift+o")),
-        MenuItem::new("New Capture One Session…", |_: &mut AppState, tx| {
-            trigger_new_session(tx)
-        })
-        .id("file-new-session")
+        MenuItem::submenu(
+            "Session",
+            [
+                MenuItem::new("New 4-Folder Session…", |_: &mut AppState, tx| {
+                    trigger_new_session(tx)
+                })
+                .id("file-new-session"),
+                MenuItem::new("Watch Hot Folder…", |_: &mut AppState, tx| {
+                    trigger_watch_hot_folder(tx)
+                })
+                .id("file-watch-hot-folder"),
+                MenuItem::separator(),
+                MenuItem::new("Move to Selects", |s: &mut AppState, tx| {
+                    s.move_active_to_selects_tx(tx)
+                })
+                .id("file-move-selects")
+                .key_equivalent(sc("cmd+j"))
+                .enabled(has_disk_photo),
+            ],
+        )
+        .id("file-session-submenu")
         .menu("File"),
-        MenuItem::new("Watch Hot Folder…", |_: &mut AppState, tx| {
-            trigger_watch_hot_folder(tx)
-        })
-        .id("file-watch-hot-folder")
-        .menu("File"),
-        MenuItem::separator().menu("File"),
-        MenuItem::new("Move to Selects", |s: &mut AppState, tx| {
-            s.move_active_to_selects_tx(tx)
-        })
-        .id("file-move-selects")
-        .menu("File")
-        .key_equivalent(sc("cmd+j"))
-        .enabled(has_disk_photo),
-        MenuItem::new("Edit With External Editor…", |s: &mut AppState, tx| {
-            s.edit_with_external_editor_tx(tx)
-        })
-        .id("file-edit-external")
-        .menu("File")
-        .key_equivalent(sc("cmd+shift+w"))
-        .enabled(has_disk_photo),
         MenuItem::separator().menu("File"),
         MenuItem::new("Save Sidecar", |s: &mut AppState, tx| s.save_sidecar_tx(tx))
             .id("file-save")
@@ -181,7 +199,15 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .id("file-export-single")
         .menu("File")
         .key_equivalent(sc("cmd+alt+e")),
-        // Edit menu
+        MenuItem::separator().menu("File"),
+        MenuItem::new("Edit With External Editor…", |s: &mut AppState, tx| {
+            s.edit_with_external_editor_tx(tx)
+        })
+        .id("file-edit-external")
+        .menu("File")
+        .key_equivalent(sc("cmd+shift+w"))
+        .enabled(has_disk_photo),
+        // 2. Edit menu (5 items)
         MenuItem::new("Undo", |s: &mut AppState, tx| s.undo_tx(tx))
             .id("edit-undo")
             .menu("Edit")
@@ -202,7 +228,7 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .menu("Edit")
         .after("selectAll:")
         .key_equivalent(sc("cmd+shift+c")),
-        MenuItem::new("Paste Selected Adjustments", |s: &mut AppState, tx| {
+        MenuItem::new("Apply Adjustments", |s: &mut AppState, tx| {
             s.paste_selected_adjustments_tx(tx)
         })
         .id("edit-paste-adj")
@@ -211,58 +237,168 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .key_equivalent(sc("cmd+shift+v"))
         .enabled(has_clipboard),
         MenuItem::separator().menu("Edit"),
-        MenuItem::new("New Variant", |s: &mut AppState, tx| {
-            s.new_variant_tx(None, tx)
-        })
-        .id("edit-new-variant")
-        .menu("Edit"),
-        MenuItem::new("Clone Variant", |s: &mut AppState, tx| {
-            s.clone_variant_tx(None, tx)
-        })
-        .id("edit-clone-variant")
-        .menu("Edit"),
-        MenuItem::new("Next Variant", |s: &mut AppState, tx| s.next_variant_tx(tx))
-            .id("edit-next-variant")
+        MenuItem::new("Reset All", |s: &mut AppState, tx| s.reset_recipe_tx(tx))
+            .id("edit-reset")
             .menu("Edit")
-            .enabled(can_del_variant),
-        MenuItem::new("Delete Active Variant", |s: &mut AppState, tx| {
-            s.delete_active_variant_tx(tx)
+            .key_equivalent(sc("cmd+r")),
+        // 3. Image menu (NEW — 4 scannable top-level items with 3 submenus)
+        MenuItem::submenu(
+            "Variants",
+            [
+                MenuItem::new("New Variant", |s: &mut AppState, tx| {
+                    s.new_variant_tx(None, tx)
+                })
+                .id("image-new-variant"),
+                MenuItem::new("Clone Variant", |s: &mut AppState, tx| {
+                    s.clone_variant_tx(None, tx)
+                })
+                .id("image-clone-variant"),
+                MenuItem::new("Next Variant", |s: &mut AppState, tx| s.next_variant_tx(tx))
+                    .id("image-next-variant")
+                    .enabled(can_del_variant),
+                MenuItem::new("Compare Variant", |s: &mut AppState, tx| {
+                    s.toggle_compare_variant_tx(tx)
+                })
+                .id("image-compare-variant")
+                .key_equivalent(sc("cmd+enter"))
+                .checked(has_compare),
+                MenuItem::separator(),
+                MenuItem::new("Delete Active Variant", |s: &mut AppState, tx| {
+                    s.delete_active_variant_tx(tx)
+                })
+                .id("image-delete-variant")
+                .enabled(can_del_variant),
+            ],
+        )
+        .id("image-variants-submenu")
+        .menu("Image"),
+        MenuItem::submenu(
+            "Auto Adjust",
+            [
+                MenuItem::new("Auto White Balance", |s: &mut AppState, tx| {
+                    s.auto_white_balance_tx(tx)
+                })
+                .id("image-auto-wb"),
+                MenuItem::new("Auto Tone", |s: &mut AppState, tx| s.auto_tone_tx(tx))
+                    .id("image-auto-tone"),
+                MenuItem::new("Auto Levels", |s: &mut AppState, tx| s.auto_levels_tx(tx))
+                    .id("image-auto-levels"),
+            ],
+        )
+        .id("image-auto-submenu")
+        .menu("Image"),
+        MenuItem::submenu("Color Tag", color_tag_items)
+            .id("image-color-tag-submenu")
+            .menu("Image"),
+        MenuItem::separator().menu("Image"),
+        MenuItem::new("Auto-Advance on Cull", |s: &mut AppState, tx| {
+            s.auto_advance = !s.auto_advance;
+            s.sync_window_state(tx);
         })
-        .id("edit-delete-variant")
-        .menu("Edit")
-        .enabled(can_del_variant),
-        MenuItem::new("Compare Variant", |s: &mut AppState, tx| {
-            s.toggle_compare_variant_tx(tx)
-        })
-        .id("edit-compare-variant")
-        .menu("Edit")
-        .key_equivalent(sc("cmd+enter"))
-        .checked(has_compare),
-        MenuItem::separator().menu("Edit"),
-        MenuItem::new("Reset Adjustments", |s: &mut AppState, tx| {
-            s.reset_recipe_tx(tx)
-        })
-        .id("edit-reset")
-        .menu("Edit")
-        .key_equivalent(sc("cmd+r")),
-        // View menu
-        MenuItem::new("Zoom to Fit", |s: &mut AppState, _| s.camera.reset())
-            .id("view-zoom-fit")
-            .menu("View")
-            .key_equivalent(sc("cmd+0")),
-        MenuItem::new("Zoom 150%", |s: &mut AppState, _| {
-            s.camera.zoom = 1.5;
-            s.camera.pan = [0.0, 0.0];
-        })
-        .id("view-zoom-150")
-        .menu("View")
-        .key_equivalent(sc("cmd+1")),
-        MenuItem::new("Zoom 200%", |s: &mut AppState, _| {
-            s.camera.zoom = 2.0;
-        })
-        .id("view-zoom-200")
-        .menu("View")
-        .key_equivalent(sc("cmd+2")),
+        .id("image-auto-advance")
+        .menu("Image")
+        .checked(auto_adv),
+        // 4. View menu (7 top-level items with 3 submenus & unified shortcuts)
+        MenuItem::submenu(
+            "Zoom",
+            [
+                MenuItem::new("Zoom to Fit", |s: &mut AppState, _| s.camera.reset())
+                    .id("view-zoom-fit")
+                    .key_equivalent(sc("cmd+0")),
+                MenuItem::new("Zoom 150%", |s: &mut AppState, _| {
+                    s.camera.zoom = 1.5;
+                    s.camera.pan = [0.0, 0.0];
+                })
+                .id("view-zoom-150")
+                .key_equivalent(sc("cmd+1")),
+                MenuItem::new("Zoom 200%", |s: &mut AppState, _| {
+                    s.camera.zoom = 2.0;
+                })
+                .id("view-zoom-200")
+                .key_equivalent(sc("cmd+2")),
+            ],
+        )
+        .id("view-zoom-submenu")
+        .menu("View"),
+        MenuItem::submenu(
+            "Overlays & Diagnostics",
+            [
+                MenuItem::new("Exposure Clipping Warning", |s: &mut AppState, tx| {
+                    s.toggle_exposure_warning_tx(tx)
+                })
+                .id("view-exposure-warning")
+                .key_equivalent(sc("cmd+e"))
+                .keys_first()
+                .checked(exposure_warning),
+                MenuItem::new("Focus Mask", |s: &mut AppState, tx| {
+                    s.toggle_focus_mask_tx(tx)
+                })
+                .id("view-focus-mask")
+                .key_equivalent(sc("cmd+m"))
+                .keys_first()
+                .checked(focus_mask),
+                MenuItem::separator(),
+                MenuItem::new("Red Mask Overlay", |s: &mut AppState, tx| {
+                    s.toggle_red_mask_overlay_tx(tx)
+                })
+                .id("view-mask-red")
+                .key_equivalent(sc("m"))
+                .keys_first()
+                .checked(mask_red),
+                MenuItem::new("Grayscale Mask Overlay", |s: &mut AppState, tx| {
+                    s.toggle_gray_mask_overlay_tx(tx)
+                })
+                .id("view-mask-gray")
+                .key_equivalent(sc("alt+m"))
+                .keys_first()
+                .checked(mask_gray),
+                MenuItem::separator(),
+                MenuItem::new("GPU Loupe Magnifier", |s: &mut AppState, tx| {
+                    s.toggle_loupe_tx(tx)
+                })
+                .id("view-loupe")
+                .key_equivalent(sc("o"))
+                .keys_first()
+                .checked(loupe_on),
+                MenuItem::new("Crop & Geometry Mode", |s: &mut AppState, tx| {
+                    s.toggle_crop_mode_tx(tx)
+                })
+                .id("view-crop-mode")
+                .key_equivalent(sc("c"))
+                .keys_first()
+                .checked(crop_mode),
+            ],
+        )
+        .id("view-overlays-submenu")
+        .menu("View"),
+        MenuItem::submenu(
+            "Proof Margin",
+            [
+                MenuItem::new("Compact (16 pt)", |s: &mut AppState, tx| {
+                    s.set_proof_margin_tx(ProofMargin::Compact, tx)
+                })
+                .id("view-margin-compact")
+                .checked(proof_margin == ProofMargin::Compact),
+                MenuItem::new("Studio (48 pt)", |s: &mut AppState, tx| {
+                    s.set_proof_margin_tx(ProofMargin::Studio, tx)
+                })
+                .id("view-margin-studio")
+                .checked(proof_margin == ProofMargin::Studio),
+                MenuItem::new("Exhibition (84 pt)", |s: &mut AppState, tx| {
+                    s.set_proof_margin_tx(ProofMargin::Exhibition, tx)
+                })
+                .id("view-margin-exhibition")
+                .checked(proof_margin == ProofMargin::Exhibition),
+                MenuItem::separator(),
+                MenuItem::new("Cycle Proof Margin", |s: &mut AppState, tx| {
+                    s.cycle_proof_margin_tx(tx)
+                })
+                .id("view-proof-margin")
+                .key_equivalent(sc("cmd+shift+m")),
+            ],
+        )
+        .id("view-proof-margin-submenu")
+        .menu("View"),
         MenuItem::separator().menu("View"),
         MenuItem::new("Before / After Split", |s: &mut AppState, tx| {
             s.camera.split_compare = !s.camera.split_compare;
@@ -273,54 +409,6 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .key_equivalent(sc("backslash"))
         .keys_first()
         .checked(is_split),
-        MenuItem::new("Exposure Clipping Warning", |s: &mut AppState, tx| {
-            s.toggle_exposure_warning_tx(tx)
-        })
-        .id("view-exposure-warning")
-        .menu("View")
-        .key_equivalent(sc("cmd+e"))
-        .keys_first()
-        .checked(exposure_warning),
-        MenuItem::new("Focus Mask", |s: &mut AppState, tx| {
-            s.toggle_focus_mask_tx(tx)
-        })
-        .id("view-focus-mask")
-        .menu("View")
-        .key_equivalent(sc("cmd+m"))
-        .keys_first()
-        .checked(focus_mask),
-        MenuItem::new("Red Mask Overlay", |s: &mut AppState, tx| {
-            s.toggle_red_mask_overlay_tx(tx)
-        })
-        .id("view-mask-red")
-        .menu("View")
-        .key_equivalent(sc("m"))
-        .keys_first()
-        .checked(mask_red),
-        MenuItem::new("Grayscale Mask Overlay", |s: &mut AppState, tx| {
-            s.toggle_gray_mask_overlay_tx(tx)
-        })
-        .id("view-mask-gray")
-        .menu("View")
-        .key_equivalent(sc("alt+m"))
-        .keys_first()
-        .checked(mask_gray),
-        MenuItem::new("Crop & Geometry Mode", |s: &mut AppState, tx| {
-            s.toggle_crop_mode_tx(tx)
-        })
-        .id("view-crop-mode")
-        .menu("View")
-        .key_equivalent(sc("c"))
-        .keys_first()
-        .checked(crop_mode),
-        MenuItem::new("GPU Loupe Magnifier", |s: &mut AppState, tx| {
-            s.toggle_loupe_tx(tx)
-        })
-        .id("view-loupe")
-        .menu("View")
-        .key_equivalent(sc("alt+l"))
-        .keys_first()
-        .checked(loupe_on),
         MenuItem::new("Grid Browser", |s: &mut AppState, tx| {
             s.toggle_grid_browser_tx(tx)
         })
@@ -329,36 +417,33 @@ pub fn build_menu_items(s: &AppState) -> Vec<MenuItem<AppState>> {
         .key_equivalent(sc("g"))
         .keys_first()
         .checked(grid_on),
-        MenuItem::new("Auto-Advance on Cull", |s: &mut AppState, tx| {
-            s.auto_advance = !s.auto_advance;
-            s.sync_window_state(tx);
-        })
-        .id("view-auto-advance")
-        .menu("View")
-        .checked(auto_adv),
-        MenuItem::new(proof_margin_label, |s: &mut AppState, tx| {
-            s.cycle_proof_margin_tx(tx)
-        })
-        .id("view-proof-margin")
-        .menu("View")
-        .key_equivalent(sc("cmd+shift+m"))
-        .checked(proof_margin_active),
         MenuItem::separator().menu("View"),
-        MenuItem::new("Toggle Filmstrip", |s: &mut AppState, tx| {
+        MenuItem::new("Show Filmstrip", |s: &mut AppState, tx| {
             s.show_filmstrip = !s.show_filmstrip;
             s.sync_window_state(tx);
         })
         .id("view-filmstrip")
         .menu("View")
-        .key_equivalent(sc("cmd+alt+f"))
+        .key_equivalent(sc("f"))
+        .keys_first()
         .checked(show_filmstrip),
-        MenuItem::new("Toggle Inspector", |s: &mut AppState, tx| {
+        MenuItem::new("Show Inspector", |s: &mut AppState, tx| {
             s.show_inspector = !s.show_inspector;
             s.sync_window_state(tx);
         })
         .id("view-inspector")
         .menu("View")
-        .key_equivalent(sc("cmd+alt+i"))
+        .key_equivalent(sc("i"))
+        .keys_first()
         .checked(show_inspector),
+        // 5. Window menu (augments standard macOS Window menu with Settings access)
+        MenuItem::separator().menu("Window"),
+        MenuItem::new("Settings & Local MCP…", |s: &mut AppState, tx| {
+            let next = !s.show_settings;
+            s.set_show_settings_tx(next, tx);
+        })
+        .id("window-settings")
+        .menu("Window")
+        .checked(s.show_settings),
     ]
 }

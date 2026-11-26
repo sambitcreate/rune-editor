@@ -1104,6 +1104,17 @@ pub enum McpClientGuide {
     SkillMd,
 }
 
+/// Hover `ⓘ` Tier 2 info popover metadata (purely transient UI state — never dirties recipe
+/// or pushes undo history).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InfoTip {
+    pub title: &'static str,
+    pub shortcut: Option<&'static str>,
+    pub description: &'static str,
+    pub cli_key: &'static str,
+    pub tier: &'static str,
+}
+
 pub struct AppState {
     pub image: Arc<LinearImage>,
     /// Incremented whenever `image` changes so the GPU compositor re-uploads once.
@@ -1152,6 +1163,34 @@ pub struct AppState {
     pub masks_open: bool,
     pub local_adj_open: bool,
     pub heal_open: bool,
+
+    // Studio Airy 3-tier progressive disclosure toggles (Tier 1 inline `Advanced ▸` drawers)
+    pub wb_presets_open: bool,
+    pub tone_advanced_open: bool,
+    pub levels_advanced_open: bool,
+    pub film_neg_advanced_open: bool,
+    pub color_adv_range_open: bool,
+    pub skin_tone_advanced_open: bool,
+    pub bw_split_open: bool,
+    pub clarity_advanced_open: bool,
+    pub sharpen_advanced_open: bool,
+    pub grain_advanced_open: bool,
+    pub vignette_advanced_open: bool,
+    pub crop_advanced_open: bool,
+    pub keystone_advanced_open: bool,
+    pub lens_advanced_open: bool,
+    pub layers_mask_actions_open: bool,
+    pub local_adj_advanced_open: bool,
+    pub heal_advanced_open: bool,
+    pub user_styles_advanced_open: bool,
+    pub clipboard_groups_open: bool,
+
+    // Studio Airy Settings progressive disclosure & transient floating popovers
+    pub settings_mcp_snippets_open: bool,
+    pub settings_mcp_tools_open: bool,
+    pub settings_security_invariants_open: bool,
+    pub overlays_popover_open: bool,
+    pub hovered_info: Option<InfoTip>,
 
     // Interactive Capture One tools & live probe state
     pub active_tool: CanvasTool,
@@ -1303,21 +1342,45 @@ impl Default for AppState {
             color_balance_open: true,
             presence_open: true,
             bw_open: false,
-            hsl_open: true,
+            hsl_open: false,
             clarity_open: true,
-            sharpen_open: true,
-            nr_open: true,
-            grain_open: true,
-            vignette_open: true,
+            sharpen_open: false,
+            nr_open: false,
+            grain_open: false,
+            vignette_open: false,
             crop_open: true,
             rotate_open: true,
-            keystone_open: true,
-            lens_open: true,
-            grid_open: true,
+            keystone_open: false,
+            lens_open: false,
+            grid_open: false,
             layers_open: true,
-            masks_open: true,
+            masks_open: false,
             local_adj_open: true,
-            heal_open: true,
+            heal_open: false,
+            wb_presets_open: false,
+            tone_advanced_open: false,
+            levels_advanced_open: false,
+            film_neg_advanced_open: false,
+            color_adv_range_open: false,
+            skin_tone_advanced_open: false,
+            bw_split_open: false,
+            clarity_advanced_open: false,
+            sharpen_advanced_open: false,
+            grain_advanced_open: false,
+            vignette_advanced_open: false,
+            crop_advanced_open: false,
+            keystone_advanced_open: false,
+            lens_advanced_open: false,
+            layers_mask_actions_open: false,
+            local_adj_advanced_open: false,
+            heal_advanced_open: false,
+            user_styles_advanced_open: false,
+            clipboard_groups_open: false,
+            settings_mcp_snippets_open: false,
+            settings_mcp_tools_open: false,
+            settings_security_invariants_open: false,
+            overlays_popover_open: false,
+            hovered_info: None,
             active_tool: CanvasTool::Hand,
             active_layer_index: None,
             brush_radius: 0.06,
@@ -1349,11 +1412,11 @@ impl Default for AppState {
                 .filter(|(id, _)| *id != "geometry")
                 .map(|(id, _)| (*id).to_owned())
                 .collect(),
-            clipboard_open: true,
-            variants_open: true,
+            clipboard_open: false,
+            variants_open: false,
             styles_open: true,
             user_styles: list_user_styles().unwrap_or_default(),
-            user_styles_open: true,
+            user_styles_open: false,
             style_name_edit: TextEdit::new(""),
             stack_styles: false,
             style_strength: 1.0,
@@ -1415,10 +1478,55 @@ impl AppState {
 
     pub fn set_show_export_tx(&mut self, show: bool, tx: &mut Tx) {
         self.show_export = show;
+        self.overlays_popover_open = false;
+        self.hovered_info = None;
         if show {
             self.show_settings = false;
         }
         self.sync_window_state(tx);
+    }
+
+    /// Sets the transient Tier 2 hover `ⓘ` info popover without dirtying recipe or undo history.
+    pub fn set_hovered_info(&mut self, tip: InfoTip) {
+        self.hovered_info = Some(tip);
+    }
+
+    /// Clears the transient hover `ⓘ` info popover only if it still matches `title`.
+    pub fn clear_hovered_info(&mut self, title: &'static str) {
+        if self.hovered_info.is_some_and(|t| t.title == title) {
+            self.hovered_info = None;
+        }
+    }
+
+    /// Toggles the Concept A titlebar `Overlays ▾` floating diagnostic popover.
+    pub fn toggle_overlays_popover(&mut self) {
+        self.overlays_popover_open = !self.overlays_popover_open;
+        if self.overlays_popover_open {
+            self.hovered_info = None;
+        }
+    }
+
+    /// Counts currently active diagnostic / guide overlays for the titlebar `Overlays ▾` indicator.
+    pub fn active_overlay_count(&self) -> usize {
+        let mut count = 0usize;
+        if self.camera.exposure_warning {
+            count += 1;
+        }
+        if self.camera.focus_mask {
+            count += 1;
+        }
+        if self.camera.mask_overlay_mode != 0 {
+            count += 1;
+        }
+        if self.camera.loupe_enabled {
+            count += 1;
+        }
+        if self.camera.crop_mode
+            && self.recipe.geometry.grid != rune_editor_core::CompositionGrid::None
+        {
+            count += 1;
+        }
+        count
     }
 
     pub fn toggle_grid_browser_tx(&mut self, tx: &mut Tx) {
@@ -1510,6 +1618,8 @@ impl AppState {
 
     pub fn set_show_settings_tx(&mut self, show: bool, tx: &mut Tx) {
         self.show_settings = show;
+        self.overlays_popover_open = false;
+        self.hovered_info = None;
         if show {
             self.show_export = false;
         }
@@ -5644,5 +5754,106 @@ mod tests {
         sc.reset_defaults();
         assert!(!sc.is_any_customized());
         assert_eq!(sc.key_for(ShortcutAction::Loupe), "o");
+    }
+
+    #[test]
+    fn studio_airy_progressive_disclosure_hovered_info_and_overlays_popover() {
+        let mut s = AppState::default();
+
+        // 1. Calmer defaults: primary cards open, secondary cards collapsed
+        assert!(s.base_open);
+        assert!(s.wb_open);
+        assert!(s.tone_open);
+        assert!(s.color_balance_open);
+        assert!(s.presence_open);
+        assert!(s.clarity_open);
+        assert!(s.crop_open);
+        assert!(s.rotate_open);
+        assert!(s.layers_open);
+        assert!(s.styles_open);
+
+        assert!(!s.levels_open);
+        assert!(!s.curve_open);
+        assert!(!s.hsl_open);
+        assert!(!s.bw_open);
+        assert!(!s.sharpen_open);
+        assert!(!s.nr_open);
+        assert!(!s.grain_open);
+        assert!(!s.vignette_open);
+        assert!(!s.keystone_open);
+        assert!(!s.lens_open);
+        assert!(!s.grid_open);
+        assert!(!s.masks_open);
+        assert!(!s.heal_open);
+        assert!(!s.user_styles_open);
+        assert!(!s.clipboard_open);
+        assert!(!s.variants_open);
+
+        // 2. Tier 1 inline Advanced disclosure defaults collapsed and toggles cleanly
+        assert!(!s.tone_advanced_open);
+        assert!(!s.levels_advanced_open);
+        assert!(!s.sharpen_advanced_open);
+        assert!(!s.grain_advanced_open);
+        assert!(!s.vignette_advanced_open);
+        assert!(!s.keystone_advanced_open);
+        assert!(!s.lens_advanced_open);
+        assert!(!s.local_adj_advanced_open);
+        assert!(!s.film_neg_advanced_open);
+        s.tone_advanced_open = true;
+        assert!(s.tone_advanced_open);
+
+        // 3. Settings progressive disclosure defaults collapsed and toggles cleanly
+        assert!(!s.settings_mcp_snippets_open);
+        assert!(!s.settings_mcp_tools_open);
+        assert!(!s.settings_security_invariants_open);
+        s.settings_mcp_snippets_open = true;
+        s.settings_mcp_tools_open = true;
+        s.settings_security_invariants_open = true;
+        assert!(s.settings_mcp_snippets_open);
+        assert!(s.settings_mcp_tools_open);
+        assert!(s.settings_security_invariants_open);
+
+        // 4. Hover `ⓘ` info tip is purely transient (never dirties recipe or pushes undo)
+        let tip_a = InfoTip {
+            title: "Exposure & Tone",
+            shortcut: Some("Q"),
+            description: "Scene-referred EV exposure.",
+            cli_key: "exposure",
+            tier: "Tier 0 · Tone",
+        };
+        let tip_b = InfoTip {
+            title: "White Balance",
+            shortcut: Some("T"),
+            description: "Kelvin calibration.",
+            cli_key: "temperature",
+            tier: "Tier 0 · Light",
+        };
+        assert!(!s.is_dirty());
+        assert!(!s.history.can_undo());
+        s.set_hovered_info(tip_a);
+        assert_eq!(s.hovered_info, Some(tip_a));
+        assert!(!s.is_dirty());
+        assert!(!s.history.can_undo());
+        // Clearing a non-matching title preserves the current hovered tip
+        s.clear_hovered_info(tip_b.title);
+        assert_eq!(s.hovered_info, Some(tip_a));
+        // Clearing the matching title clears hovered_info
+        s.clear_hovered_info(tip_a.title);
+        assert_eq!(s.hovered_info, None);
+
+        // 5. Concept A titlebar Overlays ▾ popover toggle & active overlay count
+        assert!(!s.overlays_popover_open);
+        s.set_hovered_info(tip_a);
+        s.toggle_overlays_popover();
+        assert!(s.overlays_popover_open);
+        assert_eq!(s.hovered_info, None);
+        s.toggle_overlays_popover();
+        assert!(!s.overlays_popover_open);
+
+        assert_eq!(s.active_overlay_count(), 0);
+        s.camera.exposure_warning = true;
+        s.camera.focus_mask = true;
+        s.camera.loupe_enabled = true;
+        assert_eq!(s.active_overlay_count(), 3);
     }
 }

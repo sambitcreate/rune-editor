@@ -1,26 +1,26 @@
-//! Unified Apple macOS Tahoe HIG titlebar & Anomaly OpenCode top toolbar.
+//! Unified Apple macOS Tahoe HIG titlebar — Concept A Minimal Pro + `Overlays ▾` Popover.
 //!
-//! Respects `Cx::chrome_insets()` so macOS traffic lights never collide with titlebar
-//! controls, enables native `.window_drag()` + double-click-to-zoom on empty bar area,
-//! and isolates interactive control clusters with `.no_window_drag()`.
+//! Respects `Cx::chrome_insets()` so macOS traffic lights (`[16, 17, 14, 14]`) never collide
+//! with titlebar controls, enables native `.window_drag()` on empty bar area, and keeps
+//! diagnostic overlays tucked inside a crisp frosted `Overlays ▾` popover.
 
-use rune::{ChromeInsets, El, icon, row, text};
+use rune::{ChromeInsets, Color, Cursor, El, Tx, col, el, icon, row, text};
+use rune_editor_core::CompositionGrid;
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Divider, IconButton,
-    IconButtonVariant, Kit, SegmentedControl,
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Divider, Kit, SegmentedControl,
+    scrim_tx,
 };
 use rune_theme_opencode::icons;
 
-use crate::menu::{trigger_open_dialog, trigger_open_folder};
 use crate::state::AppState;
-use crate::tokens::{border, size, space, ty};
+use crate::tokens::{border, color, radius, size, space, ty};
 
 pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
     let left_pad = insets.leading + space::XXL;
     let right_pad = insets.trailing + space::XXL;
     let band_h = insets.height.max(size::TITLEBAR_H);
 
-    // Left cluster: monochrome brand glyph + title + document filename + badges
+    // Left cluster: Traffic lights safe inset + brand + document filename + Edited badge
     let mut left = row()
         .key("toolbar-left")
         .items_center()
@@ -53,11 +53,9 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
 
     if s.is_dirty() {
         left = left.child(Badge::new("Edited").variant(BadgeVariant::Accent).build(k));
-    } else {
-        left = left.child(Badge::new("16-BIT").variant(BadgeVariant::Subtle).build(k));
     }
 
-    // Center cluster: Zoom + Compare + Capture One Viewer Diagnostics (Clipping, Focus Mask, Crop)
+    // Center cluster: Fit | 150% | 200% zoom control + Compare button
     let zoom_sel = if (s.camera.zoom - 1.0).abs() < 0.03 {
         Some(0)
     } else if (s.camera.zoom - 1.5).abs() < 0.15 {
@@ -97,190 +95,177 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         })
         .build(k);
 
-    let clip_btn = IconButton::new(&icons::WARNING)
-        .variant(if s.camera.exposure_warning {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Exposure Clipping Warning")
-        .help("Highlight overexposed (red) and crushed shadow (blue) pixels")
-        .shortcut("cmd+e")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_exposure_warning_tx(tx))
-        .build(k);
-
-    let focus_btn = IconButton::new(&icons::EYE)
-        .variant(if s.camera.focus_mask {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Focus Mask")
-        .help("Highlight sharp in-focus edges in green")
-        .shortcut("cmd+m")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_focus_mask_tx(tx))
-        .build(k);
-
-    let crop_btn = IconButton::new(&icons::OUTLINE_MAXIMIZE)
-        .variant(if s.camera.crop_mode {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Crop & Geometry")
-        .help("Toggle interactive crop, straighten and composition grid")
-        .shortcut("C")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_crop_mode_tx(tx))
-        .build(k);
-
-    let mask_btn = IconButton::new(&icons::SELECT_ELEMENT)
-        .variant(if s.camera.mask_overlay_mode != 0 {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Mask Overlay")
-        .help("Toggle Red Rubylith (M) or Grayscale (⌥M) layer mask overlay")
-        .shortcut("M")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_red_mask_overlay_tx(tx))
-        .build(k);
-
-    let loupe_btn = IconButton::new(&icons::MAGNIFYING_GLASS)
-        .variant(if s.camera.loupe_enabled {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("GPU Loupe Magnifier")
-        .help("Toggle 120Hz circular GPU Loupe magnifier")
-        .shortcut("O")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_loupe_tx(tx))
-        .build(k);
-
-    let grid_btn = IconButton::new(&icons::GRID_PLUS)
-        .variant(if s.show_grid_browser {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Grid Browser")
-        .help("Toggle multi-column Grid Browser view")
-        .shortcut("G")
-        .on_press_tx(|s: &mut AppState, tx| s.toggle_grid_browser_tx(tx))
-        .build(k);
-
     let center = row()
         .key("toolbar-center")
         .items_center()
-        .gap(space::SM)
+        .gap(space::PILL_GAP)
         .no_window_drag()
         .child(zoom_seg)
-        .child(split_btn)
-        .child(el_v_divider(k))
-        .child(clip_btn)
-        .child(focus_btn)
-        .child(mask_btn)
-        .child(crop_btn)
-        .child(loupe_btn)
-        .child(grid_btn);
+        .child(split_btn);
 
-    // Right cluster: Open / Folder / Undo / Redo / Filmstrip / Inspector / Export CTA
-    let open_photo = IconButton::new(&icons::OPEN_FILE)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Open Photo")
-        .help("Open a RAW or image file")
-        .shortcut("cmd+o")
-        .on_press_tx(|_: &mut AppState, tx| trigger_open_dialog(tx))
-        .build(k);
-
-    let open_folder = IconButton::new(&icons::FOLDER)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Open Folder")
-        .help("Open a folder of photos into the filmstrip")
-        .shortcut("cmd+shift+o")
-        .on_press_tx(|_: &mut AppState, tx| trigger_open_folder(tx))
-        .build(k);
-
-    let undo_btn = IconButton::new(&icons::OUTLINE_UNDO)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Undo")
-        .help("Undo last adjustment")
-        .shortcut("cmd+z")
-        .disabled(!s.history.can_undo())
-        .on_press_tx(|s: &mut AppState, tx| s.undo_tx(tx))
-        .build(k);
-
-    let redo_btn = IconButton::new(&icons::OUTLINE_ROTATE_CLOCKWISE)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Redo")
-        .help("Redo adjustment")
-        .shortcut("cmd+shift+z")
-        .disabled(!s.history.can_redo())
-        .on_press_tx(|s: &mut AppState, tx| s.redo_tx(tx))
-        .build(k);
-
-    let filmstrip_icon = if s.show_filmstrip {
-        &icons::LAYOUT_BOTTOM_FULL
-    } else {
-        &icons::LAYOUT_BOTTOM
-    };
-    let filmstrip_btn = IconButton::new(filmstrip_icon)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Toggle Filmstrip")
-        .help("Show or hide bottom filmstrip")
-        .shortcut("F")
-        .expanded(s.show_filmstrip)
-        .on_press_tx(|s: &mut AppState, tx| {
-            s.show_filmstrip = !s.show_filmstrip;
-            s.sync_window_state(tx);
+    // Right cluster: Overlays ▾ popover trigger, Grid, Settings (with live MCP green dot), Export
+    let active_overlays = s.active_overlay_count();
+    let overlays_open = s.overlays_popover_open;
+    let mut overlays_btn = row()
+        .key("btn-overlays-popover")
+        .role("button")
+        .label("Overlays and diagnostic toggles")
+        .help("Toggle Exposure Clipping, Focus Mask, Mask Overlay, Loupe & Composition Grid")
+        .expanded(overlays_open)
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .h(size::ACTION_PILL_H)
+        .px(space::LG)
+        .items_center()
+        .gap(space::SM)
+        .radius(k.radius.md)
+        .continuous_corners()
+        .fill(if overlays_open {
+            k.c.layer_03
+        } else if active_overlays > 0 {
+            k.c.layer_02
+        } else {
+            k.c.layer_01
         })
-        .build(k);
+        .hover(k.c.layer_02)
+        .border(
+            border::HAIRLINE,
+            if overlays_open {
+                k.c.border_focus
+            } else if active_overlays > 0 {
+                color::mask_guide_primary()
+            } else {
+                k.c.border_base
+            },
+        )
+        .child(
+            icon(&icons::EYE, size::ICON_MD)
+                .color(if overlays_open || active_overlays > 0 {
+                    k.c.text_base
+                } else {
+                    k.c.icon_muted
+                })
+                .a11y_hidden(),
+        )
+        .child(text("Overlays").font(ty::control_label_medium(k)).color(
+            if overlays_open || active_overlays > 0 {
+                k.c.text_base
+            } else {
+                k.c.text_muted
+            },
+        ));
 
-    let inspector_icon = if s.show_inspector {
-        &icons::LAYOUT_RIGHT_FULL
-    } else {
-        &icons::LAYOUT_RIGHT
-    };
-    let inspector_btn = IconButton::new(inspector_icon)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Regular)
-        .label("Toggle Inspector")
-        .help("Show or hide develop inspector")
-        .shortcut("I")
-        .expanded(s.show_inspector)
-        .on_press_tx(|s: &mut AppState, tx| {
-            s.show_inspector = !s.show_inspector;
-            s.sync_window_state(tx);
-        })
-        .build(k);
+    if active_overlays > 0 {
+        overlays_btn = overlays_btn.child(
+            row()
+                .px(space::XS)
+                .h(16.0)
+                .center()
+                .radius(radius::circle(16.0))
+                .fill(color::mask_guide_primary().alpha(0.22))
+                .child(
+                    text(format!("{active_overlays}"))
+                        .font(ty::mono_probe(k))
+                        .color(color::mask_guide_primary()),
+                ),
+        );
+    }
 
-    let mcp_running = s.is_mcp_running();
-    let settings_btn = Button::new(if mcp_running { "MCP On" } else { "Settings" })
-        .variant(if s.show_settings {
+    let overlays_btn = overlays_btn
+        .child(
+            icon(&icons::CHEVRON_DOWN, size::ICON_XS)
+                .color(if overlays_open {
+                    k.c.text_base
+                } else {
+                    k.c.icon_muted
+                })
+                .a11y_hidden(),
+        )
+        .on_press(|s: &mut AppState| s.toggle_overlays_popover());
+
+    let grid_btn = Button::new("Grid")
+        .variant(if s.show_grid_browser {
             ButtonVariant::Contrast
         } else {
             ButtonVariant::Neutral
         })
         .control_size(ControlSize::Regular)
-        .icon(&icons::MCP)
-        .help("Open Settings & Local MCP Server controls (⌘,)")
-        .shortcut("cmd+,")
-        .on_press_tx(|s: &mut AppState, tx| {
-            let next = !s.show_settings;
-            s.set_show_settings_tx(next, tx);
-        })
+        .icon(&icons::GRID_PLUS)
+        .help("Toggle multi-column Grid Browser view")
+        .shortcut("G")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_grid_browser_tx(tx))
         .build(k);
+
+    let mcp_running = s.is_mcp_running();
+    let mut settings_btn = row()
+        .key("btn-toolbar-settings")
+        .role("button")
+        .label("Settings and Local MCP")
+        .help("Open Settings & Local MCP Server controls (⌘,)")
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .h(size::ACTION_PILL_H)
+        .px(space::LG)
+        .items_center()
+        .gap(space::SM)
+        .radius(k.radius.md)
+        .continuous_corners()
+        .fill(if s.show_settings {
+            k.c.layer_03
+        } else {
+            k.c.layer_01
+        })
+        .hover(k.c.layer_02)
+        .border(
+            border::HAIRLINE,
+            if s.show_settings {
+                k.c.border_focus
+            } else {
+                k.c.border_base
+            },
+        )
+        .child(
+            icon(&icons::MCP, size::ICON_MD)
+                .color(if s.show_settings || mcp_running {
+                    k.c.text_base
+                } else {
+                    k.c.icon_muted
+                })
+                .a11y_hidden(),
+        )
+        .child(
+            text("Settings")
+                .font(ty::control_label_medium(k))
+                .color(if s.show_settings {
+                    k.c.text_base
+                } else {
+                    k.c.text_muted
+                }),
+        );
+
+    if mcp_running {
+        settings_btn = settings_btn.child(
+            el().size(size::STATUS_DOT, size::STATUS_DOT)
+                .radius(radius::circle(size::STATUS_DOT))
+                .fill(color::mcp_running())
+                .a11y_hidden(),
+        );
+    }
+
+    let settings_btn = settings_btn.on_press_tx(|s: &mut AppState, tx| {
+        let next = !s.show_settings;
+        s.set_show_settings_tx(next, tx);
+    });
 
     let export_btn = Button::new("Export")
         .variant(ButtonVariant::Contrast)
@@ -297,17 +282,10 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
     let right = row()
         .key("toolbar-right")
         .items_center()
-        .gap(space::XS)
+        .gap(space::PILL_GAP)
         .no_window_drag()
-        .child(open_photo)
-        .child(open_folder)
-        .child(el_v_divider(k))
-        .child(undo_btn)
-        .child(redo_btn)
-        .child(el_v_divider(k))
-        .child(filmstrip_btn)
-        .child(inspector_btn)
-        .child(el_v_divider(k))
+        .child(overlays_btn)
+        .child(grid_btn)
         .child(settings_btn)
         .child(export_btn);
 
@@ -331,6 +309,208 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         .child(left)
         .child(center)
         .child(right)
+}
+
+/// Crisp floating macOS popover anchored cleanly below the Concept A titlebar `Overlays ▾` button.
+pub fn overlays_popover_overlay(s: &AppState, k: &Kit) -> El {
+    let toggle_row = |key: &'static str,
+                      label: &'static str,
+                      shortcut: &'static str,
+                      active: bool,
+                      accent: Color,
+                      on_press: fn(&mut AppState, &mut Tx)| {
+        row()
+            .key(key)
+            .role("menuitemcheckbox")
+            .label(label)
+            .checked(active)
+            .cursor(Cursor::Pointer)
+            .w_full()
+            .h(size::ACTION_PILL_H)
+            .px(space::MD)
+            .items_center()
+            .justify_between()
+            .radius(k.radius.md)
+            .fill(if active {
+                k.c.layer_02
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(k.c.layer_02)
+            .child(
+                row()
+                    .items_center()
+                    .gap(space::MD)
+                    .child(
+                        el().size(size::STATUS_DOT, size::STATUS_DOT)
+                            .radius(radius::circle(size::STATUS_DOT))
+                            .fill(if active { accent } else { k.c.border_strong })
+                            .a11y_hidden(),
+                    )
+                    .child(
+                        text(label)
+                            .font(if active {
+                                ty::control_label_medium(k)
+                            } else {
+                                ty::control_label(k)
+                            })
+                            .color(if active {
+                                k.c.text_base
+                            } else {
+                                k.c.text_muted
+                            }),
+                    ),
+            )
+            .child(
+                el().px(space::SM)
+                    .py(space::MICRO)
+                    .radius(k.radius.xs)
+                    .fill(k.c.bg_deep)
+                    .border(border::HAIRLINE, k.c.border_muted)
+                    .child(text(shortcut).font(ty::mono_probe(k)).color(if active {
+                        accent
+                    } else {
+                        k.c.text_faint
+                    })),
+            )
+            .on_press_tx(on_press)
+    };
+
+    let grid_label = match s.recipe.geometry.grid {
+        CompositionGrid::None => "Off",
+        CompositionGrid::RuleOfThirds => "Thirds",
+        CompositionGrid::GoldenRatio => "Golden",
+        CompositionGrid::Diagonal => "Diag",
+    };
+    let grid_active = s.recipe.geometry.grid != CompositionGrid::None;
+
+    let card = k.elevate(
+        col()
+            .key("overlays-popover-card")
+            .role("menu")
+            .label("Overlays and diagnostics")
+            .pin(
+                None,
+                Some(size::TITLEBAR_H + space::SM),
+                Some(space::XXL + 188.0),
+                None,
+            )
+            .w(size::OVERLAYS_POPOVER_W)
+            .padding(space::CARD_PAD)
+            .gap(space::ROW_GAP)
+            .radius(k.radius.lg)
+            .continuous_corners()
+            .backdrop_blur(size::HUD_BLUR_STRONG)
+            .fill(color::popover_bg())
+            .border(border::HAIRLINE, k.c.border_strong)
+            .child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        text("OVERLAYS & DIAGNOSTICS")
+                            .font(ty::section_header(k))
+                            .color(k.c.text_muted),
+                    )
+                    .child(
+                        text(format!("{} active", s.active_overlay_count()))
+                            .font(ty::mono_probe(k))
+                            .color(k.c.text_faint),
+                    ),
+            )
+            .child(el().w_full().h(border::HAIRLINE).fill(k.c.border_muted))
+            .child(
+                col()
+                    .w_full()
+                    .gap(space::XS)
+                    .child(toggle_row(
+                        "ov-clipping",
+                        "Exposure Clipping",
+                        "⌘E",
+                        s.camera.exposure_warning,
+                        k.c.danger.fg,
+                        |s, tx| s.toggle_exposure_warning_tx(tx),
+                    ))
+                    .child(toggle_row(
+                        "ov-focus-mask",
+                        "Focus Mask",
+                        "⌘M",
+                        s.camera.focus_mask,
+                        k.c.success.fg,
+                        |s, tx| s.toggle_focus_mask_tx(tx),
+                    ))
+                    .child(toggle_row(
+                        "ov-mask-red",
+                        "Red Mask Overlay",
+                        "M",
+                        s.camera.mask_overlay_mode == 1,
+                        color::mask_overlay_red(),
+                        |s, tx| s.toggle_red_mask_overlay_tx(tx),
+                    ))
+                    .child(toggle_row(
+                        "ov-mask-gray",
+                        "Grayscale Mask",
+                        "⌥M",
+                        s.camera.mask_overlay_mode == 2,
+                        color::mask_overlay_gray(),
+                        |s, tx| s.toggle_gray_mask_overlay_tx(tx),
+                    ))
+                    .child(toggle_row(
+                        "ov-loupe",
+                        "GPU Loupe",
+                        "O",
+                        s.camera.loupe_enabled,
+                        k.c.text_accent,
+                        |s, tx| s.toggle_loupe_tx(tx),
+                    ))
+                    .child(toggle_row(
+                        "ov-grid",
+                        "Composition Grid",
+                        grid_label,
+                        grid_active,
+                        color::mask_guide_primary(),
+                        |s, tx| {
+                            let idx = CompositionGrid::ALL
+                                .iter()
+                                .position(|&g| g == s.recipe.geometry.grid)
+                                .unwrap_or(0);
+                            let next = CompositionGrid::ALL[(idx + 1) % CompositionGrid::ALL.len()];
+                            s.update_geometry_slider_tx(true, tx, |r| r.geometry.grid = next);
+                        },
+                    )),
+            )
+            .child(el().w_full().h(border::HAIRLINE).fill(k.c.border_muted))
+            .child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px(space::MD)
+                    .h(size::PILL_H)
+                    .radius(k.radius.md)
+                    .hover(k.c.layer_02)
+                    .cursor(Cursor::Pointer)
+                    .child(
+                        text("Proof Margin")
+                            .font(ty::control_label(k))
+                            .color(k.c.text_muted),
+                    )
+                    .child(
+                        text(format!("{} · ⌘⇧M", s.proof_margin.label()))
+                            .font(ty::mono_probe(k))
+                            .color(k.c.text_base),
+                    )
+                    .on_press_tx(|s: &mut AppState, tx| s.cycle_proof_margin_tx(tx)),
+            ),
+        &k.elevation.overlay,
+    );
+
+    scrim_tx("overlays-popover-scrim", |s: &mut AppState, _| {
+        s.overlays_popover_open = false;
+    })
+    .fill(Color::TRANSPARENT)
+    .child(card)
 }
 
 fn el_v_divider(k: &Kit) -> El {

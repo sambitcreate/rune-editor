@@ -9,11 +9,11 @@ use rune_editor_core::{
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 use rune_theme_opencode::icons;
 
-use crate::state::{AppState, CanvasTool};
+use crate::state::{AppState, CanvasTool, InfoTip};
 use crate::tokens::{border, color, radius, size, space, ty};
 use crate::widgets::{
-    collapsible_section_card, crop_pill_btn, develop_slider_inner, develop_slider_sized,
-    mini_reset_btn,
+    advanced_disclosure_row, collapsible_section_card, crop_pill_btn, develop_slider_inner,
+    develop_slider_sized, mini_reset_btn,
 };
 
 /// Compact local-state Scrubbable Capsule for transient brush/heal tool parameters
@@ -41,7 +41,7 @@ fn tool_param_capsule(
     let content_row = row()
         .w_full()
         .h_full()
-        .px(space::LG)
+        .px(space::XL)
         .items_center()
         .justify_between()
         .child(text(label).font(ty::control_label(k)).color(k.c.text_muted))
@@ -106,7 +106,10 @@ fn tool_param_capsule(
 /// Complete Capture One Pro 16.9 `Layers` inspector tab:
 /// `LAYERS` stack, `COMBINE MASKS`, `LOCAL ADJUSTMENTS`, and `HEAL & CLONE`.
 pub fn layers_tab_content(s: &AppState, k: &Kit) -> El {
-    let mut stack = col().w_full().gap(space::MD).child(layers_stack_card(s, k));
+    let mut stack = col()
+        .w_full()
+        .gap(space::CARD_GAP)
+        .child(layers_stack_card(s, k));
 
     if let Some(layer_idx) = s.active_layer_index
         && layer_idx < s.recipe.layers.len()
@@ -485,13 +488,13 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
 
     let mut body = col()
         .w_full()
-        .gap(space::SM)
+        .gap(space::ROW_GAP)
         .child(create_row1)
         .child(create_row2)
         .child(tool_strip)
         .child(stack_list);
 
-    // Active Layer Opacity, Invert/Clear Mask, and Mask Display segmented bar
+    // Active Layer Opacity at Tier 0; Invert/Clear Mask + Mask Display tucked in Tier 1
     if let Some(layer_idx) = s.active_layer_index
         && let Some(layer) = s.recipe.layers.get(layer_idx)
     {
@@ -512,109 +515,119 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
             },
         );
 
-        let mask_actions = row()
-            .w_full()
-            .gap(space::XS)
-            .child(crop_pill_btn(
-                k,
-                "layer-invert-mask",
-                "button",
-                "Invert active layer mask",
-                if layer.inverted {
-                    "Inverted ✓"
-                } else {
-                    "Invert Mask"
-                },
-                size::PILL_COMPACT_H,
-                layer.inverted,
-                k.c.text_muted,
-                |s, tx| s.toggle_active_layer_invert_tx(tx),
-            ))
-            .child(crop_pill_btn(
-                k,
-                "layer-clear-mask",
-                "button",
-                "Clear all masks on active layer",
-                "Clear Mask",
-                size::PILL_COMPACT_H,
-                false,
-                k.c.text_muted,
-                |s, tx| s.clear_active_layer_masks_tx(tx),
-            ));
+        let mask_mod = usize::from(layer.inverted) + usize::from(s.camera.mask_overlay_mode != 0);
+        body = body.child(opacity_slider).child(advanced_disclosure_row(
+            k,
+            "adv-layers-mask-actions",
+            "Mask Display & Actions",
+            s.layers_mask_actions_open,
+            mask_mod,
+            3,
+            |s| s.layers_mask_actions_open = !s.layers_mask_actions_open,
+        ));
 
-        let mask_display = col()
-            .w_full()
-            .gap(space::XS)
-            .child(
-                row()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        text("Mask Display")
-                            .font(ty::control_label(k))
-                            .color(k.c.text_muted),
-                    )
-                    .child(
-                        text(match s.camera.mask_overlay_mode {
-                            1 => "Red Rubylith",
-                            2 => "Grayscale",
-                            _ => "Off",
-                        })
-                        .font(ty::mono_micro(k))
-                        .color(match s.camera.mask_overlay_mode {
-                            1 => color::mask_overlay_red(),
-                            2 => color::mask_overlay_gray(),
-                            _ => k.c.text_faint,
-                        }),
-                    ),
-            )
-            .child(
-                row()
-                    .key("layer-mask-display")
-                    .role("radiogroup")
-                    .label("Mask overlay display mode")
-                    .w_full()
-                    .gap(space::XS)
-                    .child(crop_pill_btn(
-                        k,
-                        "mask-disp-off",
-                        "radio",
-                        "Hide mask overlay",
-                        "Off",
-                        size::PILL_COMPACT_H,
-                        s.camera.mask_overlay_mode == 0,
-                        k.c.text_muted,
-                        |s, tx| s.set_mask_overlay_mode_tx(0, tx),
-                    ))
-                    .child(crop_pill_btn(
-                        k,
-                        "mask-disp-red",
-                        "radio",
-                        "Red rubylith mask overlay (M)",
-                        "Red (M)",
-                        size::PILL_COMPACT_H,
-                        s.camera.mask_overlay_mode == 1,
-                        k.c.text_muted,
-                        |s, tx| s.set_mask_overlay_mode_tx(1, tx),
-                    ))
-                    .child(crop_pill_btn(
-                        k,
-                        "mask-disp-gray",
-                        "radio",
-                        "Grayscale mask overlay (⌥M)",
-                        "Gray (⌥M)",
-                        size::PILL_COMPACT_H,
-                        s.camera.mask_overlay_mode == 2,
-                        k.c.text_muted,
-                        |s, tx| s.set_mask_overlay_mode_tx(2, tx),
-                    )),
-            );
+        if s.layers_mask_actions_open {
+            let mask_actions = row()
+                .w_full()
+                .gap(space::PILL_GAP)
+                .child(crop_pill_btn(
+                    k,
+                    "layer-invert-mask",
+                    "button",
+                    "Invert active layer mask",
+                    if layer.inverted {
+                        "Inverted ✓"
+                    } else {
+                        "Invert Mask"
+                    },
+                    size::PILL_COMPACT_H,
+                    layer.inverted,
+                    k.c.text_muted,
+                    |s, tx| s.toggle_active_layer_invert_tx(tx),
+                ))
+                .child(crop_pill_btn(
+                    k,
+                    "layer-clear-mask",
+                    "button",
+                    "Clear all masks on active layer",
+                    "Clear Mask",
+                    size::PILL_COMPACT_H,
+                    false,
+                    k.c.text_muted,
+                    |s, tx| s.clear_active_layer_masks_tx(tx),
+                ));
 
-        body = body
-            .child(opacity_slider)
-            .child(mask_actions)
-            .child(mask_display);
+            let mask_display = col()
+                .w_full()
+                .gap(space::PILL_GAP)
+                .child(
+                    row()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            text("Mask Display")
+                                .font(ty::control_label(k))
+                                .color(k.c.text_muted),
+                        )
+                        .child(
+                            text(match s.camera.mask_overlay_mode {
+                                1 => "Red Rubylith",
+                                2 => "Grayscale",
+                                _ => "Off",
+                            })
+                            .font(ty::mono_micro(k))
+                            .color(match s.camera.mask_overlay_mode {
+                                1 => color::mask_overlay_red(),
+                                2 => color::mask_overlay_gray(),
+                                _ => k.c.text_faint,
+                            }),
+                        ),
+                )
+                .child(
+                    row()
+                        .key("layer-mask-display")
+                        .role("radiogroup")
+                        .label("Mask overlay display mode")
+                        .w_full()
+                        .gap(space::PILL_GAP)
+                        .child(crop_pill_btn(
+                            k,
+                            "mask-disp-off",
+                            "radio",
+                            "Hide mask overlay",
+                            "Off",
+                            size::PILL_COMPACT_H,
+                            s.camera.mask_overlay_mode == 0,
+                            k.c.text_muted,
+                            |s, tx| s.set_mask_overlay_mode_tx(0, tx),
+                        ))
+                        .child(crop_pill_btn(
+                            k,
+                            "mask-disp-red",
+                            "radio",
+                            "Red rubylith mask overlay (M)",
+                            "Red (M)",
+                            size::PILL_COMPACT_H,
+                            s.camera.mask_overlay_mode == 1,
+                            k.c.text_muted,
+                            |s, tx| s.set_mask_overlay_mode_tx(1, tx),
+                        ))
+                        .child(crop_pill_btn(
+                            k,
+                            "mask-disp-gray",
+                            "radio",
+                            "Grayscale mask overlay (⌥M)",
+                            "Gray (⌥M)",
+                            size::PILL_COMPACT_H,
+                            s.camera.mask_overlay_mode == 2,
+                            k.c.text_muted,
+                            |s, tx| s.set_mask_overlay_mode_tx(2, tx),
+                        )),
+                );
+
+            body = body.child(mask_actions).child(mask_display);
+        }
     }
 
     let count_badge = text(format!("{layer_count}/{MAX_ADJUSTMENT_LAYERS}"))
@@ -628,6 +641,14 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
         s.layers_open,
         layer_count > 0,
         |s| s.layers_open = !s.layers_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Adjustment Layers & Masks",
+            shortcut: Some("B / L / T / M"),
+            description: "Non-destructive masked adjustment layers supporting Linear, Radial, Luma Range, Brush/Eraser, and AI Subject/Background masks.",
+            cli_key: "layers[]  ·  MCP: rune_edit_layers",
+            tier: "Tier 0 · Layers",
+        },
         Some(count_badge),
         body,
     )
@@ -638,12 +659,12 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
     let layer = &s.recipe.layers[layer_idx];
     let can_add = layer.masks.len() < MAX_MASKS_PER_LAYER;
 
-    let mut body = col().w_full().gap(space::SM);
+    let mut body = col().w_full().gap(space::ROW_GAP);
 
     if can_add {
         let add_mask_row = row()
             .w_full()
-            .gap(space::XS)
+            .gap(space::PILL_GAP)
             .child(crop_pill_btn(
                 k,
                 "mask-add-linear",
@@ -722,10 +743,9 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
 
     if layer.masks.is_empty() {
         body = body.child(
-            text("No masks yet — click a shape above or paint with Brush (B).")
+            text("No masks on this layer yet.")
                 .font(ty::caption(k))
-                .color(k.c.text_faint)
-                .wrap(),
+                .color(k.c.text_faint),
         );
     }
 
@@ -740,8 +760,8 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
                     .label(format!("Combine mode {}", op.label()))
                     .checked(active)
                     .cursor(Cursor::Pointer)
-                    .h(18.0)
-                    .px(space::XS)
+                    .h(22.0)
+                    .px(space::SM)
                     .center()
                     .radius(k.radius.xs)
                     .fill(color::pill_fill(k, active))
@@ -763,8 +783,8 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
             .role("button")
             .label("Invert this mask item")
             .cursor(Cursor::Pointer)
-            .h(18.0)
-            .px(space::XS)
+            .h(22.0)
+            .px(space::SM)
             .center()
             .radius(k.radius.xs)
             .fill(color::pill_fill(k, item.inverted))
@@ -1045,19 +1065,33 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
         s.masks_open,
         !layer.masks.is_empty(),
         |s| s.masks_open = !s.masks_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Composable Boolean Masks",
+            shortcut: Some("M / ⌥M"),
+            description: "Combines up to 4 mask shapes per layer using Add, Subtract, and Intersect operators with per-mask inversion and feathering.",
+            cli_key: "layers[].masks[]  ·  MCP: rune_edit_layers",
+            tier: "Tier 1 · Masking",
+        },
         Some(badge),
         body,
     )
 }
 
-/// 3. LOCAL ADJUSTMENTS Card for the active layer (all 11 Capture One local controls + Reset).
+/// 3. LOCAL ADJUSTMENTS Card for the active layer (Tier 0 primary 5 + Tier 1 Color & Detail 6).
 fn local_adjustments_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
     let adj = s.recipe.layers[layer_idx].adjustments;
     let neutral = adj.is_neutral();
+    let adv_mod = usize::from(adj.brightness.abs() > 0.005)
+        + usize::from(adj.tint.abs() > 0.005)
+        + usize::from(adj.saturation.abs() > 0.005)
+        + usize::from(adj.clarity.abs() > 0.005)
+        + usize::from(adj.dehaze.abs() > 0.005)
+        + usize::from(adj.sharpen.abs() > 0.005);
 
-    let controls = col()
+    let mut controls = col()
         .w_full()
-        .gap(space::TIGHT)
+        .gap(space::ROW_GAP)
         .child(develop_slider_inner(
             k,
             format!("sl-loc-exp-{layer_idx}"),
@@ -1087,22 +1121,6 @@ fn local_adjustments_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
             move |rec, v| {
                 if let Some(l) = rec.layers.get_mut(layer_idx) {
                     l.adjustments.contrast = v.clamp(-1.0, 1.0);
-                }
-            },
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-loc-bri-{layer_idx}"),
-            "Brightness",
-            None,
-            adj.brightness,
-            -1.0..=1.0,
-            format!("{:+.0}", adj.brightness * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.brightness = v.clamp(-1.0, 1.0);
                 }
             },
         ))
@@ -1154,86 +1172,115 @@ fn local_adjustments_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
                 }
             },
         ))
-        .child(develop_slider_inner(
+        .child(advanced_disclosure_row(
             k,
-            format!("sl-loc-tint-{layer_idx}"),
-            "Tint",
-            None,
-            adj.tint,
-            -1.0..=1.0,
-            format!("{:+.0}", adj.tint * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.tint = v.clamp(-1.0, 1.0);
-                }
-            },
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-loc-sat-{layer_idx}"),
-            "Saturation",
-            None,
-            adj.saturation,
-            -1.0..=1.0,
-            format!("{:+.0}", adj.saturation * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.saturation = v.clamp(-1.0, 1.0);
-                }
-            },
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-loc-clr-{layer_idx}"),
-            "Clarity",
-            None,
-            adj.clarity,
-            -1.0..=1.0,
-            format!("{:+.0}", adj.clarity * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.clarity = v.clamp(-1.0, 1.0);
-                }
-            },
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-loc-dhz-{layer_idx}"),
-            "Dehaze",
-            None,
-            adj.dehaze,
-            -1.0..=1.0,
-            format!("{:+.0}", adj.dehaze * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.dehaze = v.clamp(-1.0, 1.0);
-                }
-            },
-        ))
-        .child(develop_slider_inner(
-            k,
-            format!("sl-loc-shp-{layer_idx}"),
-            "Sharpen",
-            None,
-            adj.sharpen,
-            0.0..=1.0,
-            format!("{:.0}", adj.sharpen * 100.0),
-            0.0,
-            true,
-            move |rec, v| {
-                if let Some(l) = rec.layers.get_mut(layer_idx) {
-                    l.adjustments.sharpen = v.clamp(0.0, 1.0);
-                }
-            },
+            "adv-local-adj-more",
+            "Color & Detail",
+            s.local_adj_advanced_open,
+            adv_mod,
+            6,
+            |s| s.local_adj_advanced_open = !s.local_adj_advanced_open,
         ));
+
+    if s.local_adj_advanced_open {
+        controls = controls
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-bri-{layer_idx}"),
+                "Brightness",
+                None,
+                adj.brightness,
+                -1.0..=1.0,
+                format!("{:+.0}", adj.brightness * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.brightness = v.clamp(-1.0, 1.0);
+                    }
+                },
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-tint-{layer_idx}"),
+                "Tint",
+                None,
+                adj.tint,
+                -1.0..=1.0,
+                format!("{:+.0}", adj.tint * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.tint = v.clamp(-1.0, 1.0);
+                    }
+                },
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-sat-{layer_idx}"),
+                "Saturation",
+                None,
+                adj.saturation,
+                -1.0..=1.0,
+                format!("{:+.0}", adj.saturation * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.saturation = v.clamp(-1.0, 1.0);
+                    }
+                },
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-clr-{layer_idx}"),
+                "Clarity",
+                None,
+                adj.clarity,
+                -1.0..=1.0,
+                format!("{:+.0}", adj.clarity * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.clarity = v.clamp(-1.0, 1.0);
+                    }
+                },
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-dhz-{layer_idx}"),
+                "Dehaze",
+                None,
+                adj.dehaze,
+                -1.0..=1.0,
+                format!("{:+.0}", adj.dehaze * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.dehaze = v.clamp(-1.0, 1.0);
+                    }
+                },
+            ))
+            .child(develop_slider_inner(
+                k,
+                format!("sl-loc-shp-{layer_idx}"),
+                "Sharpen",
+                None,
+                adj.sharpen,
+                0.0..=1.0,
+                format!("{:.0}", adj.sharpen * 100.0),
+                0.0,
+                true,
+                move |rec, v| {
+                    if let Some(l) = rec.layers.get_mut(layer_idx) {
+                        l.adjustments.sharpen = v.clamp(0.0, 1.0);
+                    }
+                },
+            ));
+    }
 
     let reset = mini_reset_btn(k, "Reset Local Adjustments", neutral, |s, tx| {
         s.reset_active_layer_adjustments_tx(tx);
@@ -1246,13 +1293,21 @@ fn local_adjustments_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
         s.local_adj_open,
         !neutral,
         |s| s.local_adj_open = !s.local_adj_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Per-Layer Local Adjustments",
+            shortcut: None,
+            description: "Blends Exposure, Contrast, Highlights, Shadows, Temperature, and Color/Detail selectively through the active layer's combined mask.",
+            cli_key: "layers[].adjustments.*  ·  MCP: rune_edit_layers",
+            tier: "Tier 0 · Local Grade",
+        },
         Some(reset),
         controls,
     )
 }
 
-/// HEAL & CLONE Card: mode selector (`Heal (Q)` | `Clone (S)`), Radius/Feather/Opacity
-/// capsules, active spot list with remove button, and `Clear Spots`.
+/// HEAL & CLONE Card: mode selector (`Heal (Q)` | `Clone (S)`), Radius/Feather at Tier 0,
+/// Opacity + Clear Spots in Tier 1, and active spot list.
 fn heal_clone_card(s: &AppState, k: &Kit) -> El {
     let spot_count = s.recipe.heal_spots.len();
     let heal_active = s.active_tool == CanvasTool::Heal;
@@ -1263,7 +1318,7 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
         .role("radiogroup")
         .label("Heal and Clone tool mode")
         .w_full()
-        .gap(space::XS)
+        .gap(space::PILL_GAP)
         .child(crop_pill_btn(
             k,
             "tool-heal-mode",
@@ -1301,9 +1356,10 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
             },
         ));
 
+    let heal_adv_mod = usize::from((s.heal_opacity - 1.0).abs() > 0.01);
     let mut body = col()
         .w_full()
-        .gap(space::SM)
+        .gap(space::ROW_GAP)
         .child(mode_row)
         .child(tool_param_capsule(
             k,
@@ -1324,20 +1380,10 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
             format!("{:.0}%", s.heal_feather * 100.0),
             0.42,
             |s, v| s.heal_feather = v,
-        ))
-        .child(tool_param_capsule(
-            k,
-            "sl-heal-opacity",
-            "Opacity",
-            s.heal_opacity,
-            0.05..=1.0,
-            format!("{:.0}%", s.heal_opacity * 100.0),
-            1.0,
-            |s, v| s.heal_opacity = v,
         ));
 
     if !s.recipe.heal_spots.is_empty() {
-        let mut list = col().w_full().gap(space::XXS);
+        let mut list = col().w_full().gap(space::XS);
         for (idx, spot) in s.recipe.heal_spots.iter().enumerate() {
             let dot_col = match spot.mode {
                 HealMode::Heal => color::heal_target_ring(),
@@ -1348,7 +1394,7 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
                     .key(format!("heal-spot-row-{idx}"))
                     .w_full()
                     .px(space::SM)
-                    .py(space::TINY)
+                    .py(space::XS)
                     .items_center()
                     .justify_between()
                     .radius(k.radius.sm)
@@ -1389,25 +1435,41 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
             );
         }
         body = body.child(list);
-    } else {
-        body = body.child(
-            text("Click photo to place spot • Drag to aim source patch • Esc for Hand")
-                .font(ty::caption(k))
-                .color(k.c.text_faint)
-                .wrap(),
-        );
     }
 
-    body = body.child(
-        row().w_full().justify_end().child(
-            Button::new("Clear Spots")
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .disabled(spot_count == 0)
-                .on_press_tx(|s: &mut AppState, tx| s.clear_heal_spots_tx(tx))
-                .build(k),
-        ),
-    );
+    body = body.child(advanced_disclosure_row(
+        k,
+        "adv-heal-edge",
+        "Opacity & Actions",
+        s.heal_advanced_open,
+        heal_adv_mod,
+        2,
+        |s| s.heal_advanced_open = !s.heal_advanced_open,
+    ));
+
+    if s.heal_advanced_open {
+        body = body
+            .child(tool_param_capsule(
+                k,
+                "sl-heal-opacity",
+                "Opacity",
+                s.heal_opacity,
+                0.05..=1.0,
+                format!("{:.0}%", s.heal_opacity * 100.0),
+                1.0,
+                |s, v| s.heal_opacity = v,
+            ))
+            .child(
+                row().w_full().justify_end().child(
+                    Button::new("Clear Spots")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .disabled(spot_count == 0)
+                        .on_press_tx(|s: &mut AppState, tx| s.clear_heal_spots_tx(tx))
+                        .build(k),
+                ),
+            );
+    }
 
     let badge = text(format!("{spot_count}/{MAX_HEAL_SPOTS}"))
         .font(ty::mono_compact(k))
@@ -1420,6 +1482,14 @@ fn heal_clone_card(s: &AppState, k: &Kit) -> El {
         s.heal_open,
         spot_count > 0,
         |s| s.heal_open = !s.heal_open,
+        s.hovered_info,
+        InfoTip {
+            title: "Spot Heal & Clone Stamp",
+            shortcut: Some("Q / S"),
+            description: "Non-destructive blemish removal and patch cloning. Click photo to place a spot, drag to aim the source patch, press Esc for Hand.",
+            cli_key: "heal_spots[]  ·  MCP: rune_edit_layers",
+            tier: "Tier 1 · Retouch",
+        },
         Some(badge),
         body,
     )

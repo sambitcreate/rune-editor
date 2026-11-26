@@ -44,7 +44,7 @@ pub fn export_view(s: &AppState, k: &Kit) -> El {
         .child(color_and_metadata_card(s, k))
         .child(export_action_bar(s, k, enabled_count));
 
-    let scroll_viewport = el()
+    let scroll_viewport = col()
         .key("export-scroll")
         .grow(1.0)
         .h_full()

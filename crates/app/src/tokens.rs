@@ -25,7 +25,7 @@ pub fn srgb(r: f32, g: f32, b: f32) -> Color {
     }
 }
 
-/// Spacing & padding scale (points).
+/// Spacing & padding scale (points) — locked `Studio Airy` rhythm.
 pub mod space {
     pub const MICRO: f32 = 1.0;
     pub const XXS: f32 = 2.0;
@@ -42,39 +42,47 @@ pub mod space {
     pub const HUD_X: f32 = 18.0;
     pub const HUD_BELOW_SPLIT: f32 = 48.0;
     pub const MODAL_PAD: f32 = 20.0;
+
+    // Studio Airy semantic layout rhythm (DESIGN.md §4)
+    pub const CARD_PAD: f32 = 14.0;
+    pub const CARD_GAP: f32 = 12.0;
+    pub const CARD_HEADER_GAP: f32 = 10.0;
+    pub const ROW_GAP: f32 = 8.0;
+    pub const GROUP_GAP: f32 = 14.0;
+    pub const PILL_GAP: f32 = 6.0;
 }
 
-/// Layout, widget, icon, and viewport dimensions (points).
+/// Layout, widget, icon, and viewport dimensions (points) — locked `Studio Airy` metrics.
 pub mod size {
     pub const WINDOW_DEFAULT: (f32, f32) = (1360.0, 860.0);
     pub const WINDOW_MIN: (f32, f32) = (1024.0, 680.0);
 
-    pub const TITLEBAR_H: f32 = 48.0;
-    pub const STATUS_BAR_H: f32 = 28.0;
-    pub const INSPECTOR_W: f32 = 356.0;
-    pub const CARD_INNER_W: f32 = 308.0;
+    pub const TITLEBAR_H: f32 = 50.0;
+    pub const STATUS_BAR_H: f32 = 30.0;
+    pub const INSPECTOR_W: f32 = 388.0;
+    pub const CARD_INNER_W: f32 = 332.0;
 
-    pub const HISTOGRAM_W: f32 = 312.0;
-    pub const HISTOGRAM_H: f32 = 64.0;
-    pub const PROBE_FOOTER_H: f32 = 16.0;
-    pub const LEVELS_STRIP_H: f32 = 38.0;
-    pub const CURVE_H: f32 = 144.0;
+    pub const HISTOGRAM_W: f32 = 332.0;
+    pub const HISTOGRAM_H: f32 = 72.0;
+    pub const PROBE_FOOTER_H: f32 = 20.0;
+    pub const LEVELS_STRIP_H: f32 = 42.0;
+    pub const CURVE_H: f32 = 152.0;
 
     pub const FILMSTRIP_H: f32 = 160.0;
-    pub const FILMSTRIP_HEADER_H: f32 = 34.0;
+    pub const FILMSTRIP_HEADER_H: f32 = 36.0;
     pub const THUMB_CARD_W: f32 = 150.0;
     pub const THUMB_PREVIEW_W: f32 = 140.0;
     pub const THUMB_PREVIEW_H: f32 = 74.0;
     pub const THUMB_EMPTY_H: f32 = 92.0;
     pub const FLAG_BADGE: f32 = 16.0;
 
-    pub const WHEEL_DIAMETER: f32 = 88.0;
-    pub const MASTER_WHEEL_DIAMETER: f32 = 148.0;
+    pub const WHEEL_DIAMETER: f32 = 96.0;
+    pub const MASTER_WHEEL_DIAMETER: f32 = 152.0;
     pub const WHEEL_PUCK: f32 = 11.0;
     pub const WHEEL_CROSSHAIR_ARM: f32 = 5.0;
 
-    pub const SWATCH_RING: f32 = 26.0;
-    pub const SWATCH_DOT: f32 = 14.0;
+    pub const SWATCH_RING: f32 = 28.0;
+    pub const SWATCH_DOT: f32 = 15.0;
     pub const MODIFIED_DOT: f32 = 4.0;
     pub const CHANNEL_DOT: f32 = 6.0;
     pub const BAND_DOT: f32 = 8.0;
@@ -82,21 +90,25 @@ pub mod size {
     pub const TARGET_SWATCH: f32 = 14.0;
     pub const COLOR_TAG_DOT: f32 = 8.0;
     pub const COLOR_TAG_BTN: f32 = 16.0;
-    pub const VARIANT_STRIP_H: f32 = 32.0;
+    pub const VARIANT_STRIP_H: f32 = 34.0;
     pub const PIN_MARKER: f32 = 18.0;
     pub const GRID_CARD_W: f32 = 216.0;
     pub const GRID_PREVIEW_H: f32 = 132.0;
     pub const EXPORT_CONTENT_MAX_W: f32 = 720.0;
 
-    pub const PILL_COMPACT_H: f32 = 22.0;
-    pub const PILL_H: f32 = 24.0;
-    pub const ASPECT_PILL_H: f32 = 26.0;
-    pub const ACTION_PILL_H: f32 = 28.0;
-    pub const CAPSULE_SLIDER_H: f32 = 30.0;
-    pub const MINI_CAPSULE_SLIDER_H: f32 = 22.0;
+    pub const PILL_COMPACT_H: f32 = 26.0;
+    pub const PILL_H: f32 = 28.0;
+    pub const ASPECT_PILL_H: f32 = 28.0;
+    pub const ACTION_PILL_H: f32 = 30.0;
+    pub const CAPSULE_SLIDER_H: f32 = 32.0;
+    pub const MINI_CAPSULE_SLIDER_H: f32 = 24.0;
     pub const CAPSULE_ZERO_TICK_W: f32 = 1.0;
     pub const CAPSULE_EDGE_W: f32 = 1.0;
-    pub const MINI_AUTO_BTN: f32 = 20.0;
+    pub const MINI_AUTO_BTN: f32 = 22.0;
+
+    pub const INFO_BADGE_SIZE: f32 = 15.0;
+    pub const INFO_POPOVER_W: f32 = 288.0;
+    pub const OVERLAYS_POPOVER_W: f32 = 268.0;
 
     pub const CURVE_PT: f32 = 8.0;
     pub const CURVE_PT_DRAG: f32 = 10.0;
@@ -112,7 +124,7 @@ pub mod size {
 
     pub const DIALOG_ABOUT_W: f32 = 360.0;
     pub const DIALOG_CLOSE_W: f32 = 380.0;
-    pub const SETTINGS_SIDEBAR_W: f32 = 220.0;
+    pub const SETTINGS_SIDEBAR_W: f32 = 224.0;
     pub const SETTINGS_CONTENT_MAX_W: f32 = 700.0;
     pub const STATUS_DOT: f32 = 7.0;
 
@@ -154,7 +166,8 @@ pub mod radius {
     }
 }
 
-/// Named OpenCode typography tokens (including tabular monospace readouts).
+/// Named OpenCode / `Studio Airy` typography tokens (1.48–1.50× relaxed line-height,
+/// tabular monospace numerals `'tnum' 1`).
 pub mod ty {
     use super::*;
 
@@ -169,67 +182,103 @@ pub mod ty {
 
     #[inline]
     pub fn mono_probe(k: &Kit) -> TextStyle {
-        mono_sized(k, 9.5, 13.5)
+        mono_sized(k, 10.5, 15.5)
     }
 
     #[inline]
     pub fn mono_micro(k: &Kit) -> TextStyle {
-        mono_sized(k, 10.0, 14.0)
+        mono_sized(k, 10.5, 15.5)
     }
 
     #[inline]
     pub fn mono_compact(k: &Kit) -> TextStyle {
-        mono_sized(k, 10.5, 14.5)
+        mono_sized(k, 11.0, 16.5)
     }
 
     #[inline]
     pub fn mono_value(k: &Kit) -> TextStyle {
-        mono_sized(k, 11.0, 15.0)
+        mono_sized(k, 12.0, 18.0)
     }
 
     #[inline]
     pub fn mono_status(k: &Kit) -> TextStyle {
-        mono_sized(k, 11.0, 14.0)
+        mono_sized(k, 11.5, 17.0)
     }
 
     #[inline]
     pub fn mono_hud(k: &Kit) -> TextStyle {
-        mono_sized(k, 12.0, 16.0)
+        mono_sized(k, 12.0, 18.0)
     }
 
     #[inline]
     pub fn section_header(k: &Kit) -> TextStyle {
-        k.ty.small_medium
+        TextStyle {
+            size: 11.5,
+            line_height: 17.0,
+            weight: 600.0,
+            tracking: 0.65,
+            ..k.ty.small_medium
+        }
     }
 
     #[inline]
     pub fn control_label(k: &Kit) -> TextStyle {
-        k.ty.text_xsmall
+        TextStyle {
+            size: 12.5,
+            line_height: 18.5,
+            weight: 440.0,
+            ..k.ty.text_xsmall
+        }
     }
 
     #[inline]
     pub fn control_label_medium(k: &Kit) -> TextStyle {
-        k.ty.text_xsmall_medium
+        TextStyle {
+            size: 12.5,
+            line_height: 18.5,
+            weight: 530.0,
+            ..k.ty.text_xsmall_medium
+        }
     }
 
     #[inline]
     pub fn brand_title(k: &Kit) -> TextStyle {
-        k.ty.ui_medium
+        TextStyle {
+            size: 13.0,
+            line_height: 19.5,
+            weight: 530.0,
+            ..k.ty.ui_medium
+        }
     }
 
     #[inline]
     pub fn caption(k: &Kit) -> TextStyle {
-        k.ty.small
+        TextStyle {
+            size: 12.0,
+            line_height: 18.0,
+            tracking: 0.0,
+            ..k.ty.small
+        }
     }
 
     #[inline]
     pub fn dialog_title(k: &Kit) -> TextStyle {
-        k.ty.body_medium
+        TextStyle {
+            size: 15.0,
+            line_height: 22.0,
+            weight: 530.0,
+            ..k.ty.body_medium
+        }
     }
 
     #[inline]
     pub fn dialog_body(k: &Kit) -> TextStyle {
-        k.ty.text_small
+        TextStyle {
+            size: 13.0,
+            line_height: 20.0,
+            weight: 400.0,
+            ..k.ty.text_small
+        }
     }
 }
 
@@ -562,5 +611,23 @@ pub mod color {
     #[inline]
     pub fn code_surface(k: &Kit) -> Color {
         k.c.bg_deep
+    }
+
+    /// Subtle circular outline for Tier 2 `ⓘ` hover info badges.
+    #[inline]
+    pub fn info_badge_border() -> Color {
+        srgb(1.0, 1.0, 1.0).alpha(0.24)
+    }
+
+    /// Subtle neutral surface fill for Tier 2 `ⓘ` hover info badges at rest.
+    #[inline]
+    pub fn info_badge_bg() -> Color {
+        srgb(1.0, 1.0, 1.0).alpha(0.06)
+    }
+
+    /// Frosted darkroom floating popover surface (`Overlays ▾` & hover `ⓘ` info cards).
+    #[inline]
+    pub fn popover_bg() -> Color {
+        srgb(0.115, 0.115, 0.125).alpha(0.95)
     }
 }

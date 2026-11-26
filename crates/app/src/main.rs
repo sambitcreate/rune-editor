@@ -55,8 +55,8 @@ use crate::state::{
     SettingsSection, ShortcutAction, SpeedEditParam,
 };
 use crate::tokens::{border, color, radius, size, space, ty};
-use crate::toolbar::top_toolbar;
-use crate::widgets::right_inspector;
+use crate::toolbar::{overlays_popover_overlay, top_toolbar};
+use crate::widgets::{floating_info_popover, right_inspector};
 
 /// Compact translucent OpenCode pill for active viewer diagnostics (`CLIPPING`, `FOCUS MASK`, `CROP`).
 fn diagnostic_hud_pill(k: &Kit, key: &'static str, label: &'static str, fg: Color) -> El {
@@ -1095,6 +1095,10 @@ fn handle_key(s: &mut AppState, ev: &KeyEvent, tx: &mut Tx) -> bool {
 
     match &ev.key {
         Key::Escape => {
+            if s.overlays_popover_open {
+                s.overlays_popover_open = false;
+                return true;
+            }
             if s.show_about {
                 s.show_about = false;
                 return true;
@@ -1614,6 +1618,12 @@ fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         .child(status_bar(s, k));
 
     let mut overlays = Vec::new();
+    if s.overlays_popover_open {
+        overlays.push(overlays_popover_overlay(s, k));
+    }
+    if let Some(info_card) = floating_info_popover(s, k) {
+        overlays.push(info_card);
+    }
     if s.show_about {
         overlays.push(about_dialog_overlay(k));
     }
@@ -1648,6 +1658,9 @@ fn scene_editorial(s: &mut AppState) {
 
 fn scene_color(s: &mut AppState) {
     s.active_tab = InspectorTab::Color;
+    s.color_balance_open = true;
+    s.presence_open = true;
+    s.hsl_open = true;
     s.color_balance_view = ColorBalanceView::ThreeWay;
     s.bw_open = false;
     s.selected_hsl_band = 1;
@@ -1741,6 +1754,7 @@ fn scene_levels(s: &mut AppState) {
     s.wb_open = false;
     s.tone_open = false;
     s.levels_open = true;
+    s.levels_advanced_open = true;
     s.curve_open = false;
     s.levels_channel = LevelsChannel::Red;
     s.recipe.brightness = 0.16;
@@ -1760,6 +1774,7 @@ fn scene_bw(s: &mut AppState) {
     s.color_balance_open = false;
     s.presence_open = false;
     s.bw_open = true;
+    s.bw_split_open = true;
     s.hsl_open = false;
     s.recipe.contrast = 0.24;
     s.recipe.clarity = 0.18;
@@ -1781,7 +1796,9 @@ fn scene_bw(s: &mut AppState) {
 fn scene_detail(s: &mut AppState) {
     s.active_tab = InspectorTab::Detail;
     s.clarity_open = true;
+    s.clarity_advanced_open = true;
     s.sharpen_open = true;
+    s.sharpen_advanced_open = true;
     s.nr_open = true;
     s.grain_open = true;
     s.vignette_open = true;
@@ -1810,7 +1827,9 @@ fn scene_grain(s: &mut AppState) {
     s.sharpen_open = false;
     s.nr_open = true;
     s.grain_open = true;
+    s.grain_advanced_open = true;
     s.vignette_open = true;
+    s.vignette_advanced_open = true;
     s.recipe.vignette_method = VignetteMethod::CircularOnCrop;
     s.status_message =
         Some("Noise Reduction • Film Grain Profiles • Crop-Aware Vignetting".to_owned());
@@ -1822,6 +1841,7 @@ fn scene_color_advanced(s: &mut AppState) {
     s.presence_open = false;
     s.bw_open = false;
     s.hsl_open = true;
+    s.color_adv_range_open = true;
     s.color_editor_mode = ColorEditorMode::Advanced;
     s.selected_color_slice = 0;
     s.recipe.advanced_color[0].enabled = true;
@@ -1849,6 +1869,7 @@ fn scene_skin_tone(s: &mut AppState) {
     s.presence_open = false;
     s.bw_open = false;
     s.hsl_open = true;
+    s.skin_tone_advanced_open = true;
     s.color_editor_mode = ColorEditorMode::SkinTone;
     s.recipe.skin_tone.enabled = true;
     s.recipe.skin_tone.target_hue = 22.0;
@@ -1871,7 +1892,9 @@ fn scene_lens_keystone(s: &mut AppState) {
     s.crop_open = false;
     s.rotate_open = false;
     s.keystone_open = true;
+    s.keystone_advanced_open = true;
     s.lens_open = true;
+    s.lens_advanced_open = true;
     s.grid_open = false;
     s.recipe.geometry.keystone_vertical = -0.16;
     s.recipe.geometry.keystone_horizontal = 0.08;
@@ -1908,6 +1931,8 @@ fn scene_warnings(s: &mut AppState) {
 fn scene_settings(s: &mut AppState) {
     s.show_settings = true;
     s.settings_section = SettingsSection::AgentMcp;
+    s.settings_mcp_snippets_open = true;
+    s.settings_mcp_tools_open = false;
     s.mcp_request_count = 14;
     s.mcp_last_activity = Some("rune_edit_photo • ok".to_owned());
     s.status_message = Some("Settings — Local MCP Server (2025-11-25)".to_owned());
@@ -1942,7 +1967,9 @@ fn scene_clipboard_styles(s: &mut AppState) {
     s.styles_open = false;
     s.style_strength = 0.75;
     s.user_styles_open = true;
+    s.user_styles_advanced_open = true;
     s.clipboard_open = true;
+    s.clipboard_groups_open = true;
     s.catalog.copy_adjustments(&s.recipe);
     s.autoselect_adjusted_groups();
     if s.user_styles.is_empty()
@@ -1997,6 +2024,7 @@ fn scene_layers_mask(s: &mut AppState) {
     scene_editorial(s);
     s.active_tab = InspectorTab::Layers;
     s.layers_open = true;
+    s.layers_mask_actions_open = true;
     s.masks_open = true;
     s.local_adj_open = true;
     s.heal_open = false;
@@ -2053,6 +2081,7 @@ fn scene_layers_grayscale(s: &mut AppState) {
     scene_editorial(s);
     s.active_tab = InspectorTab::Layers;
     s.layers_open = true;
+    s.layers_mask_actions_open = true;
     s.masks_open = true;
     s.local_adj_open = false;
     s.heal_open = false;
@@ -2087,6 +2116,7 @@ fn scene_heal_clone(s: &mut AppState) {
     s.masks_open = false;
     s.local_adj_open = false;
     s.heal_open = true;
+    s.heal_advanced_open = true;
     s.active_tool = CanvasTool::Heal;
     s.recipe.heal_spots = vec![
         HealSpot {
@@ -2125,6 +2155,7 @@ fn scene_film_negative(s: &mut AppState) {
     s.active_tab = InspectorTab::Light;
     s.base_open = true;
     s.film_neg_open = true;
+    s.film_neg_advanced_open = true;
     s.wb_open = false;
     s.tone_open = false;
     s.levels_open = false;
@@ -2272,4 +2303,308 @@ fn main() {
         initial_state
     })
     .run();
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use rune::{Env, Runtime, ScrollBars};
+
+    fn find_rect(rt: &Runtime<AppState>, key: &str) -> [f32; 4] {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("missing element with key {key:?}"))
+            .rect
+    }
+
+    fn find_first_child_rect(rt: &Runtime<AppState>, parent_key: &str) -> [f32; 4] {
+        let elems = rt.elements();
+        let parent_path = elems
+            .iter()
+            .find(|e| e.key.as_deref() == Some(parent_key))
+            .unwrap_or_else(|| panic!("missing element with key {parent_key:?}"))
+            .path
+            .clone();
+        let prefix = format!("{parent_path}/");
+        elems
+            .into_iter()
+            .find(|e| {
+                e.path
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.contains('/'))
+            })
+            .unwrap_or_else(|| panic!("missing direct child of {parent_key:?}"))
+            .rect
+    }
+
+    fn make_runtime(state: AppState, size: (f32, f32)) -> Runtime<AppState> {
+        let mut rt = Runtime::new(state, view, size, Env::new(true, 1.0));
+        rt.set_system_scroll_bars(ScrollBars::Always);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        rt
+    }
+
+    #[test]
+    fn right_inspector_scrolls_vertically_across_tabs_and_reaches_bottom() {
+        type TabSetup = (&'static str, fn(&mut AppState));
+        let tabs: &[TabSetup] = &[
+            ("Light", |s| {
+                scene_editorial(s);
+                s.active_tab = InspectorTab::Light;
+                s.levels_open = true;
+                s.curve_open = true;
+            }),
+            ("Color", |s| {
+                scene_color(s);
+                s.active_tab = InspectorTab::Color;
+                s.color_balance_open = true;
+                s.hsl_open = true;
+                s.bw_open = true;
+            }),
+            ("Detail", |s| {
+                scene_detail(s);
+                s.active_tab = InspectorTab::Detail;
+                s.clarity_open = true;
+                s.sharpen_open = true;
+                s.grain_open = true;
+                s.vignette_open = true;
+            }),
+            ("Crop/Lens", |s| {
+                scene_lens_keystone(s);
+                s.active_tab = InspectorTab::Crop;
+                s.crop_open = true;
+                s.rotate_open = true;
+                s.keystone_open = true;
+                s.lens_open = true;
+                s.grid_open = true;
+            }),
+            ("Layers", |s| {
+                scene_layers_mask(s);
+                s.heal_open = true;
+            }),
+            ("Style", |s| {
+                scene_clipboard_styles(s);
+                s.variants_open = true;
+                s.styles_open = true;
+                s.user_styles_open = true;
+                s.clipboard_open = true;
+            }),
+        ];
+
+        for &(label, setup) in tabs {
+            let mut state = AppState::default();
+            setup(&mut state);
+            let mut rt = make_runtime(state, size::WINDOW_DEFAULT);
+
+            let vp = find_rect(&rt, "inspector-scroll");
+            let content_before = find_rect(&rt, "inspector-tabpanel");
+            let bar = find_rect(&rt, "scroll-bar");
+
+            assert!(
+                content_before[3] > vp[3] + 20.0,
+                "{label} tab content ({}) must exceed inspector-scroll viewport ({}) rather than being clamped",
+                content_before[3],
+                vp[3],
+            );
+            assert!(
+                bar[3] > 100.0,
+                "{label} tab scroll-bar must be visible with non-zero height, got {bar:?}",
+            );
+
+            let cx = vp[0] + vp[2] * 0.5;
+            let cy = vp[1] + vp[3] * 0.5;
+            let initial_zoom = rt.state.camera.zoom;
+
+            // Scroll down in steps until the bottom of content is visible.
+            for _ in 0..8 {
+                rt.wheel_event(WheelEvent::new(0.0, -240.0).at(cx, cy));
+                rt.frame(1.0 / 60.0);
+            }
+            for _ in 0..30 {
+                rt.frame(1.0 / 60.0);
+            }
+
+            let content_after = find_rect(&rt, "inspector-tabpanel");
+            assert!(
+                content_after[1] < content_before[1] - 100.0,
+                "{label} tab did not scroll on wheel: before={content_before:?} after={content_after:?}",
+            );
+            let content_bottom = content_after[1] + content_after[3];
+            let vp_bottom = vp[1] + vp[3];
+            assert!(
+                content_bottom <= vp_bottom + 1.5,
+                "{label} tab could not scroll all the way to bottom: content_bottom={content_bottom} vp_bottom={vp_bottom}",
+            );
+            assert_eq!(
+                rt.state.camera.zoom, initial_zoom,
+                "wheeling over {label} inspector must not affect viewport camera zoom",
+            );
+        }
+    }
+
+    #[test]
+    fn settings_export_browser_and_filmstrip_scroll() {
+        // 1. Settings pane vertical scroll (short window height).
+        {
+            let mut state = AppState::default();
+            scene_settings_shortcuts(&mut state);
+            let mut rt = make_runtime(state, size::WINDOW_MIN);
+            let vp = find_rect(&rt, "settings-scroll");
+            let before = find_first_child_rect(&rt, "settings-scroll");
+            assert!(
+                before[3] > vp[3] + 20.0,
+                "settings content ({}) must exceed viewport ({})",
+                before[3],
+                vp[3],
+            );
+            rt.wheel_event(
+                WheelEvent::new(0.0, -240.0).at(vp[0] + vp[2] * 0.5, vp[1] + vp[3] * 0.5),
+            );
+            for _ in 0..20 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = find_first_child_rect(&rt, "settings-scroll");
+            assert!(
+                after[1] < before[1] - 50.0,
+                "settings pane did not scroll: before={before:?} after={after:?}",
+            );
+        }
+
+        // 2. Export pane vertical scroll (short window height).
+        {
+            let mut state = AppState::default();
+            scene_export_recipes(&mut state);
+            let mut rt = make_runtime(state, size::WINDOW_MIN);
+            let vp = find_rect(&rt, "export-scroll");
+            let before = find_first_child_rect(&rt, "export-scroll");
+            assert!(
+                before[3] > vp[3] + 20.0,
+                "export content ({}) must exceed viewport ({})",
+                before[3],
+                vp[3],
+            );
+            rt.wheel_event(
+                WheelEvent::new(0.0, -240.0).at(vp[0] + vp[2] * 0.5, vp[1] + vp[3] * 0.5),
+            );
+            for _ in 0..20 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = find_first_child_rect(&rt, "export-scroll");
+            assert!(
+                after[1] < before[1] - 50.0,
+                "export pane did not scroll: before={before:?} after={after:?}",
+            );
+        }
+
+        // 3. Grid browser vertical scroll with >12 photos (4+ rows).
+        {
+            let mut state = AppState::default();
+            scene_grid_browser(&mut state);
+            while state.catalog.entries.len() < 16 {
+                let mut dup = state.catalog.entries[0].clone();
+                let n = state.catalog.entries.len();
+                dup.path = std::path::PathBuf::from(format!("Frame_{n:03}.ARW"));
+                state.catalog.entries.push(dup);
+            }
+            let mut rt = make_runtime(state, size::WINDOW_DEFAULT);
+            let vp = find_rect(&rt, "grid-browser-scroll");
+            let before = find_rect(&rt, "grid-browser-cards");
+            assert!(
+                before[3] > vp[3] + 20.0,
+                "grid browser content ({}) must exceed viewport ({})",
+                before[3],
+                vp[3],
+            );
+            rt.wheel_event(
+                WheelEvent::new(0.0, -240.0).at(vp[0] + vp[2] * 0.5, vp[1] + vp[3] * 0.5),
+            );
+            for _ in 0..20 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = find_rect(&rt, "grid-browser-cards");
+            assert!(
+                after[1] < before[1] - 50.0,
+                "grid browser did not scroll: before={before:?} after={after:?}",
+            );
+        }
+
+        // 4. Filmstrip horizontal scroll with >10 photos.
+        {
+            let mut state = AppState::default();
+            scene_filmstrip(&mut state);
+            while state.catalog.entries.len() < 12 {
+                let mut dup = state.catalog.entries[0].clone();
+                let n = state.catalog.entries.len();
+                dup.path = std::path::PathBuf::from(format!("Strip_{n:03}.ARW"));
+                state.catalog.entries.push(dup);
+            }
+            let mut rt = make_runtime(state, size::WINDOW_DEFAULT);
+            let vp = find_rect(&rt, "filmstrip-scroll");
+            let before = find_rect(&rt, "filmstrip-items");
+            assert!(
+                before[2] > vp[2] + 50.0,
+                "filmstrip items ({}) must exceed horizontal viewport ({})",
+                before[2],
+                vp[2],
+            );
+            rt.wheel_event(
+                WheelEvent::new(-240.0, 0.0).at(vp[0] + vp[2] * 0.5, vp[1] + vp[3] * 0.5),
+            );
+            for _ in 0..20 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = find_rect(&rt, "filmstrip-items");
+            assert!(
+                after[0] < before[0] - 50.0,
+                "filmstrip did not scroll horizontally: before={before:?} after={after:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn studio_airy_overlays_and_info_popover_render_cleanly() {
+        // 1. Overlays popover renders below titlebar and clears macOS traffic lights
+        let s = AppState {
+            overlays_popover_open: true,
+            ..AppState::default()
+        };
+        let rt = make_runtime(s, size::WINDOW_DEFAULT);
+        let inspector = find_rect(&rt, "develop-inspector");
+        assert!(
+            (inspector[2] - size::INSPECTOR_W).abs() < 1.0,
+            "inspector width must match Studio Airy 388pt, got {:?}",
+            inspector
+        );
+        let popover = find_rect(&rt, "overlays-popover-card");
+        assert!(
+            popover[1] >= size::TITLEBAR_H,
+            "overlays popover must open below titlebar, got {popover:?}"
+        );
+        assert!(popover[2] > 200.0 && popover[3] > 120.0);
+
+        // 2. Floating hover `ⓘ` info popover renders in Darkroom and Settings without clipping
+        let tip = crate::state::InfoTip {
+            title: "Exposure & Tone",
+            shortcut: Some("Q / W / A / S"),
+            description: "Scene-referred EV exposure and tonal recovery.",
+            cli_key: "exposure  ·  contrast  ·  highlights  ·  shadows",
+            tier: "Tier 0 · Tone",
+        };
+        let mut s_dark = AppState::default();
+        s_dark.set_hovered_info(tip);
+        let rt_dark = make_runtime(s_dark, size::WINDOW_DEFAULT);
+        let card_dark = find_rect(&rt_dark, "floating-info-popover");
+        assert!(card_dark[1] >= size::TITLEBAR_H);
+        assert!(card_dark[0] + card_dark[2] <= size::WINDOW_DEFAULT.0 - size::INSPECTOR_W);
+
+        let mut s_set = AppState::default();
+        scene_settings(&mut s_set);
+        s_set.set_hovered_info(tip);
+        let rt_set = make_runtime(s_set, size::WINDOW_DEFAULT);
+        let card_set = find_rect(&rt_set, "floating-info-popover");
+        assert!(card_set[0] >= size::SETTINGS_SIDEBAR_W);
+        assert!(card_set[1] + card_set[3] <= size::WINDOW_DEFAULT.1 - size::STATUS_BAR_H);
+    }
 }
