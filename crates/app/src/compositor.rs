@@ -24,11 +24,12 @@ impl Compositor<AppState> for DarkroomCompositor {
             return;
         };
 
-        // Upload linear Rgba16Float photo texture once per image generation and 256x1 curve LUT
-        // only when tone curve points change.
+        // Upload linear Rgba16Float photo texture once per image generation, 256x1 curve LUT
+        // when tone curves change, and 1024x512 R8Unorm layer mask atlas when layers change.
         let generation = f.rt.state.image_generation;
         gpu.ensure_image_uploaded(f.device, f.queue, generation, &f.rt.state.image);
         gpu.ensure_curve_lut_uploaded(f.queue, &f.rt.state.recipe);
+        gpu.ensure_layer_masks_uploaded(f.queue, &f.rt.state.recipe);
 
         // Pre-build Copy uniform block by borrowing recipe (zero per-frame heap allocations).
         let base_uniforms = DevelopUniforms::build(

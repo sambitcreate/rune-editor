@@ -4,8 +4,8 @@
 //! Pick (`P`) / Reject (`X`) badges, filter pills (`All | Picks | ★+`), and instant
 //! keyboard (`←`/`→`) or click switching.
 
-use rune::{Cursor, El, SurfaceFit, col, el, icon, row, text};
-use rune_editor_core::{CullFilter, CullFlag};
+use rune::{Color, Cursor, El, SurfaceFit, col, el, icon, row, text};
+use rune_editor_core::{ColorTag, CullFilter, CullFlag};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
     SegmentedControl,
@@ -48,6 +48,78 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
         })
         .build(k);
 
+    let active_tag = s
+        .catalog
+        .active_entry()
+        .map_or(ColorTag::None, |e| e.effective_color_tag());
+    let mut tag_picker = row()
+        .key("filmstrip-color-tags")
+        .role("radiogroup")
+        .label("Assign color tag")
+        .items_center()
+        .gap(space::XXS);
+    for &tag in &ColorTag::ALL {
+        let selected = active_tag == tag;
+        let fill_col = if tag == ColorTag::None {
+            k.c.bg_base
+        } else {
+            color::color_tag_swatch(tag, k)
+        };
+        tag_picker = tag_picker.child(
+            row()
+                .key(format!("fs-tag-{}", tag.cli_slug()))
+                .role("radio")
+                .label(format!("Color tag {}", tag.label()))
+                .help(format!("Tag active photo: {}", tag.label()))
+                .checked(selected)
+                .cursor(Cursor::Pointer)
+                .size(size::COLOR_TAG_BTN, size::COLOR_TAG_BTN)
+                .center()
+                .radius(radius::circle(size::COLOR_TAG_BTN))
+                .fill(if selected {
+                    k.c.layer_03
+                } else {
+                    Color::TRANSPARENT
+                })
+                .border(
+                    if selected {
+                        border::REGULAR
+                    } else {
+                        border::NONE
+                    },
+                    if selected {
+                        k.c.border_focus
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                )
+                .child(
+                    el().size(size::COLOR_TAG_DOT, size::COLOR_TAG_DOT)
+                        .radius(radius::circle(size::COLOR_TAG_DOT))
+                        .fill(fill_col)
+                        .border(border::HAIRLINE, k.c.border_strong)
+                        .a11y_hidden(),
+                )
+                .on_press_tx(move |s: &mut AppState, tx| {
+                    s.set_active_color_tag_tx(tag, tx);
+                }),
+        );
+    }
+
+    let auto_adv_btn = Button::new("Auto-Adv")
+        .variant(if s.auto_advance {
+            ButtonVariant::Contrast
+        } else {
+            ButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Small)
+        .help("Advance to next frame automatically after rating, flagging, or tagging")
+        .on_press_tx(|s: &mut AppState, tx| {
+            s.auto_advance = !s.auto_advance;
+            s.sync_window_state(tx);
+        })
+        .build(k);
+
     let header = row()
         .key("filmstrip-header")
         .w_full()
@@ -84,11 +156,18 @@ pub fn filmstrip_bar(s: &AppState, k: &Kit) -> El {
                         .build(k),
                 ),
         )
-        .child(filter_ctrl)
+        .child(
+            row()
+                .items_center()
+                .gap(space::MD)
+                .child(filter_ctrl)
+                .child(tag_picker),
+        )
         .child(
             row()
                 .items_center()
                 .gap(space::SM)
+                .child(auto_adv_btn)
                 .child(
                     Button::new("Open Folder…")
                         .variant(ButtonVariant::GhostMuted)
@@ -167,6 +246,8 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
     let rejected = entry.meta.flag == CullFlag::Reject;
     let picked = entry.meta.flag == CullFlag::Pick;
     let rating = entry.meta.rating;
+    let color_tag = entry.effective_color_tag();
+    let variant_count = entry.meta.variant_count();
 
     let name = entry
         .path
@@ -183,6 +264,33 @@ fn thumbnail_card(s: &AppState, k: &Kit, idx: usize) -> El {
 
     if let Some(px) = s.thumbnails.get(&entry.path) {
         preview = preview.pixels_fit(px, SurfaceFit::Fill);
+    }
+
+    if color_tag != ColorTag::None {
+        preview = preview.child(
+            el().pin(Some(space::XS), Some(space::XS), None, None)
+                .size(size::COLOR_TAG_DOT, size::COLOR_TAG_DOT)
+                .radius(radius::circle(size::COLOR_TAG_DOT))
+                .fill(color::color_tag_swatch(color_tag, k))
+                .border(border::REGULAR, k.c.bg_deep)
+                .a11y_hidden(),
+        );
+    }
+
+    if variant_count > 1 {
+        preview = preview.child(
+            row()
+                .pin(Some(space::XS), None, None, Some(space::XS))
+                .px(space::XS)
+                .py(space::MICRO)
+                .radius(k.radius.xs)
+                .fill(color::hud_surface_strong(k))
+                .child(
+                    text(format!("V{variant_count}"))
+                        .font(ty::mono_micro(k))
+                        .color(k.c.text_base),
+                ),
+        );
     }
 
     if picked {

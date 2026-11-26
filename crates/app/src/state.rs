@@ -1,23 +1,37 @@
 //! Application state, session catalog orchestration, undo/redo, Speed Edit,
 //! live cursor color readout, interactive crop, and macOS document-state sync.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use rune::{AppHandle, LiveRegion, Pixels, Tx};
+use rune::{AppHandle, LiveRegion, Pixels, TextEdit, Tx};
 use rune_editor_core::{
-    CompiledRecipe, CropAspect, CullFilter, CullFlag, DevelopRecipe, HistogramData, HistoryStack,
-    PhotoMeta, SessionCatalog, SessionEntry, StylePreset, ToneCurves, ViewportCamera,
-    auto_exposure_and_tone, auto_levels, auto_white_balance, builtin_presets,
-    compute_histogram_compiled, default_curve_points, filmic_tonemap, linear_to_srgb,
-    pick_white_balance, rgb_to_hsl_and_lab,
+    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, AdjustmentLayer, BrushDab, ChannelLevels,
+    ClarityMethod, ColorTag, CompiledRecipe, CropAspect, CullFilter, CullFlag, DevelopRecipe,
+    FilmCurve, FilmNegativeParams, GrainType, HealMode, HealSpot, HistogramData, HistoryStack,
+    LayerMaskItem, LevelsParams, LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK,
+    MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode,
+    SessionCatalog, SessionEntry, StylePreset, ToneCurves, UserStyle, ViewportCamera,
+    VignetteMethod, WbPreset, all_param_descriptors, apply_style_to_recipe, auto_exposure_and_tone,
+    auto_levels, auto_white_balance, builtin_presets, compute_histogram_compiled,
+    copy_recipe_groups, create_capture_one_session, default_curve_points, delete_user_style,
+    filmic_tonemap, find_scalar_param, linear_to_srgb, list_user_styles, modified_recipe_groups,
+    move_photo_with_sidecar, pick_white_balance, recipe_to_sparse_patch, rgb_to_hsl_and_lab,
+    save_user_style, stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
-    ExportFormat, ExportOptions, LinearImage, ThumbnailRgba8, export_image_with_options,
-    generate_demo_hdr_scene, generate_demo_thumbnail, load_file, load_from_memory, load_thumbnail,
-    scan_photo_folder,
+    ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher, LinearImage,
+    NamingContext, TextWatermark, ThumbnailRgba8, WatermarkPosition, builtin_export_recipes,
+    expand_naming_template, export_image_with_options, export_multi_recipe,
+    generate_demo_hdr_scene, generate_demo_thumbnail, generate_subject_mask, guard_not_source,
+    load_file, load_from_memory, load_thumbnail, scan_photo_folder,
 };
+use rune_editor_mcp::{ActiveCanvasSnapshot, LocalMcpServer, McpService, McpSettings};
+
+use crate::mcp_bridge::GuiMcpBridge;
 
 const SAMPLE_PORTRAIT_BYTES: &[u8] =
     include_bytes!("../../../assets/samples/editorial_portrait.jpg");
@@ -27,6 +41,82 @@ use crate::menu::build_menu_items;
 /// Effect slot mark ID for the central GPU photo viewport.
 pub const PHOTO_VIEWPORT_MARK: u32 = 1;
 
+/// Maximum full-resolution linear images retained in the background neighbor prefetch cache.
+pub const MAX_PREFETCH_CACHE_ENTRIES: usize = 2;
+
+/// Canonical `(min, max)` bounds for any top-level scalar parameter in `SCALAR_PARAMS`.
+pub fn scalar_bounds(id: &str) -> (f32, f32) {
+    let spec = find_scalar_param(id).unwrap_or_else(|| {
+        panic!("scalar parameter `{id}` must be registered in rune_editor_core::SCALAR_PARAMS")
+    });
+    (spec.min, spec.max)
+}
+
+/// Inclusive range `min..=max` sourced directly from `rune_editor_core::SCALAR_PARAMS`.
+pub fn scalar_range(id: &str) -> std::ops::RangeInclusive<f32> {
+    let (min, max) = scalar_bounds(id);
+    min..=max
+}
+
+/// Canonical default value sourced directly from `rune_editor_core::SCALAR_PARAMS`.
+pub fn scalar_default(id: &str) -> f32 {
+    find_scalar_param(id)
+        .unwrap_or_else(|| {
+            panic!("scalar parameter `{id}` must be registered in rune_editor_core::SCALAR_PARAMS")
+        })
+        .default
+}
+
+/// Cached `(min, max, default)` lookup map built once from `all_param_descriptors()` so
+/// structured sliders (Advanced Color, Skin Tone, Lens, Keystone) also source bounds from core.
+fn param_descriptor_table() -> &'static HashMap<String, (f32, f32, f32)> {
+    static TABLE: OnceLock<HashMap<String, (f32, f32, f32)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = HashMap::new();
+        for d in all_param_descriptors() {
+            if let (Some(min), Some(max)) = (d.min, d.max) {
+                let def = d
+                    .default
+                    .as_ref()
+                    .and_then(|v| v.as_f64())
+                    .map_or(0.0, |v| v as f32);
+                map.insert(d.id, (min, max, def));
+            }
+        }
+        map
+    })
+}
+
+/// Canonical `(min, max)` bounds for any structured dot-path parameter in `all_param_descriptors()`.
+pub fn descriptor_bounds(id: &str) -> (f32, f32) {
+    let &(min, max, _) = param_descriptor_table().get(id).unwrap_or_else(|| {
+        panic!("parameter `{id}` must be registered with min/max in core registry")
+    });
+    (min, max)
+}
+
+/// Inclusive range `min..=max` sourced directly from `rune_editor_core::all_param_descriptors()`.
+pub fn descriptor_range(id: &str) -> std::ops::RangeInclusive<f32> {
+    let (min, max) = descriptor_bounds(id);
+    min..=max
+}
+
+/// Canonical default value sourced directly from `rune_editor_core::all_param_descriptors()`.
+pub fn descriptor_default(id: &str) -> f32 {
+    param_descriptor_table()
+        .get(id)
+        .unwrap_or_else(|| {
+            panic!("parameter `{id}` must be registered with default in core registry")
+        })
+        .2
+}
+
+/// Canonical exposure slider bounds sourced directly from `rune_editor_core`'s parameter registry.
+#[cfg(test)]
+pub fn exposure_bounds() -> (f32, f32) {
+    scalar_bounds("exposure")
+}
+
 /// Right inspector tab selection (Capture One / Lightroom darkroom layout).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InspectorTab {
@@ -35,18 +125,20 @@ pub enum InspectorTab {
     Color,
     Detail,
     Crop,
+    Layers,
     Presets,
 }
 
 impl InspectorTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Light,
         Self::Color,
         Self::Detail,
         Self::Crop,
+        Self::Layers,
         Self::Presets,
     ];
-    pub const LABELS: [&'static str; 5] = ["Light", "Color", "Detail", "Crop", "Style"];
+    pub const LABELS: [&'static str; 6] = ["Light", "Color", "Detail", "Lens", "Layers", "Style"];
 
     pub fn index(self) -> usize {
         match self {
@@ -54,7 +146,8 @@ impl InspectorTab {
             Self::Color => 1,
             Self::Detail => 2,
             Self::Crop => 3,
-            Self::Presets => 4,
+            Self::Layers => 4,
+            Self::Presets => 5,
         }
     }
 
@@ -63,9 +156,10 @@ impl InspectorTab {
     }
 }
 
-/// Active channel inside the interactive Tone Curve Editor.
+/// Active channel inside the interactive Tone Curve Editor (Capture One 5-tab layout).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CurveChannel {
+    Rgb,
     #[default]
     Luma,
     Red,
@@ -74,10 +168,11 @@ pub enum CurveChannel {
 }
 
 impl CurveChannel {
-    pub const ALL: [Self; 4] = [Self::Luma, Self::Red, Self::Green, Self::Blue];
+    pub const ALL: [Self; 5] = [Self::Rgb, Self::Luma, Self::Red, Self::Green, Self::Blue];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Rgb => "RGB",
             Self::Luma => "Luma",
             Self::Red => "Red",
             Self::Green => "Green",
@@ -87,6 +182,7 @@ impl CurveChannel {
 
     pub fn short_label(self) -> &'static str {
         match self {
+            Self::Rgb => "RGB",
             Self::Luma => "Luma",
             Self::Red => "R",
             Self::Green => "G",
@@ -96,6 +192,7 @@ impl CurveChannel {
 
     pub fn points(self, curves: &ToneCurves) -> &[[f32; 2]] {
         match self {
+            Self::Rgb => &curves.rgb,
             Self::Luma => &curves.luma,
             Self::Red => &curves.red,
             Self::Green => &curves.green,
@@ -105,10 +202,148 @@ impl CurveChannel {
 
     pub fn points_mut(self, curves: &mut ToneCurves) -> &mut Vec<[f32; 2]> {
         match self {
+            Self::Rgb => &mut curves.rgb,
             Self::Luma => &mut curves.luma,
             Self::Red => &mut curves.red,
             Self::Green => &mut curves.green,
             Self::Blue => &mut curves.blue,
+        }
+    }
+
+    /// Returns the hovered pixel's normalized `[0.0, 1.0]` tonal value for this curve channel
+    /// to position Capture One's live vertical tonal indicator line.
+    pub fn probe_tone(self, readout: &CursorColorReadout) -> f32 {
+        let r = readout.rgb8[0] as f32 / 255.0;
+        let g = readout.rgb8[1] as f32 / 255.0;
+        let b = readout.rgb8[2] as f32 / 255.0;
+        let v = match self {
+            Self::Rgb | Self::Luma => 0.2126 * r + 0.7152 * g + 0.0722 * b,
+            Self::Red => r,
+            Self::Green => g,
+            Self::Blue => b,
+        };
+        v.clamp(0.0, 1.0)
+    }
+}
+
+/// Active channel inside the Capture One-style Levels tool (`RGB | R | G | B`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LevelsChannel {
+    #[default]
+    Rgb,
+    Red,
+    Green,
+    Blue,
+}
+
+impl LevelsChannel {
+    pub const ALL: [Self; 4] = [Self::Rgb, Self::Red, Self::Green, Self::Blue];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rgb => "RGB",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Rgb => "RGB",
+            Self::Red => "R",
+            Self::Green => "G",
+            Self::Blue => "B",
+        }
+    }
+
+    pub fn channel(self, lv: &LevelsParams) -> ChannelLevels {
+        match self {
+            Self::Rgb => lv.master_channel().sanitized(),
+            Self::Red => lv.red.sanitized(),
+            Self::Green => lv.green.sanitized(),
+            Self::Blue => lv.blue.sanitized(),
+        }
+    }
+
+    pub fn is_modified(self, lv: &LevelsParams) -> bool {
+        !self.channel(lv).is_identity()
+    }
+
+    pub fn set_in_black(self, lv: &mut LevelsParams, v: f32) {
+        match self {
+            Self::Rgb => lv.in_black = v.min(lv.in_white - 0.02).clamp(0.0, 0.95),
+            Self::Red => lv.red.in_black = v.min(lv.red.in_white - 0.02).clamp(0.0, 0.95),
+            Self::Green => lv.green.in_black = v.min(lv.green.in_white - 0.02).clamp(0.0, 0.95),
+            Self::Blue => lv.blue.in_black = v.min(lv.blue.in_white - 0.02).clamp(0.0, 0.95),
+        }
+    }
+
+    pub fn set_in_mid(self, lv: &mut LevelsParams, v: f32) {
+        let clamped = v.clamp(-1.0, 1.0);
+        match self {
+            Self::Rgb => lv.in_mid = clamped,
+            Self::Red => lv.red.in_mid = clamped,
+            Self::Green => lv.green.in_mid = clamped,
+            Self::Blue => lv.blue.in_mid = clamped,
+        }
+    }
+
+    pub fn set_in_white(self, lv: &mut LevelsParams, v: f32) {
+        match self {
+            Self::Rgb => lv.in_white = v.max(lv.in_black + 0.02).clamp(0.05, 1.0),
+            Self::Red => lv.red.in_white = v.max(lv.red.in_black + 0.02).clamp(0.05, 1.0),
+            Self::Green => lv.green.in_white = v.max(lv.green.in_black + 0.02).clamp(0.05, 1.0),
+            Self::Blue => lv.blue.in_white = v.max(lv.blue.in_black + 0.02).clamp(0.05, 1.0),
+        }
+    }
+
+    pub fn set_out_black(self, lv: &mut LevelsParams, v: f32) {
+        let clamped = v.clamp(0.0, 1.0);
+        match self {
+            Self::Rgb => lv.out_black = clamped,
+            Self::Red => lv.red.out_black = clamped,
+            Self::Green => lv.green.out_black = clamped,
+            Self::Blue => lv.blue.out_black = clamped,
+        }
+    }
+
+    pub fn set_out_white(self, lv: &mut LevelsParams, v: f32) {
+        let clamped = v.clamp(0.0, 1.0);
+        match self {
+            Self::Rgb => lv.out_white = clamped,
+            Self::Red => lv.red.out_white = clamped,
+            Self::Green => lv.green.out_white = clamped,
+            Self::Blue => lv.blue.out_white = clamped,
+        }
+    }
+}
+
+/// Active view mode inside the Capture One-style Color Balance card (`3-Way | Master`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorBalanceView {
+    #[default]
+    ThreeWay,
+    Master,
+}
+
+/// Active mode inside the Capture One-style 3-tab Color Editor (`Basic | Advanced | Skin Tone`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorEditorMode {
+    #[default]
+    Basic,
+    Advanced,
+    SkinTone,
+}
+
+impl ColorEditorMode {
+    pub const ALL: [Self; 3] = [Self::Basic, Self::Advanced, Self::SkinTone];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic",
+            Self::Advanced => "Advanced",
+            Self::SkinTone => "Skin Tone",
         }
     }
 }
@@ -187,7 +422,7 @@ impl SpeedEditParam {
             Self::Shadows => format!("{:+.0}", r.shadows * 100.0),
             Self::Whites => format!("{:+.0}", r.whites * 100.0),
             Self::Clarity => format!("{:+.0}", r.clarity * 100.0),
-            Self::Temperature => format!("{:+.0}", r.temperature * 100.0),
+            Self::Temperature => format!("{} K", temperature_to_kelvin(r.temperature)),
             Self::Tint => format!("{:+.0}", r.tint * 100.0),
         }
     }
@@ -198,21 +433,38 @@ impl SpeedEditParam {
         if !delta.is_finite() || delta.abs() < 1e-6 {
             return false;
         }
-        let (slot, min, max, scale) = match self {
-            Self::Exposure => (&mut r.exposure, -4.0, 4.0, 3.0),
-            Self::Contrast => (&mut r.contrast, -1.0, 1.0, 1.0),
-            Self::Brightness => (&mut r.brightness, -1.0, 1.0, 1.0),
-            Self::Saturation => (&mut r.saturation, -1.0, 1.0, 1.0),
-            Self::Highlights => (&mut r.highlights, -1.0, 1.0, 1.0),
-            Self::Shadows => (&mut r.shadows, -1.0, 1.0, 1.0),
-            Self::Whites => (&mut r.whites, -1.0, 1.0, 1.0),
-            Self::Clarity => (&mut r.clarity, -1.0, 1.0, 1.0),
-            Self::Temperature => (&mut r.temperature, -1.0, 1.0, 1.0),
-            Self::Tint => (&mut r.tint, -1.0, 1.0, 1.0),
+        let (param_id, scale) = match self {
+            Self::Exposure => ("exposure", 3.0),
+            Self::Contrast => ("contrast", 1.0),
+            Self::Brightness => ("brightness", 1.0),
+            Self::Saturation => ("saturation", 1.0),
+            Self::Highlights => ("highlights", 1.0),
+            Self::Shadows => ("shadows", 1.0),
+            Self::Whites => ("whites", 1.0),
+            Self::Clarity => ("clarity", 1.0),
+            Self::Temperature => ("temperature", 1.0),
+            Self::Tint => ("tint", 1.0),
+        };
+        let (min, max) = scalar_bounds(param_id);
+        let slot = match self {
+            Self::Exposure => &mut r.exposure,
+            Self::Contrast => &mut r.contrast,
+            Self::Brightness => &mut r.brightness,
+            Self::Saturation => &mut r.saturation,
+            Self::Highlights => &mut r.highlights,
+            Self::Shadows => &mut r.shadows,
+            Self::Whites => &mut r.whites,
+            Self::Clarity => &mut r.clarity,
+            Self::Temperature => &mut r.temperature,
+            Self::Tint => &mut r.tint,
         };
         let prev = *slot;
         *slot = (prev + delta * scale).clamp(min, max);
-        (*slot - prev).abs() > 1e-6
+        let changed = (*slot - prev).abs() > 1e-6;
+        if changed && matches!(self, Self::Temperature | Self::Tint) {
+            r.wb_preset = WbPreset::Custom;
+        }
+        changed
     }
 }
 
@@ -222,6 +474,24 @@ pub struct CursorColorReadout {
     pub rgb8: [u8; 3],
     pub hsl: [f32; 3],
     pub lab: [f32; 3],
+}
+
+/// Maximum pinned live Color Readout markers on the photo viewport (`#1..#4`).
+pub const MAX_PINNED_READOUTS: usize = 4;
+
+/// A numbered Color Readout marker pinned to a source UV on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PinnedReadout {
+    pub source_uv: [f32; 2],
+    pub slot_uv: [f32; 2],
+}
+
+/// Pinned orange-bordered Capture One Compare Variant reference frame (`⌘⏎`).
+#[derive(Clone)]
+pub struct CompareReference {
+    pub label: String,
+    pub variant_tag: String,
+    pub pixels: Pixels,
 }
 
 /// Active handle when dragging the crop frame on the photo canvas.
@@ -236,6 +506,602 @@ pub enum CropDragHandle {
     Top,
     Bottom,
     Move,
+}
+
+/// Active interactive canvas tool for Phase 4 Layers, Masks & Spot Retouching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CanvasTool {
+    #[default]
+    Hand,
+    Brush,
+    Eraser,
+    LinearGradient,
+    RadialGradient,
+    Heal,
+    Clone,
+}
+
+impl CanvasTool {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hand => "Hand",
+            Self::Brush => "Brush",
+            Self::Eraser => "Eraser",
+            Self::LinearGradient => "Linear Mask",
+            Self::RadialGradient => "Radial Mask",
+            Self::Heal => "Heal",
+            Self::Clone => "Clone",
+        }
+    }
+
+    pub const fn hud_badge(self) -> &'static str {
+        match self {
+            Self::Hand => "HAND",
+            Self::Brush => "BRUSH (B)",
+            Self::Eraser => "ERASER (E)",
+            Self::LinearGradient => "LINEAR MASK (L)",
+            Self::RadialGradient => "RADIAL MASK (T)",
+            Self::Heal => "HEAL (Q)",
+            Self::Clone => "CLONE (S)",
+        }
+    }
+
+    pub const fn is_retouch_or_mask(self) -> bool {
+        !matches!(self, Self::Hand)
+    }
+}
+
+/// Transient drag tracking for interactive canvas Brush/Eraser/Gradient/Heal operations.
+#[derive(Clone, Copy, Debug)]
+pub enum LayerDragState {
+    Brush {
+        layer_idx: usize,
+        mask_idx: usize,
+        erase: bool,
+    },
+    Linear {
+        layer_idx: usize,
+        mask_idx: usize,
+        start_uv: [f32; 2],
+    },
+    Radial {
+        layer_idx: usize,
+        mask_idx: usize,
+        center_uv: [f32; 2],
+    },
+    Heal {
+        spot_idx: usize,
+    },
+}
+
+/// Active navigation section inside the dedicated Settings view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsSection {
+    #[default]
+    AgentMcp,
+    CliAndSkill,
+    Shortcuts,
+    Security,
+}
+
+/// Capture One-style configurable neutral viewport Proof Margin (`Compact | Studio | Exhibition`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProofMargin {
+    #[default]
+    Compact,
+    Studio,
+    Exhibition,
+}
+
+impl ProofMargin {
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Studio, Self::Exhibition];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Studio => "Studio",
+            Self::Exhibition => "Exhibition",
+        }
+    }
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Studio => "studio",
+            Self::Exhibition => "exhibition",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "studio" => Some(Self::Studio),
+            "exhibition" => Some(Self::Exhibition),
+            _ => None,
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Studio,
+            Self::Studio => Self::Exhibition,
+            Self::Exhibition => Self::Compact,
+        }
+    }
+
+    /// Extra outer mat padding in points (adds to shader's ~14pt internal pad).
+    pub const fn extra_padding_pts(self) -> f32 {
+        match self {
+            Self::Compact => 0.0,
+            Self::Studio => crate::tokens::size::PROOF_MARGIN_STUDIO,
+            Self::Exhibition => crate::tokens::size::PROOF_MARGIN_EXHIBITION,
+        }
+    }
+
+    pub const fn effective_pt_label(self) -> &'static str {
+        match self {
+            Self::Compact => "16 pt",
+            Self::Studio => "48 pt",
+            Self::Exhibition => "84 pt",
+        }
+    }
+}
+
+/// Grouping category inside Settings → Keyboard Shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutCategory {
+    ToolsAndMasks,
+    ViewAndOverlays,
+    CullingAndNav,
+    Workflow,
+}
+
+impl ShortcutCategory {
+    pub const ALL: [Self; 4] = [
+        Self::ToolsAndMasks,
+        Self::ViewAndOverlays,
+        Self::CullingAndNav,
+        Self::Workflow,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ToolsAndMasks => "TOOLS & MASKS",
+            Self::ViewAndOverlays => "VIEW & OVERLAYS",
+            Self::CullingAndNav => "CULLING & NAVIGATION",
+            Self::Workflow => "WORKFLOW & SESSIONS",
+        }
+    }
+}
+
+/// Customizable single-key actions persisted in `~/.config/rune-darkroom/settings.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShortcutAction {
+    Brush,
+    Eraser,
+    LinearMask,
+    RadialMask,
+    Heal,
+    Clone,
+    Crop,
+    RedMaskOverlay,
+    Loupe,
+    CompareSplit,
+    GridBrowser,
+    PickFlag,
+    RejectFlag,
+    Filmstrip,
+    Inspector,
+}
+
+impl ShortcutAction {
+    pub const ALL: [Self; 15] = [
+        Self::Brush,
+        Self::Eraser,
+        Self::LinearMask,
+        Self::RadialMask,
+        Self::Heal,
+        Self::Clone,
+        Self::Crop,
+        Self::RedMaskOverlay,
+        Self::Loupe,
+        Self::CompareSplit,
+        Self::GridBrowser,
+        Self::PickFlag,
+        Self::RejectFlag,
+        Self::Filmstrip,
+        Self::Inspector,
+    ];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Brush => "brush",
+            Self::Eraser => "eraser",
+            Self::LinearMask => "linear_mask",
+            Self::RadialMask => "radial_mask",
+            Self::Heal => "heal",
+            Self::Clone => "clone",
+            Self::Crop => "crop",
+            Self::RedMaskOverlay => "red_mask_overlay",
+            Self::Loupe => "loupe",
+            Self::CompareSplit => "compare_split",
+            Self::GridBrowser => "grid_browser",
+            Self::PickFlag => "pick_flag",
+            Self::RejectFlag => "reject_flag",
+            Self::Filmstrip => "filmstrip",
+            Self::Inspector => "inspector",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.id() == id)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Brush => "Mask Brush",
+            Self::Eraser => "Mask Eraser (Layers)",
+            Self::LinearMask => "Linear Gradient Mask",
+            Self::RadialMask => "Radial Gradient Mask (Layers)",
+            Self::Heal => "Spot Heal (Layers)",
+            Self::Clone => "Clone Stamp (Layers)",
+            Self::Crop => "Crop & Geometry",
+            Self::RedMaskOverlay => "Red Mask Overlay",
+            Self::Loupe => "GPU Loupe Magnifier",
+            Self::CompareSplit => "Before / After Split",
+            Self::GridBrowser => "Grid Browser",
+            Self::PickFlag => "Flag as Pick",
+            Self::RejectFlag => "Flag as Reject",
+            Self::Filmstrip => "Toggle Filmstrip",
+            Self::Inspector => "Toggle Inspector",
+        }
+    }
+
+    pub const fn category(self) -> ShortcutCategory {
+        match self {
+            Self::Brush
+            | Self::Eraser
+            | Self::LinearMask
+            | Self::RadialMask
+            | Self::Heal
+            | Self::Clone
+            | Self::Crop => ShortcutCategory::ToolsAndMasks,
+            Self::RedMaskOverlay | Self::Loupe | Self::CompareSplit | Self::GridBrowser => {
+                ShortcutCategory::ViewAndOverlays
+            }
+            Self::PickFlag | Self::RejectFlag | Self::Filmstrip | Self::Inspector => {
+                ShortcutCategory::CullingAndNav
+            }
+        }
+    }
+
+    pub const fn default_key(self) -> &'static str {
+        match self {
+            Self::Brush => "b",
+            Self::Eraser => "e",
+            Self::LinearMask => "l",
+            Self::RadialMask => "t",
+            Self::Heal => "q",
+            Self::Clone => "s",
+            Self::Crop => "c",
+            Self::RedMaskOverlay => "m",
+            Self::Loupe => "o",
+            Self::CompareSplit => "\\",
+            Self::GridBrowser => "g",
+            Self::PickFlag => "p",
+            Self::RejectFlag => "x",
+            Self::Filmstrip => "f",
+            Self::Inspector => "i",
+        }
+    }
+}
+
+/// User-customizable shortcut binding table with safe validation & defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShortcutBindings {
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl ShortcutBindings {
+    pub fn key_for(&self, action: ShortcutAction) -> &str {
+        self.overrides
+            .get(action.id())
+            .map(String::as_str)
+            .unwrap_or_else(|| action.default_key())
+    }
+
+    pub fn display_key(&self, action: ShortcutAction) -> String {
+        let k = self.key_for(action);
+        if k == "\\" {
+            "\\".to_owned()
+        } else {
+            k.to_ascii_uppercase()
+        }
+    }
+
+    pub fn matches(&self, action: ShortcutAction, ch: &str) -> bool {
+        self.key_for(action).eq_ignore_ascii_case(ch)
+    }
+
+    pub fn is_customized(&self, action: ShortcutAction) -> bool {
+        self.overrides
+            .get(action.id())
+            .is_some_and(|v| !v.eq_ignore_ascii_case(action.default_key()))
+    }
+
+    pub fn is_any_customized(&self) -> bool {
+        ShortcutAction::ALL
+            .into_iter()
+            .any(|a| self.is_customized(a))
+    }
+
+    pub fn set_key(&mut self, action: ShortcutAction, raw_key: &str) -> Result<(), String> {
+        let norm = raw_key.trim().to_ascii_lowercase();
+        if norm.chars().count() != 1 {
+            return Err("Shortcut must be a single character key".to_owned());
+        }
+        let c = norm.chars().next().unwrap();
+        if matches!(c, '0'..='5') {
+            return Err("Digits 0–5 are reserved for star ratings".to_owned());
+        }
+        if !(c.is_ascii_alphanumeric() || matches!(c, '\\' | '[' | ']' | '/' | '.' | ',' | ';')) {
+            return Err(format!("Unsupported shortcut key '{c}'"));
+        }
+        if norm == action.default_key() {
+            self.overrides.remove(action.id());
+        } else {
+            self.overrides.insert(action.id().to_owned(), norm);
+        }
+        Ok(())
+    }
+
+    pub fn reset_defaults(&mut self) {
+        self.overrides.clear();
+    }
+}
+
+/// Unified persisted settings written to `~/.config/rune-darkroom/settings.json`
+/// (100% backward-compatible with `McpSettings` JSON schema).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedAppSettings {
+    pub mcp: McpSettings,
+    pub proof_margin: ProofMargin,
+    pub hot_folder_style: Option<String>,
+    pub shortcuts: ShortcutBindings,
+}
+
+impl Default for PersistedAppSettings {
+    fn default() -> Self {
+        Self {
+            mcp: McpSettings::default(),
+            proof_margin: ProofMargin::Compact,
+            hot_folder_style: None,
+            shortcuts: ShortcutBindings::default(),
+        }
+    }
+}
+
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_json_str(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(esc) = chars.next() {
+                match esc {
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    other => out.push(other),
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = json.find(&needle)?;
+    let rest = &json[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    let val = rest[colon + 1..].trim_start();
+    if !val.starts_with('"') {
+        return None;
+    }
+    let inner = &val[1..];
+    let mut escaped = false;
+    for (i, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(unescape_json_str(&inner[..i]));
+        }
+    }
+    None
+}
+
+fn extract_json_object_strings(json: &str, key: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let needle = format!("\"{key}\"");
+    let Some(pos) = json.find(&needle) else {
+        return map;
+    };
+    let rest = &json[pos + needle.len()..];
+    let Some(open) = rest.find('{') else {
+        return map;
+    };
+    let body = &rest[open + 1..];
+    let Some(close) = body.find('}') else {
+        return map;
+    };
+    let obj = &body[..close];
+    let mut idx = 0;
+    let bytes = obj.as_bytes();
+    while idx < bytes.len() {
+        let Some(k_start) = obj[idx..].find('"') else {
+            break;
+        };
+        let k_abs = idx + k_start + 1;
+        let Some(k_end) = obj[k_abs..].find('"') else {
+            break;
+        };
+        let k_str = unescape_json_str(&obj[k_abs..k_abs + k_end]);
+        idx = k_abs + k_end + 1;
+        let Some(colon) = obj[idx..].find(':') else {
+            break;
+        };
+        idx += colon + 1;
+        let val_slice = obj[idx..].trim_start();
+        if !val_slice.starts_with('"') {
+            break;
+        }
+        let v_rel_start = obj.len() - val_slice.len() + 1;
+        let v_inner = &obj[v_rel_start..];
+        let mut escaped = false;
+        let mut v_end = None;
+        for (i, ch) in v_inner.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                v_end = Some(i);
+                break;
+            }
+        }
+        let Some(ve) = v_end else {
+            break;
+        };
+        let v_str = unescape_json_str(&v_inner[..ve]);
+        map.insert(k_str, v_str);
+        idx = v_rel_start + ve + 1;
+    }
+    map
+}
+
+impl PersistedAppSettings {
+    pub fn to_json_pretty(&self) -> String {
+        let mut out = String::from("{\n");
+        out.push_str(&format!("  \"enabled\": {},\n", self.mcp.enabled));
+        out.push_str(&format!("  \"port\": {},\n", self.mcp.port));
+        out.push_str(&format!(
+            "  \"allow_live_canvas_edits\": {},\n",
+            self.mcp.allow_live_canvas_edits
+        ));
+        out.push_str(&format!(
+            "  \"proof_margin\": \"{}\",\n",
+            self.proof_margin.slug()
+        ));
+        if let Some(style) = self.hot_folder_style.as_deref() {
+            out.push_str(&format!(
+                "  \"hot_folder_style\": \"{}\",\n",
+                escape_json_str(style)
+            ));
+        } else {
+            out.push_str("  \"hot_folder_style\": null,\n");
+        }
+        out.push_str("  \"shortcuts\": {");
+        if !self.shortcuts.overrides.is_empty() {
+            out.push('\n');
+            let len = self.shortcuts.overrides.len();
+            for (i, (k, v)) in self.shortcuts.overrides.iter().enumerate() {
+                let comma = if i + 1 < len { "," } else { "" };
+                out.push_str(&format!(
+                    "    \"{}\": \"{}\"{comma}\n",
+                    escape_json_str(k),
+                    escape_json_str(v)
+                ));
+            }
+            out.push_str("  }\n");
+        } else {
+            out.push_str("}\n");
+        }
+        out.push_str("}\n");
+        out
+    }
+
+    pub fn from_json_str(text: &str, mcp: McpSettings) -> Self {
+        let proof_margin = extract_json_string_field(text, "proof_margin")
+            .and_then(|s| ProofMargin::from_slug(&s))
+            .unwrap_or_default();
+        let hot_folder_style = extract_json_string_field(text, "hot_folder_style");
+        let mut shortcuts = ShortcutBindings::default();
+        for (k, v) in extract_json_object_strings(text, "shortcuts") {
+            if let Some(action) = ShortcutAction::from_id(&k) {
+                let _ = shortcuts.set_key(action, &v);
+            }
+        }
+        Self {
+            mcp,
+            proof_margin,
+            hot_folder_style,
+            shortcuts,
+        }
+    }
+
+    pub fn load() -> Self {
+        let mcp = McpSettings::load();
+        let Some(path) = McpSettings::config_path() else {
+            return Self {
+                mcp,
+                ..Self::default()
+            };
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self {
+                mcp,
+                ..Self::default()
+            };
+        };
+        Self::from_json_str(&text, mcp)
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let json = self.to_json_pretty();
+        rune_editor_core::session::atomic_write_bytes(path, json.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save(&self) -> Result<PathBuf, String> {
+        let path = McpSettings::config_path()
+            .ok_or_else(|| "Could not determine HOME directory for settings".to_owned())?;
+        self.save_to_path(&path)?;
+        Ok(path)
+    }
+}
+
+/// Selected connection guide tab inside Settings → Agent & Local MCP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpClientGuide {
+    #[default]
+    StreamableHttp,
+    StdioCli,
+    SkillMd,
 }
 
 pub struct AppState {
@@ -255,18 +1121,55 @@ pub struct AppState {
     // Inspector & workspace layout state
     pub active_tab: InspectorTab,
     pub curve_channel: CurveChannel,
+    pub levels_channel: LevelsChannel,
+    pub color_balance_view: ColorBalanceView,
+    pub color_editor_mode: ColorEditorMode,
+    pub selected_color_slice: usize,
     pub dragging_curve_pt: Option<usize>,
     pub selected_hsl_band: usize,
     pub show_inspector: bool,
     pub show_filmstrip: bool,
+    pub base_open: bool,
     pub wb_open: bool,
     pub tone_open: bool,
     pub levels_open: bool,
     pub curve_open: bool,
+    pub color_balance_open: bool,
+    pub presence_open: bool,
     pub bw_open: bool,
+    pub hsl_open: bool,
+    pub clarity_open: bool,
+    pub sharpen_open: bool,
+    pub nr_open: bool,
+    pub grain_open: bool,
+    pub vignette_open: bool,
+    pub crop_open: bool,
+    pub rotate_open: bool,
+    pub keystone_open: bool,
+    pub lens_open: bool,
+    pub grid_open: bool,
+    pub layers_open: bool,
+    pub masks_open: bool,
+    pub local_adj_open: bool,
+    pub heal_open: bool,
 
     // Interactive Capture One tools & live probe state
+    pub active_tool: CanvasTool,
+    pub active_layer_index: Option<usize>,
+    pub brush_radius: f32,
+    pub brush_hardness: f32,
+    pub brush_opacity: f32,
+    pub heal_radius: f32,
+    pub heal_feather: f32,
+    pub heal_opacity: f32,
+    pub layer_drag: Option<LayerDragState>,
     pub wb_eyedropper_active: bool,
+    pub film_base_picker_active: bool,
+    pub film_neg_open: bool,
+    pub color_slice_picker_active: bool,
+    pub skin_picker_active: bool,
+    pub readout_picker_active: bool,
+    pub pinned_readouts: Vec<PinnedReadout>,
     pub speed_edit: Option<SpeedEditParam>,
     pub speed_edit_snapshot: Option<DevelopRecipe>,
     pub viewport_rect_pts: [f32; 2],
@@ -274,21 +1177,67 @@ pub struct AppState {
     pub cursor_readout: Option<CursorColorReadout>,
     pub crop_drag: Option<(CropDragHandle, [f32; 2], [f32; 4])>,
 
+    // Phase 3 Pro Workflow: Grid Browser, Auto-Advance, Compare Variant, Styles & Clipboard, Multi-Recipe Export
+    pub auto_advance: bool,
+    pub show_grid_browser: bool,
+    pub browser_search_edit: TextEdit,
+    pub compare_reference: Option<CompareReference>,
+    pub clipboard_groups: HashSet<String>,
+    pub clipboard_open: bool,
+    pub variants_open: bool,
+    pub styles_open: bool,
+    pub user_styles: Vec<UserStyle>,
+    pub user_styles_open: bool,
+    pub style_name_edit: TextEdit,
+    pub stack_styles: bool,
+    pub style_strength: f32,
+    pub show_export: bool,
+    pub export_recipes: Vec<ExportRecipeSpec>,
+    pub export_naming_edit: TextEdit,
+    pub export_watermark_enabled: bool,
+    pub export_watermark_edit: TextEdit,
+    pub export_watermark_opacity: f32,
+    pub export_watermark_position: WatermarkPosition,
+    pub export_strip_metadata: bool,
+    pub export_color_space: ExportColorSpace,
+    pub export_output_dir: Option<PathBuf>,
+
+    // Phase 5: Proof Margin, Hot Folder Auto-Ingest & Custom Keyboard Shortcuts
+    pub proof_margin: ProofMargin,
+    pub hot_folder_watcher: Option<HotFolderWatcher>,
+    pub hot_folder_dir: Option<PathBuf>,
+    pub hot_folder_style: Option<String>,
+    pub hot_folder_ingested_count: usize,
+    pub shortcuts: ShortcutBindings,
+    pub recording_shortcut: Option<ShortcutAction>,
+
     // Folder / session catalog & filmstrip culling state
     pub catalog: SessionCatalog,
     pub demo_mode: bool,
     pub thumbnails: HashMap<PathBuf, Pixels>,
     pub prefetch_cache: Arc<Mutex<HashMap<PathBuf, Arc<LinearImage>>>>,
+    pub prefetch_in_flight: Arc<Mutex<HashSet<PathBuf>>>,
 
     // Pointer / drag & drop interaction state
     pub drag_undo_snapshot: Option<DevelopRecipe>,
     pub last_drag_pos: Option<(f32, f32)>,
     pub drop_hover: bool,
 
-    // Status, modal sheets & native menu handle
+    // Status, modal sheets, Settings view, Local MCP server & native menu handle
     pub status_message: Option<String>,
     pub show_about: bool,
     pub confirm_close: bool,
+    pub show_settings: bool,
+    pub settings_section: SettingsSection,
+    pub mcp_client_guide: McpClientGuide,
+    pub mcp_settings: McpSettings,
+    pub mcp_server: Option<LocalMcpServer>,
+    pub mcp_shared_canvas: Arc<Mutex<ActiveCanvasSnapshot>>,
+    pub mcp_allow_live: Arc<AtomicBool>,
+    pub mcp_error: Option<String>,
+    pub mcp_request_count: u64,
+    pub mcp_last_activity: Option<String>,
+    pub mcp_copied_tag: Option<String>,
     pub app_handle: Option<AppHandle<AppState>>,
 }
 
@@ -308,6 +1257,23 @@ impl Default for AppState {
         let histogram = compute_histogram_compiled(&image.histogram_proxy, &compiled_recipe);
 
         let (catalog, thumbnails) = build_demo_session(&image, &presets);
+        let persisted = PersistedAppSettings::load();
+        let mcp_settings = persisted.mcp;
+        let initial_snap = ActiveCanvasSnapshot {
+            display_name: image.display_name.clone(),
+            source_path: image.source_path.clone(),
+            image: image.clone(),
+            recipe: recipe.clone(),
+            rating: catalog.active_meta().map_or(0, |m| m.rating),
+            flag: catalog.active_meta().map_or(CullFlag::None, |m| m.flag),
+            color_tag: catalog
+                .active_entry()
+                .map_or(ColorTag::None, |e| e.effective_color_tag()),
+            demo_mode: true,
+            folder: catalog.folder.clone(),
+            catalog_len: catalog.len(),
+        };
+        let mcp_allow_live = Arc::new(AtomicBool::new(mcp_settings.allow_live_canvas_edits));
 
         Self {
             image,
@@ -321,32 +1287,115 @@ impl Default for AppState {
             presets,
             active_tab: InspectorTab::Light,
             curve_channel: CurveChannel::Luma,
+            levels_channel: LevelsChannel::Rgb,
+            color_balance_view: ColorBalanceView::ThreeWay,
+            color_editor_mode: ColorEditorMode::Basic,
+            selected_color_slice: 0,
             dragging_curve_pt: None,
             selected_hsl_band: 0,
             show_inspector: true,
             show_filmstrip: false,
+            base_open: true,
             wb_open: true,
             tone_open: true,
             levels_open: false,
             curve_open: false,
+            color_balance_open: true,
+            presence_open: true,
             bw_open: false,
+            hsl_open: true,
+            clarity_open: true,
+            sharpen_open: true,
+            nr_open: true,
+            grain_open: true,
+            vignette_open: true,
+            crop_open: true,
+            rotate_open: true,
+            keystone_open: true,
+            lens_open: true,
+            grid_open: true,
+            layers_open: true,
+            masks_open: true,
+            local_adj_open: true,
+            heal_open: true,
+            active_tool: CanvasTool::Hand,
+            active_layer_index: None,
+            brush_radius: 0.06,
+            brush_hardness: 0.45,
+            brush_opacity: 0.85,
+            heal_radius: 0.032,
+            heal_feather: 0.42,
+            heal_opacity: 1.0,
+            layer_drag: None,
             wb_eyedropper_active: false,
+            film_base_picker_active: false,
+            film_neg_open: true,
+            color_slice_picker_active: false,
+            skin_picker_active: false,
+            readout_picker_active: false,
+            pinned_readouts: Vec::new(),
             speed_edit: None,
             speed_edit_snapshot: None,
             viewport_rect_pts: [0.0, 0.0],
             viewport_scale: 1.0,
             cursor_readout: None,
             crop_drag: None,
+            auto_advance: false,
+            show_grid_browser: false,
+            browser_search_edit: TextEdit::new(""),
+            compare_reference: None,
+            clipboard_groups: ALL_CLIPBOARD_GROUPS
+                .iter()
+                .filter(|(id, _)| *id != "geometry")
+                .map(|(id, _)| (*id).to_owned())
+                .collect(),
+            clipboard_open: true,
+            variants_open: true,
+            styles_open: true,
+            user_styles: list_user_styles().unwrap_or_default(),
+            user_styles_open: true,
+            style_name_edit: TextEdit::new(""),
+            stack_styles: false,
+            style_strength: 1.0,
+            show_export: false,
+            export_recipes: builtin_export_recipes(),
+            export_naming_edit: TextEdit::new("{ImageName}_{Recipe}"),
+            export_watermark_enabled: false,
+            export_watermark_edit: TextEdit::new("© Rune Darkroom"),
+            export_watermark_opacity: 0.45,
+            export_watermark_position: WatermarkPosition::BottomRight,
+            export_strip_metadata: false,
+            export_color_space: ExportColorSpace::Srgb,
+            export_output_dir: None,
+            proof_margin: persisted.proof_margin,
+            hot_folder_watcher: None,
+            hot_folder_dir: None,
+            hot_folder_style: persisted.hot_folder_style,
+            hot_folder_ingested_count: 0,
+            shortcuts: persisted.shortcuts,
+            recording_shortcut: None,
             catalog,
             demo_mode: true,
             thumbnails,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             drag_undo_snapshot: None,
             last_drag_pos: None,
             drop_hover: false,
             status_message: Some("Ready — drop a RAW/photo or press ⌘O to open".to_owned()),
             show_about: false,
             confirm_close: false,
+            show_settings: false,
+            settings_section: SettingsSection::AgentMcp,
+            mcp_client_guide: McpClientGuide::StreamableHttp,
+            mcp_settings,
+            mcp_server: None,
+            mcp_shared_canvas: Arc::new(Mutex::new(initial_snap)),
+            mcp_allow_live,
+            mcp_error: None,
+            mcp_request_count: 0,
+            mcp_last_activity: None,
+            mcp_copied_tag: None,
             app_handle: None,
         }
     }
@@ -357,10 +1406,219 @@ impl AppState {
         self.recipe != self.saved_recipe
     }
 
+    pub fn any_text_input_focused(&self) -> bool {
+        self.browser_search_edit.focused
+            || self.style_name_edit.focused
+            || self.export_naming_edit.focused
+            || self.export_watermark_edit.focused
+    }
+
+    pub fn set_show_export_tx(&mut self, show: bool, tx: &mut Tx) {
+        self.show_export = show;
+        if show {
+            self.show_settings = false;
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_grid_browser_tx(&mut self, tx: &mut Tx) {
+        self.show_grid_browser = !self.show_grid_browser;
+        if self.show_grid_browser {
+            self.camera.crop_mode = false;
+            self.camera.loupe_enabled = false;
+            self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.readout_picker_active = false;
+            self.status_message =
+                Some("Grid Browser — click to select, press G for Viewer".to_owned());
+        } else {
+            self.status_message = Some("Single-Frame Viewer".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn is_mcp_running(&self) -> bool {
+        self.mcp_server.is_some()
+    }
+
+    /// Keeps the lock-protected MCP snapshot in sync with the active canvas without blocking UI.
+    pub fn sync_mcp_canvas_snapshot(&self) {
+        if let Ok(mut snap) = self.mcp_shared_canvas.lock() {
+            snap.display_name = self.image.display_name.clone();
+            snap.source_path = self.image.source_path.clone();
+            snap.image = self.image.clone();
+            snap.recipe = self.recipe.clone();
+            snap.rating = self.catalog.active_meta().map_or(0, |m| m.rating);
+            snap.flag = self
+                .catalog
+                .active_meta()
+                .map_or(CullFlag::None, |m| m.flag);
+            snap.color_tag = self
+                .catalog
+                .active_entry()
+                .map_or(ColorTag::None, |e| e.effective_color_tag());
+            snap.demo_mode = self.demo_mode;
+            snap.folder = self.catalog.folder.clone();
+            snap.catalog_len = self.catalog.len();
+        }
+    }
+
+    /// Starts the embedded Streamable HTTP MCP server if persisted settings have `enabled: true`.
+    pub fn init_mcp_if_enabled(&mut self) {
+        if self.mcp_settings.enabled && self.mcp_server.is_none() {
+            self.start_mcp_server();
+        }
+    }
+
+    fn start_mcp_server(&mut self) {
+        let Some(handle) = self.app_handle.clone() else {
+            self.mcp_error = Some("AppHandle unavailable in headless mode".to_owned());
+            return;
+        };
+        self.sync_mcp_canvas_snapshot();
+        self.mcp_allow_live
+            .store(self.mcp_settings.allow_live_canvas_edits, Ordering::SeqCst);
+        let bridge = Arc::new(GuiMcpBridge {
+            handle,
+            shared_canvas: self.mcp_shared_canvas.clone(),
+            allow_live_edits: self.mcp_allow_live.clone(),
+        });
+        let service = Arc::new(McpService::new(bridge));
+        match LocalMcpServer::start(self.mcp_settings.port, service) {
+            Ok(server) => {
+                self.mcp_error = None;
+                let url = server.endpoint_url();
+                self.mcp_server = Some(server);
+                self.status_message = Some(format!("Local MCP running at {url}"));
+            }
+            Err(err) => {
+                self.mcp_server = None;
+                self.mcp_error = Some(err.clone());
+                self.status_message = Some(format!("MCP failed to start: {err}"));
+            }
+        }
+    }
+
+    fn stop_mcp_server(&mut self) {
+        if let Some(mut srv) = self.mcp_server.take() {
+            srv.stop();
+        }
+        self.mcp_error = None;
+        self.status_message = Some("Local MCP server stopped".to_owned());
+    }
+
+    pub fn set_show_settings_tx(&mut self, show: bool, tx: &mut Tx) {
+        self.show_settings = show;
+        if show {
+            self.show_export = false;
+        }
+        self.mcp_copied_tag = None;
+        self.sync_window_state(tx);
+    }
+
+    pub fn save_app_settings(&self) {
+        let persisted = PersistedAppSettings {
+            mcp: self.mcp_settings.clone(),
+            proof_margin: self.proof_margin,
+            hot_folder_style: self.hot_folder_style.clone(),
+            shortcuts: self.shortcuts.clone(),
+        };
+        let _ = persisted.save();
+    }
+
+    pub fn toggle_mcp_server_tx(&mut self, tx: &mut Tx) {
+        if self.mcp_server.is_some() {
+            self.stop_mcp_server();
+            self.mcp_settings.enabled = false;
+        } else {
+            self.mcp_settings.enabled = true;
+            self.start_mcp_server();
+            if self.mcp_server.is_none() {
+                self.mcp_settings.enabled = false;
+            }
+        }
+        self.save_app_settings();
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_mcp_live_edits_tx(&mut self, tx: &mut Tx) {
+        self.mcp_settings.allow_live_canvas_edits = !self.mcp_settings.allow_live_canvas_edits;
+        self.mcp_allow_live
+            .store(self.mcp_settings.allow_live_canvas_edits, Ordering::SeqCst);
+        self.save_app_settings();
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_mcp_port_tx(&mut self, port: u16, tx: &mut Tx) {
+        if self.mcp_settings.port == port {
+            return;
+        }
+        let was_running = self.mcp_server.is_some();
+        if was_running {
+            self.stop_mcp_server();
+        }
+        self.mcp_settings.port = port;
+        if was_running {
+            self.start_mcp_server();
+            if self.mcp_server.is_none() {
+                self.mcp_settings.enabled = false;
+            }
+        }
+        self.save_app_settings();
+        self.sync_window_state(tx);
+    }
+
+    /// Applies an edit delivered by a connected local MCP agent onto the live canvas,
+    /// pushing the previous recipe onto `HistoryStack` so the user can hit `⌘Z` to undo.
+    pub fn apply_external_mcp_recipe_tx(
+        &mut self,
+        new_recipe: DevelopRecipe,
+        summary: String,
+        tx: &mut Tx,
+    ) {
+        let sanitized = new_recipe.sanitized();
+        let changed = self.recipe != sanitized;
+        if changed {
+            self.history.push(self.recipe.clone());
+            self.recipe = sanitized;
+            self.catalog.update_active_recipe(self.recipe.clone());
+        }
+        let mut meta_synced = false;
+        if let Some(path) = self.image.source_path.as_deref() {
+            if let Ok(Some(disk_meta)) = PhotoMeta::load_sidecar(path)
+                && let Some(entry) = self.catalog.active_entry_mut()
+            {
+                entry.meta.revision = disk_meta.revision;
+                entry.meta.history = disk_meta.history;
+                entry.meta.rating = disk_meta.rating;
+                entry.meta.flag = disk_meta.flag;
+                entry.meta.color_tag = disk_meta.color_tag;
+                entry.color_tag = disk_meta.color_tag;
+                entry.meta.active_variant_index = disk_meta.active_variant_index;
+                entry.meta.variants = disk_meta.variants;
+                entry.meta.recipe = self.recipe.clone();
+                meta_synced = true;
+            }
+            self.saved_recipe = self.recipe.clone();
+        }
+        if changed {
+            self.recompute_histogram();
+            self.status_message = Some(format!("{summary} (⌘Z to undo)"));
+            self.sync_window_state(tx);
+            tx.announce("Applied live MCP agent edit", LiveRegion::Polite);
+        } else if meta_synced {
+            self.status_message = Some(summary);
+            self.sync_window_state(tx);
+        }
+    }
+
     pub fn recompute_histogram(&mut self) {
+        self.sync_active_layer_camera();
         self.compiled_recipe = CompiledRecipe::from_recipe(&self.recipe);
         self.histogram =
             compute_histogram_compiled(&self.image.histogram_proxy, &self.compiled_recipe);
+        self.sync_mcp_canvas_snapshot();
     }
 
     /// Clears in-flight pointer/keyboard interaction state so menu actions, undo/redo,
@@ -369,13 +1627,16 @@ impl AppState {
         self.speed_edit = None;
         self.speed_edit_snapshot = None;
         self.crop_drag = None;
+        self.layer_drag = None;
         self.drag_undo_snapshot = None;
         self.dragging_curve_pt = None;
         self.last_drag_pos = None;
     }
 
-    /// Syncs macOS `NSWindow.documentEdited` and live native menu enabled/checked states.
+    /// Syncs macOS `NSWindow.documentEdited`, live native menu enabled/checked states,
+    /// and the shared MCP canvas snapshot.
     pub fn sync_window_state(&self, tx: &mut Tx) {
+        self.sync_mcp_canvas_snapshot();
         tx.set_document_edited(self.is_dirty());
         self.sync_native_menu();
     }
@@ -488,17 +1749,241 @@ impl AppState {
     // Auto Color Science, WB Eyedropper & Viewer Diagnostics
     // -------------------------------------------------------------------------
 
+    pub fn set_film_curve(&mut self, curve: FilmCurve) {
+        if self.recipe.film_curve == curve {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.film_curve = curve;
+        next.preset_name = None;
+        self.commit_recipe_change(next, format!("Film Curve: {}", curve.label()));
+    }
+
+    pub fn set_film_curve_tx(&mut self, curve: FilmCurve, tx: &mut Tx) {
+        self.set_film_curve(curve);
+        self.sync_window_state(tx);
+    }
+
+    pub fn apply_wb_preset(&mut self, preset: WbPreset) {
+        let mut next = self.recipe.clone();
+        next.apply_wb_preset(preset);
+        next.preset_name = None;
+        let kelvin = temperature_to_kelvin(next.temperature);
+        self.commit_recipe_change(next, format!("WB Preset: {} ({kelvin} K)", preset.label()));
+    }
+
+    pub fn apply_wb_preset_tx(&mut self, preset: WbPreset, tx: &mut Tx) {
+        self.apply_wb_preset(preset);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_clarity_method(&mut self, method: ClarityMethod) {
+        if self.recipe.clarity_method == method {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.clarity_method = method;
+        next.preset_name = None;
+        self.commit_recipe_change(next, format!("Clarity Method: {}", method.label()));
+    }
+
+    pub fn set_clarity_method_tx(&mut self, method: ClarityMethod, tx: &mut Tx) {
+        self.set_clarity_method(method);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_grain_type(&mut self, grain_type: GrainType) {
+        if self.recipe.grain_type == grain_type {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.grain_type = grain_type;
+        next.preset_name = None;
+        self.commit_recipe_change(next, format!("Film Grain: {}", grain_type.label()));
+    }
+
+    pub fn set_grain_type_tx(&mut self, grain_type: GrainType, tx: &mut Tx) {
+        self.set_grain_type(grain_type);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_vignette_method(&mut self, method: VignetteMethod) {
+        if self.recipe.vignette_method == method {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.vignette_method = method;
+        next.preset_name = None;
+        self.commit_recipe_change(next, format!("Vignette Method: {}", method.label()));
+    }
+
+    pub fn set_vignette_method_tx(&mut self, method: VignetteMethod, tx: &mut Tx) {
+        self.set_vignette_method(method);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_active_tab(&mut self, tab: InspectorTab) {
+        self.active_tab = tab;
+        if tab != InspectorTab::Color {
+            self.camera.view_color_range = -1;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+        }
+    }
+
+    pub fn set_color_editor_mode(&mut self, mode: ColorEditorMode) {
+        if self.color_editor_mode != mode {
+            self.color_editor_mode = mode;
+            self.camera.view_color_range = -1;
+            if mode != ColorEditorMode::Advanced {
+                self.color_slice_picker_active = false;
+            }
+            if mode != ColorEditorMode::SkinTone {
+                self.skin_picker_active = false;
+            }
+        }
+    }
+
+    pub fn set_selected_color_slice(&mut self, index: usize) {
+        let clamped = index.min(ADVANCED_COLOR_SLICE_COUNT - 1);
+        self.selected_color_slice = clamped;
+        if self.camera.view_color_range >= 0
+            && (self.camera.view_color_range as usize) < ADVANCED_COLOR_SLICE_COUNT
+        {
+            self.camera.view_color_range = clamped as i32;
+        }
+    }
+
+    pub fn toggle_view_color_range(&mut self, target: i32) {
+        if self.camera.view_color_range == target {
+            self.camera.view_color_range = -1;
+            self.status_message = Some("View Selected Color Range OFF".to_owned());
+        } else {
+            self.camera.view_color_range = target;
+            self.status_message = Some(if target == 4 {
+                "Viewing Skin Tone selected color range".to_owned()
+            } else {
+                format!("Viewing Color Slice {} selected range", target + 1)
+            });
+        }
+    }
+
+    pub fn toggle_color_slice_picker_tx(&mut self, tx: &mut Tx) {
+        self.color_slice_picker_active = !self.color_slice_picker_active;
+        if self.color_slice_picker_active {
+            self.wb_eyedropper_active = false;
+            self.skin_picker_active = false;
+            self.camera.crop_mode = false;
+            self.crop_drag = None;
+            self.active_tab = InspectorTab::Color;
+            self.hsl_open = true;
+            self.color_editor_mode = ColorEditorMode::Advanced;
+            self.status_message = Some(format!(
+                "Color Picker — click a color on the photo for Slice {}",
+                self.selected_color_slice + 1
+            ));
+        } else {
+            self.status_message = Some("Cancelled Color Picker".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_skin_picker_tx(&mut self, tx: &mut Tx) {
+        self.skin_picker_active = !self.skin_picker_active;
+        if self.skin_picker_active {
+            self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.camera.crop_mode = false;
+            self.crop_drag = None;
+            self.active_tab = InspectorTab::Color;
+            self.hsl_open = true;
+            self.color_editor_mode = ColorEditorMode::SkinTone;
+            self.status_message =
+                Some("Skin Tone Picker — click skin on the photo to sample target".to_owned());
+        } else {
+            self.status_message = Some("Cancelled Skin Tone Picker".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    /// Samples a 3×3 linear RGB patch under the viewport click, populates the active
+    /// Advanced Color Editor slice's target Hue/Sat, and enables the slice.
+    pub fn pick_color_slice_at_viewport(&mut self, local_x: f32, local_y: f32) -> bool {
+        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            self.color_slice_picker_active = false;
+            self.status_message = Some("Click inside the photo to pick a color slice".to_owned());
+            return false;
+        };
+        let avg = self.sample_raw_patch_linear(su, sv, 1);
+        let pre_adv = self.compiled_recipe.evaluate_pre_advanced_color_linear(avg);
+        let idx = self
+            .selected_color_slice
+            .min(ADVANCED_COLOR_SLICE_COUNT - 1);
+        let mut next = self.recipe.clone();
+        if let Some((hue, sat, _)) = next.pick_color_slice_from_rgb(idx, pre_adv) {
+            next.preset_name = None;
+            self.color_slice_picker_active = false;
+            self.commit_recipe_change(
+                next,
+                format!(
+                    "Picked Slice {} ({hue:.0}° · Sat {:.0}%)",
+                    idx + 1,
+                    sat * 100.0
+                ),
+            );
+            true
+        } else {
+            self.color_slice_picker_active = false;
+            false
+        }
+    }
+
+    pub fn pick_color_slice_at_viewport_tx(&mut self, local_x: f32, local_y: f32, tx: &mut Tx) {
+        if self.pick_color_slice_at_viewport(local_x, local_y) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    /// Samples a 3×3 linear RGB patch under the viewport click, populates Skin Tone
+    /// target H/S/L, and enables Skin Tone Uniformity.
+    pub fn pick_skin_tone_at_viewport(&mut self, local_x: f32, local_y: f32) -> bool {
+        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            self.skin_picker_active = false;
+            self.status_message = Some("Click inside the photo to pick a skin tone".to_owned());
+            return false;
+        };
+        let avg = self.sample_raw_patch_linear(su, sv, 1);
+        let pre_adv = self.compiled_recipe.evaluate_pre_advanced_color_linear(avg);
+        let mut next = self.recipe.clone();
+        let (hue, sat, lum) = next.pick_skin_tone_from_rgb(pre_adv);
+        next.preset_name = None;
+        self.skin_picker_active = false;
+        self.commit_recipe_change(
+            next,
+            format!(
+                "Picked Skin Tone ({hue:.0}° · S{:.0} L{:.0})",
+                sat * 100.0,
+                lum * 100.0
+            ),
+        );
+        true
+    }
+
+    pub fn pick_skin_tone_at_viewport_tx(&mut self, local_x: f32, local_y: f32, tx: &mut Tx) {
+        if self.pick_skin_tone_at_viewport(local_x, local_y) {
+            self.sync_window_state(tx);
+        }
+    }
+
     pub fn auto_white_balance_tx(&mut self, tx: &mut Tx) {
         let (temp, tint) = auto_white_balance(&self.image.histogram_proxy);
         let mut next = self.recipe.clone();
         next.temperature = temp;
         next.tint = tint;
+        next.wb_preset = WbPreset::Custom;
         next.preset_name = None;
-        let msg = format!(
-            "Auto WB (Temp {:+.0}, Tint {:+.0})",
-            temp * 100.0,
-            tint * 100.0
-        );
+        let kelvin = temperature_to_kelvin(temp);
+        let msg = format!("Auto WB ({kelvin} K, Tint {:+.0})", tint * 100.0);
         self.commit_recipe_change(next, msg);
         self.sync_window_state(tx);
     }
@@ -558,8 +2043,12 @@ impl AppState {
         self.camera.crop_mode = !self.camera.crop_mode;
         if self.camera.crop_mode {
             self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.camera.view_color_range = -1;
             self.camera.split_compare = false;
             self.active_tab = InspectorTab::Crop;
+            self.crop_open = true;
             self.status_message =
                 Some("Crop mode — drag corners/edges or pick an aspect ratio".to_owned());
         } else {
@@ -572,6 +2061,9 @@ impl AppState {
     pub fn toggle_wb_eyedropper_tx(&mut self, tx: &mut Tx) {
         self.wb_eyedropper_active = !self.wb_eyedropper_active;
         if self.wb_eyedropper_active {
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.camera.view_color_range = -1;
             self.camera.crop_mode = false;
             self.crop_drag = None;
             self.active_tab = InspectorTab::Light;
@@ -596,15 +2088,13 @@ impl AppState {
         let mut next = self.recipe.clone();
         next.temperature = temp;
         next.tint = tint;
+        next.wb_preset = WbPreset::Custom;
         next.preset_name = None;
         self.wb_eyedropper_active = false;
+        let kelvin = temperature_to_kelvin(temp);
         self.commit_recipe_change(
             next,
-            format!(
-                "Picked WB (Temp {:+.0}, Tint {:+.0})",
-                temp * 100.0,
-                tint * 100.0
-            ),
+            format!("Picked WB ({kelvin} K, Tint {:+.0})", tint * 100.0),
         );
         self.sync_window_state(tx);
     }
@@ -618,14 +2108,21 @@ impl AppState {
             return;
         }
         let slot_u = (local_x / w).clamp(0.0, 1.0);
-        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+        let is_before = self.camera.show_original
+            || (self.camera.split_compare && slot_u < self.camera.split_pos);
+        let distortion = if is_before {
+            0.0
+        } else {
+            self.recipe.lens.sanitized().distortion
+        };
+        let Some([su, sv]) =
+            self.viewport_local_to_source_uv_with_distortion(local_x, local_y, distortion)
+        else {
             self.cursor_readout = None;
             return;
         };
         let src_lin = self.sample_raw_pixel_linear(su, sv);
-        let graded_lin = if self.camera.show_original
-            || (self.camera.split_compare && slot_u < self.camera.split_pos)
-        {
+        let graded_lin = if is_before {
             filmic_tonemap(src_lin)
         } else {
             self.compiled_recipe.evaluate_pixel_linear(src_lin)
@@ -645,6 +2142,19 @@ impl AppState {
     }
 
     fn viewport_local_to_source_uv(&self, local_x: f32, local_y: f32) -> Option<[f32; 2]> {
+        self.viewport_local_to_source_uv_with_distortion(
+            local_x,
+            local_y,
+            self.recipe.lens.sanitized().distortion,
+        )
+    }
+
+    fn viewport_local_to_source_uv_with_distortion(
+        &self,
+        local_x: f32,
+        local_y: f32,
+        distortion: f32,
+    ) -> Option<[f32; 2]> {
         let w = self.viewport_rect_pts[0];
         let h = self.viewport_rect_pts[1];
         if w <= 1.0 || h <= 1.0 {
@@ -653,11 +2163,12 @@ impl AppState {
         let scale = self.viewport_scale.max(1.0);
         let slot_uv = [local_x / w, local_y / h];
         let slot_size = [w * scale, h * scale];
-        self.recipe.geometry.viewport_to_source_uv(
+        self.recipe.geometry.viewport_to_source_uv_with_lens(
             slot_uv,
             slot_size,
             [self.image.width, self.image.height],
             &self.camera,
+            distortion,
         )
     }
 
@@ -947,13 +2458,1765 @@ impl AppState {
         let Some(preset) = self.presets.iter().find(|p| p.id == preset_id).cloned() else {
             return;
         };
-        let label = format!("Applied style: {}", preset.name);
-        self.commit_recipe_change(preset.recipe, label);
+        let strength = self.style_strength.clamp(0.0, 1.0);
+        let mut next = if self.stack_styles {
+            let mut stacked = self.recipe.clone();
+            let patch = recipe_to_sparse_patch(&preset.recipe);
+            let _ = stack_style_onto_recipe(&mut stacked, &patch, strength);
+            stacked.preset_name = None;
+            stacked
+        } else if (strength - 1.0).abs() > 1e-3 {
+            let mut blended = rune_editor_core::blend_recipes(
+                &DevelopRecipe::default(),
+                &preset.recipe,
+                strength,
+            );
+            blended.geometry = self.recipe.geometry;
+            blended.preset_name = None;
+            blended
+        } else {
+            let mut replaced = preset.recipe;
+            replaced.geometry = self.recipe.geometry;
+            replaced
+        };
+        next.geometry = self.recipe.geometry;
+        let label = if self.stack_styles {
+            format!("Stacked style: {} ({:.0}%)", preset.name, strength * 100.0)
+        } else {
+            format!("Applied style: {}", preset.name)
+        };
+        self.commit_recipe_change(next, label);
     }
 
     pub fn apply_preset_tx(&mut self, preset_id: &str, tx: &mut Tx) {
         self.apply_preset(preset_id);
         self.sync_window_state(tx);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Virtual Variants, Compare Variant, Selective Clipboard, User Styles,
+    // 120Hz Loupe, Pinned Color Readouts & Multi-Recipe Export
+    // -------------------------------------------------------------------------
+
+    pub fn active_variant_count(&self) -> usize {
+        self.catalog
+            .active_meta()
+            .map_or(1, PhotoMeta::variant_count)
+    }
+
+    pub fn active_variant_index(&self) -> usize {
+        self.catalog
+            .active_meta()
+            .map_or(0, |m| m.active_variant_index)
+    }
+
+    pub fn new_variant(&mut self, label: Option<String>) -> usize {
+        self.catalog.update_active_recipe(self.recipe.clone());
+        let idx = if let Some(entry) = self.catalog.active_entry_mut() {
+            let i = entry.meta.new_variant(label);
+            entry.color_tag = entry.meta.color_tag;
+            self.recipe = entry.meta.recipe.clone();
+            self.saved_recipe = self.recipe.clone();
+            i
+        } else {
+            0
+        };
+        self.clear_transient_interactions();
+        self.history.clear();
+        self.recompute_histogram();
+        self.status_message = Some(format!("Created Variant V{} (Neutral)", idx + 1));
+        idx
+    }
+
+    pub fn new_variant_tx(&mut self, label: Option<String>, tx: &mut Tx) {
+        self.new_variant(label);
+        if !self.demo_mode
+            && let Some(idx) = self.catalog.active_index
+        {
+            let _ = self.catalog.save_entry_sidecar_mut(idx);
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn clone_variant(&mut self, label: Option<String>) -> usize {
+        self.catalog.update_active_recipe(self.recipe.clone());
+        let idx = if let Some(entry) = self.catalog.active_entry_mut() {
+            let i = entry.meta.clone_variant(label);
+            entry.color_tag = entry.meta.color_tag;
+            self.recipe = entry.meta.recipe.clone();
+            self.saved_recipe = self.recipe.clone();
+            i
+        } else {
+            0
+        };
+        self.clear_transient_interactions();
+        self.history.clear();
+        self.recompute_histogram();
+        self.status_message = Some(format!("Cloned Variant V{}", idx + 1));
+        idx
+    }
+
+    pub fn clone_variant_tx(&mut self, label: Option<String>, tx: &mut Tx) {
+        self.clone_variant(label);
+        if !self.demo_mode
+            && let Some(idx) = self.catalog.active_index
+        {
+            let _ = self.catalog.save_entry_sidecar_mut(idx);
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn select_variant(&mut self, index: usize) -> bool {
+        self.catalog.update_active_recipe(self.recipe.clone());
+        let switched = if let Some(entry) = self.catalog.active_entry_mut() {
+            if entry.meta.select_variant(index) {
+                entry.color_tag = entry.meta.color_tag;
+                self.recipe = entry.meta.recipe.clone();
+                self.saved_recipe = self.recipe.clone();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if switched {
+            self.clear_transient_interactions();
+            self.history.clear();
+            self.recompute_histogram();
+            self.status_message = Some(format!("Selected Variant V{}", index + 1));
+        }
+        switched
+    }
+
+    pub fn select_variant_tx(&mut self, index: usize, tx: &mut Tx) {
+        if self.select_variant(index) {
+            if !self.demo_mode
+                && let Some(idx) = self.catalog.active_index
+            {
+                let _ = self.catalog.save_entry_sidecar_mut(idx);
+            }
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn next_variant_tx(&mut self, tx: &mut Tx) {
+        let count = self.active_variant_count();
+        if count > 1 {
+            let next = (self.active_variant_index() + 1) % count;
+            self.select_variant_tx(next, tx);
+        }
+    }
+
+    pub fn delete_active_variant(&mut self) -> bool {
+        let cur = self.active_variant_index();
+        let deleted = if let Some(entry) = self.catalog.active_entry_mut() {
+            if entry.meta.delete_variant(cur) {
+                entry.color_tag = entry.meta.color_tag;
+                self.recipe = entry.meta.recipe.clone();
+                self.saved_recipe = self.recipe.clone();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if deleted {
+            self.clear_transient_interactions();
+            self.history.clear();
+            self.recompute_histogram();
+            self.status_message = Some(format!(
+                "Deleted variant • Now on V{}",
+                self.active_variant_index() + 1
+            ));
+        }
+        deleted
+    }
+
+    pub fn delete_active_variant_tx(&mut self, tx: &mut Tx) {
+        if self.delete_active_variant() {
+            if !self.demo_mode
+                && let Some(idx) = self.catalog.active_index
+            {
+                let _ = self.catalog.save_entry_sidecar_mut(idx);
+            }
+            self.sync_window_state(tx);
+        }
+    }
+
+    /// Pins the current frame & active variant as a Capture One orange-bordered Compare Reference.
+    pub fn pin_compare_variant(&mut self) {
+        let pixels = render_graded_demo_pixels(&self.image, &self.recipe, 960);
+        let variant_tag = format!("V{}", self.active_variant_index() + 1);
+        let label = self.image.display_name.clone();
+        self.compare_reference = Some(CompareReference {
+            label: label.clone(),
+            variant_tag: variant_tag.clone(),
+            pixels,
+        });
+        self.camera.split_compare = false;
+        self.show_grid_browser = false;
+        self.status_message = Some(format!(
+            "Compare Variant pinned: {label} ({variant_tag}) — switch variant or photo to compare"
+        ));
+    }
+
+    pub fn toggle_compare_variant_tx(&mut self, tx: &mut Tx) {
+        if self.compare_reference.is_some() {
+            self.compare_reference = None;
+            self.status_message = Some("Cleared Compare Variant reference".to_owned());
+        } else {
+            self.pin_compare_variant();
+        }
+        self.sync_window_state(tx);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Adjustment Layers, Composable Masks, AI Subject/Bg & Heal/Clone
+    // -------------------------------------------------------------------------
+
+    /// Keeps `active_layer_index` within bounds and mirrors it into `camera.active_layer_index`.
+    pub fn sync_active_layer_camera(&mut self) {
+        let len = self.recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS);
+        if len == 0 {
+            self.active_layer_index = None;
+            self.camera.active_layer_index = -1;
+            self.camera.mask_overlay_mode = 0;
+        } else if let Some(idx) = self.active_layer_index {
+            let clamped = idx.min(len - 1);
+            self.active_layer_index = Some(clamped);
+            self.camera.active_layer_index = clamped as i32;
+        } else {
+            self.camera.active_layer_index = -1;
+            self.camera.mask_overlay_mode = 0;
+        }
+    }
+
+    pub fn select_layer(&mut self, index: Option<usize>) {
+        let len = self.recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS);
+        self.active_layer_index = index.filter(|&i| i < len);
+        self.sync_active_layer_camera();
+        self.status_message = Some(match self.active_layer_index {
+            Some(i) => format!("Selected layer: {}", self.recipe.layers[i].name),
+            None => "Selected Background (Base Image)".to_owned(),
+        });
+    }
+
+    pub fn select_layer_tx(&mut self, index: Option<usize>, tx: &mut Tx) {
+        self.select_layer(index);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_canvas_tool(&mut self, tool: CanvasTool) {
+        self.active_tool = tool;
+        self.layer_drag = None;
+        if tool.is_retouch_or_mask() {
+            self.camera.crop_mode = false;
+            self.crop_drag = None;
+            self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.readout_picker_active = false;
+            self.camera.view_color_range = -1;
+            self.show_grid_browser = false;
+            self.active_tab = InspectorTab::Layers;
+            if matches!(tool, CanvasTool::Heal | CanvasTool::Clone) {
+                self.heal_open = true;
+            }
+        }
+        self.status_message = Some(if tool == CanvasTool::Hand {
+            "Hand cursor active".to_owned()
+        } else {
+            format!("Tool: {} — drag on photo • Esc for Hand", tool.label())
+        });
+    }
+
+    pub fn set_canvas_tool_tx(&mut self, tool: CanvasTool, tx: &mut Tx) {
+        self.set_canvas_tool(tool);
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_mask_overlay_mode(&mut self, mode: i32) {
+        let clamped = mode.clamp(0, 2);
+        if clamped != 0 && self.active_layer_index.is_none() && !self.recipe.layers.is_empty() {
+            self.active_layer_index = Some(self.recipe.layers.len() - 1);
+        }
+        self.sync_active_layer_camera();
+        if self.active_layer_index.is_none() && clamped != 0 {
+            self.camera.mask_overlay_mode = 0;
+            self.status_message =
+                Some("Add or select an adjustment layer to view its mask".to_owned());
+            return;
+        }
+        self.camera.mask_overlay_mode = clamped;
+        self.status_message = Some(match clamped {
+            1 => "Mask Overlay: Red Rubylith (M)".to_owned(),
+            2 => "Mask Overlay: Grayscale (⌥M)".to_owned(),
+            _ => "Mask Overlay: Off".to_owned(),
+        });
+    }
+
+    pub fn set_mask_overlay_mode_tx(&mut self, mode: i32, tx: &mut Tx) {
+        self.set_mask_overlay_mode(mode);
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_red_mask_overlay(&mut self) {
+        let next = if self.camera.mask_overlay_mode == 1 {
+            0
+        } else {
+            1
+        };
+        self.set_mask_overlay_mode(next);
+    }
+
+    pub fn toggle_red_mask_overlay_tx(&mut self, tx: &mut Tx) {
+        self.toggle_red_mask_overlay();
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_gray_mask_overlay(&mut self) {
+        let next = if self.camera.mask_overlay_mode == 2 {
+            0
+        } else {
+            2
+        };
+        self.set_mask_overlay_mode(next);
+    }
+
+    pub fn toggle_gray_mask_overlay_tx(&mut self, tx: &mut Tx) {
+        self.toggle_gray_mask_overlay();
+        self.sync_window_state(tx);
+    }
+
+    fn next_layer_id(&self) -> String {
+        let mut n = self.recipe.layers.len() + 1;
+        while self
+            .recipe
+            .layers
+            .iter()
+            .any(|l| l.id == format!("layer-{n}"))
+        {
+            n += 1;
+        }
+        format!("layer-{n}")
+    }
+
+    fn next_heal_spot_id(&self) -> String {
+        let mut n = self.recipe.heal_spots.len() + 1;
+        while self
+            .recipe
+            .heal_spots
+            .iter()
+            .any(|h| h.id == format!("heal-{n}"))
+        {
+            n += 1;
+        }
+        format!("heal-{n}")
+    }
+
+    pub fn add_layer_with_shape(
+        &mut self,
+        name: String,
+        shape: Option<MaskShape>,
+    ) -> Option<usize> {
+        if self.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+            self.status_message = Some(format!(
+                "Maximum {MAX_ADJUSTMENT_LAYERS} adjustment layers reached"
+            ));
+            return None;
+        }
+        let id = self.next_layer_id();
+        let layer = match shape {
+            Some(s) => AdjustmentLayer::new_with_mask(id, name.clone(), s),
+            None => AdjustmentLayer::new(id, name.clone()),
+        };
+        let mut next = self.recipe.clone();
+        next.layers.push(layer);
+        next.preset_name = None;
+        let idx = next.layers.len() - 1;
+        self.active_layer_index = Some(idx);
+        self.commit_recipe_change(next, format!("Added layer: {name}"));
+        Some(idx)
+    }
+
+    pub fn add_empty_layer_tx(&mut self, tx: &mut Tx) {
+        let n = self.recipe.layers.len() + 1;
+        self.add_layer_with_shape(format!("Adjustment {n}"), None);
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_filled_layer_tx(&mut self, tx: &mut Tx) {
+        let n = self.recipe.layers.len() + 1;
+        self.add_layer_with_shape(format!("Filled Layer {n}"), Some(MaskShape::Filled));
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_linear_layer_tx(&mut self, tx: &mut Tx) {
+        let n = self.recipe.layers.len() + 1;
+        let shape = MaskShape::LinearGradient {
+            start: [0.5, 0.16],
+            end: [0.5, 0.62],
+            feather: 0.75,
+        };
+        if self
+            .add_layer_with_shape(format!("Linear Gradient {n}"), Some(shape))
+            .is_some()
+        {
+            self.set_canvas_tool(CanvasTool::LinearGradient);
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_radial_layer_tx(&mut self, tx: &mut Tx) {
+        let n = self.recipe.layers.len() + 1;
+        let shape = MaskShape::RadialGradient {
+            center: [0.5, 0.46],
+            radius: [0.28, 0.34],
+            angle_deg: 0.0,
+            feather: 0.45,
+        };
+        if self
+            .add_layer_with_shape(format!("Radial Gradient {n}"), Some(shape))
+            .is_some()
+        {
+            self.set_canvas_tool(CanvasTool::RadialGradient);
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_luma_layer_tx(&mut self, tx: &mut Tx) {
+        let n = self.recipe.layers.len() + 1;
+        let shape = MaskShape::LumaRange {
+            low: 0.45,
+            high: 1.0,
+            low_falloff: 0.15,
+            high_falloff: 0.05,
+        };
+        self.add_layer_with_shape(format!("Luma Range {n}"), Some(shape));
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_ai_subject_layer(&mut self, background: bool) -> Option<usize> {
+        let mask = generate_subject_mask(&self.image, background);
+        let name = if background {
+            "AI Background".to_owned()
+        } else {
+            "AI Subject".to_owned()
+        };
+        self.add_layer_with_shape(name, Some(mask))
+    }
+
+    pub fn add_ai_subject_layer_tx(&mut self, background: bool, tx: &mut Tx) {
+        if self.add_ai_subject_layer(background).is_some() {
+            self.set_mask_overlay_mode(1);
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn duplicate_layer_tx(&mut self, idx: usize, tx: &mut Tx) {
+        if idx >= self.recipe.layers.len() || self.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+            return;
+        }
+        let mut cloned = self.recipe.layers[idx].clone();
+        cloned.id = self.next_layer_id();
+        cloned.name = format!("{} Copy", cloned.name);
+        let mut next = self.recipe.clone();
+        let insert_at = idx + 1;
+        next.layers.insert(insert_at, cloned);
+        next.preset_name = None;
+        self.active_layer_index = Some(insert_at);
+        self.commit_recipe_change(next, "Duplicated adjustment layer");
+        self.sync_window_state(tx);
+    }
+
+    pub fn remove_layer(&mut self, idx: usize) -> bool {
+        if idx >= self.recipe.layers.len() {
+            return false;
+        }
+        let mut next = self.recipe.clone();
+        let removed = next.layers.remove(idx);
+        next.preset_name = None;
+        if next.layers.is_empty() {
+            self.active_layer_index = None;
+        } else if let Some(cur) = self.active_layer_index {
+            if cur >= next.layers.len() {
+                self.active_layer_index = Some(next.layers.len() - 1);
+            } else if idx < cur {
+                self.active_layer_index = Some(cur - 1);
+            }
+        }
+        self.commit_recipe_change(next, format!("Deleted layer: {}", removed.name));
+        true
+    }
+
+    pub fn remove_layer_tx(&mut self, idx: usize, tx: &mut Tx) {
+        if self.remove_layer(idx) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn move_layer_tx(&mut self, idx: usize, delta: isize, tx: &mut Tx) {
+        let len = self.recipe.layers.len();
+        if idx >= len {
+            return;
+        }
+        let target = idx as isize + delta;
+        if target < 0 || target >= len as isize {
+            return;
+        }
+        let target = target as usize;
+        let mut next = self.recipe.clone();
+        next.layers.swap(idx, target);
+        next.preset_name = None;
+        if self.active_layer_index == Some(idx) {
+            self.active_layer_index = Some(target);
+        } else if self.active_layer_index == Some(target) {
+            self.active_layer_index = Some(idx);
+        }
+        self.commit_recipe_change(next, "Reordered adjustment layer");
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_layer_enabled_tx(&mut self, idx: usize, tx: &mut Tx) {
+        if idx >= self.recipe.layers.len() {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[idx].enabled = !next.layers[idx].enabled;
+        let on = next.layers[idx].enabled;
+        let name = next.layers[idx].name.clone();
+        self.commit_recipe_change(
+            next,
+            format!("{}: {}", name, if on { "Visible" } else { "Hidden" }),
+        );
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_active_layer_invert(&mut self) -> bool {
+        let Some(idx) = self.active_layer_index else {
+            return false;
+        };
+        if idx >= self.recipe.layers.len() {
+            return false;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[idx].inverted = !next.layers[idx].inverted;
+        let inv = next.layers[idx].inverted;
+        self.commit_recipe_change(
+            next,
+            if inv {
+                "Inverted active layer mask"
+            } else {
+                "Restored active layer mask polarity"
+            },
+        );
+        true
+    }
+
+    pub fn toggle_active_layer_invert_tx(&mut self, tx: &mut Tx) {
+        if self.toggle_active_layer_invert() {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn clear_active_layer_masks_tx(&mut self, tx: &mut Tx) {
+        let Some(idx) = self.active_layer_index else {
+            return;
+        };
+        if idx >= self.recipe.layers.len() {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[idx].masks.clear();
+        next.layers[idx].inverted = false;
+        self.commit_recipe_change(next, "Cleared active layer masks");
+        self.sync_window_state(tx);
+    }
+
+    pub fn reset_active_layer_adjustments_tx(&mut self, tx: &mut Tx) {
+        let Some(idx) = self.active_layer_index else {
+            return;
+        };
+        if idx >= self.recipe.layers.len() {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[idx].adjustments = LocalAdjustments::default();
+        self.commit_recipe_change(next, "Reset local adjustments on active layer");
+        self.sync_window_state(tx);
+    }
+
+    pub fn add_mask_to_active_layer(&mut self, shape: MaskShape) -> bool {
+        let Some(idx) = self.active_layer_index else {
+            return false;
+        };
+        if idx >= self.recipe.layers.len()
+            || self.recipe.layers[idx].masks.len() >= MAX_MASKS_PER_LAYER
+        {
+            return false;
+        }
+        let label = shape.kind_label();
+        let mut next = self.recipe.clone();
+        next.layers[idx].masks.push(LayerMaskItem::new(shape));
+        self.commit_recipe_change(next, format!("Added {label} mask to layer"));
+        true
+    }
+
+    pub fn add_mask_to_active_layer_tx(&mut self, shape: MaskShape, tx: &mut Tx) {
+        if self.add_mask_to_active_layer(shape) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn set_layer_mask_op(
+        &mut self,
+        layer_idx: usize,
+        mask_idx: usize,
+        op: MaskCombineOp,
+    ) -> bool {
+        if layer_idx >= self.recipe.layers.len()
+            || mask_idx >= self.recipe.layers[layer_idx].masks.len()
+        {
+            return false;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[layer_idx].masks[mask_idx].op = op;
+        self.commit_recipe_change(next, format!("Mask combine mode: {}", op.label()));
+        true
+    }
+
+    pub fn set_layer_mask_op_tx(
+        &mut self,
+        layer_idx: usize,
+        mask_idx: usize,
+        op: MaskCombineOp,
+        tx: &mut Tx,
+    ) {
+        if self.set_layer_mask_op(layer_idx, mask_idx, op) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn toggle_layer_mask_invert_tx(&mut self, layer_idx: usize, mask_idx: usize, tx: &mut Tx) {
+        if layer_idx >= self.recipe.layers.len()
+            || mask_idx >= self.recipe.layers[layer_idx].masks.len()
+        {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[layer_idx].masks[mask_idx].inverted =
+            !next.layers[layer_idx].masks[mask_idx].inverted;
+        self.commit_recipe_change(next, "Toggled mask item polarity");
+        self.sync_window_state(tx);
+    }
+
+    pub fn remove_layer_mask_tx(&mut self, layer_idx: usize, mask_idx: usize, tx: &mut Tx) {
+        if layer_idx >= self.recipe.layers.len()
+            || mask_idx >= self.recipe.layers[layer_idx].masks.len()
+        {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.layers[layer_idx].masks.remove(mask_idx);
+        self.commit_recipe_change(next, "Removed mask from layer");
+        self.sync_window_state(tx);
+    }
+
+    #[cfg(test)]
+    pub fn add_heal_spot(
+        &mut self,
+        target: [f32; 2],
+        source: Option<[f32; 2]>,
+        mode: HealMode,
+    ) -> Option<usize> {
+        if self.recipe.heal_spots.len() >= MAX_HEAL_SPOTS {
+            self.status_message =
+                Some(format!("Maximum {MAX_HEAL_SPOTS} heal/clone spots reached"));
+            return None;
+        }
+        let id = self.next_heal_spot_id();
+        let radius = self.heal_radius.clamp(0.004, 0.15);
+        let src = source.unwrap_or_else(|| HealSpot::auto_source_for_target(target, radius));
+        let spot = HealSpot {
+            id,
+            target,
+            source: src,
+            radius,
+            feather: self.heal_feather.clamp(0.0, 1.0),
+            opacity: self.heal_opacity.clamp(0.0, 1.0),
+            mode,
+        }
+        .sanitized();
+        let mut next = self.recipe.clone();
+        next.heal_spots.push(spot);
+        next.preset_name = None;
+        let idx = next.heal_spots.len() - 1;
+        self.commit_recipe_change(next, format!("Placed {} spot #{}", mode.label(), idx + 1));
+        Some(idx)
+    }
+
+    pub fn remove_heal_spot_tx(&mut self, idx: usize, tx: &mut Tx) {
+        if idx >= self.recipe.heal_spots.len() {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.heal_spots.remove(idx);
+        self.commit_recipe_change(next, format!("Removed retouch spot #{}", idx + 1));
+        self.sync_window_state(tx);
+    }
+
+    pub fn clear_heal_spots(&mut self) {
+        if self.recipe.heal_spots.is_empty() {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.heal_spots.clear();
+        self.commit_recipe_change(next, "Cleared all Heal & Clone spots");
+    }
+
+    pub fn clear_heal_spots_tx(&mut self, tx: &mut Tx) {
+        self.clear_heal_spots();
+        self.sync_window_state(tx);
+    }
+
+    /// Interactive canvas drag start for Brush, Eraser, Linear/Radial Gradient, and Heal/Clone.
+    pub fn begin_canvas_tool_drag(&mut self, local_x: f32, local_y: f32) {
+        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            return;
+        };
+        if self.drag_undo_snapshot.is_none() {
+            self.drag_undo_snapshot = Some(self.recipe.clone());
+        }
+        match self.active_tool {
+            CanvasTool::Hand => {}
+            CanvasTool::Brush | CanvasTool::Eraser => {
+                let erase = self.active_tool == CanvasTool::Eraser;
+                let layer_idx = match self.active_layer_index {
+                    Some(i) if i < self.recipe.layers.len() => i,
+                    _ => {
+                        if self.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+                            self.drag_undo_snapshot = None;
+                            return;
+                        }
+                        let id = self.next_layer_id();
+                        let n = self.recipe.layers.len() + 1;
+                        self.recipe
+                            .layers
+                            .push(AdjustmentLayer::new(id, format!("Brush Layer {n}")));
+                        let idx = self.recipe.layers.len() - 1;
+                        self.active_layer_index = Some(idx);
+                        idx
+                    }
+                };
+                let mask_idx = if let Some(mi) = self.recipe.layers[layer_idx]
+                    .masks
+                    .iter()
+                    .rposition(|m| matches!(m.shape, MaskShape::BrushStrokes { .. }))
+                {
+                    mi
+                } else if self.recipe.layers[layer_idx].masks.len() < MAX_MASKS_PER_LAYER {
+                    self.recipe.layers[layer_idx].masks.push(LayerMaskItem::new(
+                        MaskShape::BrushStrokes {
+                            strokes: Vec::new(),
+                        },
+                    ));
+                    self.recipe.layers[layer_idx].masks.len() - 1
+                } else {
+                    self.drag_undo_snapshot = None;
+                    return;
+                };
+                let dab = BrushDab {
+                    x: su,
+                    y: sv,
+                    radius: self.brush_radius,
+                    hardness: self.brush_hardness,
+                    opacity: self.brush_opacity,
+                    erase,
+                }
+                .sanitized();
+                if let MaskShape::BrushStrokes { strokes } =
+                    &mut self.recipe.layers[layer_idx].masks[mask_idx].shape
+                    && strokes.len() < MAX_BRUSH_DABS_PER_MASK
+                {
+                    strokes.push(dab);
+                }
+                self.layer_drag = Some(LayerDragState::Brush {
+                    layer_idx,
+                    mask_idx,
+                    erase,
+                });
+                self.sync_active_layer_camera();
+            }
+            CanvasTool::LinearGradient => {
+                let layer_idx = match self.active_layer_index {
+                    Some(i) if i < self.recipe.layers.len() => i,
+                    _ => {
+                        if self.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+                            self.drag_undo_snapshot = None;
+                            return;
+                        }
+                        let id = self.next_layer_id();
+                        let n = self.recipe.layers.len() + 1;
+                        self.recipe
+                            .layers
+                            .push(AdjustmentLayer::new(id, format!("Linear Gradient {n}")));
+                        let idx = self.recipe.layers.len() - 1;
+                        self.active_layer_index = Some(idx);
+                        idx
+                    }
+                };
+                let shape = MaskShape::LinearGradient {
+                    start: [su, sv],
+                    end: [su, (sv + 0.02).min(1.0)],
+                    feather: 0.75,
+                };
+                let mask_idx = if let Some(mi) = self.recipe.layers[layer_idx]
+                    .masks
+                    .iter()
+                    .rposition(|m| matches!(m.shape, MaskShape::LinearGradient { .. }))
+                {
+                    self.recipe.layers[layer_idx].masks[mi].shape = shape;
+                    mi
+                } else if self.recipe.layers[layer_idx].masks.len() < MAX_MASKS_PER_LAYER {
+                    self.recipe.layers[layer_idx]
+                        .masks
+                        .push(LayerMaskItem::new(shape));
+                    self.recipe.layers[layer_idx].masks.len() - 1
+                } else {
+                    self.drag_undo_snapshot = None;
+                    return;
+                };
+                self.layer_drag = Some(LayerDragState::Linear {
+                    layer_idx,
+                    mask_idx,
+                    start_uv: [su, sv],
+                });
+                self.sync_active_layer_camera();
+            }
+            CanvasTool::RadialGradient => {
+                let layer_idx = match self.active_layer_index {
+                    Some(i) if i < self.recipe.layers.len() => i,
+                    _ => {
+                        if self.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+                            self.drag_undo_snapshot = None;
+                            return;
+                        }
+                        let id = self.next_layer_id();
+                        let n = self.recipe.layers.len() + 1;
+                        self.recipe
+                            .layers
+                            .push(AdjustmentLayer::new(id, format!("Radial Gradient {n}")));
+                        let idx = self.recipe.layers.len() - 1;
+                        self.active_layer_index = Some(idx);
+                        idx
+                    }
+                };
+                let shape = MaskShape::RadialGradient {
+                    center: [su, sv],
+                    radius: [0.05, 0.05],
+                    angle_deg: 0.0,
+                    feather: 0.45,
+                };
+                let mask_idx = if let Some(mi) = self.recipe.layers[layer_idx]
+                    .masks
+                    .iter()
+                    .rposition(|m| matches!(m.shape, MaskShape::RadialGradient { .. }))
+                {
+                    self.recipe.layers[layer_idx].masks[mi].shape = shape;
+                    mi
+                } else if self.recipe.layers[layer_idx].masks.len() < MAX_MASKS_PER_LAYER {
+                    self.recipe.layers[layer_idx]
+                        .masks
+                        .push(LayerMaskItem::new(shape));
+                    self.recipe.layers[layer_idx].masks.len() - 1
+                } else {
+                    self.drag_undo_snapshot = None;
+                    return;
+                };
+                self.layer_drag = Some(LayerDragState::Radial {
+                    layer_idx,
+                    mask_idx,
+                    center_uv: [su, sv],
+                });
+                self.sync_active_layer_camera();
+            }
+            CanvasTool::Heal | CanvasTool::Clone => {
+                if self.recipe.heal_spots.len() >= MAX_HEAL_SPOTS {
+                    self.drag_undo_snapshot = None;
+                    self.status_message =
+                        Some(format!("Maximum {MAX_HEAL_SPOTS} heal/clone spots reached"));
+                    return;
+                }
+                let mode = if self.active_tool == CanvasTool::Clone {
+                    HealMode::Clone
+                } else {
+                    HealMode::Heal
+                };
+                let id = self.next_heal_spot_id();
+                let radius = self.heal_radius.clamp(0.004, 0.15);
+                let spot = HealSpot {
+                    id,
+                    target: [su, sv],
+                    source: HealSpot::auto_source_for_target([su, sv], radius),
+                    radius,
+                    feather: self.heal_feather.clamp(0.0, 1.0),
+                    opacity: self.heal_opacity.clamp(0.0, 1.0),
+                    mode,
+                }
+                .sanitized();
+                self.recipe.heal_spots.push(spot);
+                let spot_idx = self.recipe.heal_spots.len() - 1;
+                self.layer_drag = Some(LayerDragState::Heal { spot_idx });
+            }
+        }
+    }
+
+    pub fn update_canvas_tool_drag(&mut self, local_x: f32, local_y: f32) {
+        let Some(drag) = self.layer_drag else {
+            return;
+        };
+        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            return;
+        };
+        match drag {
+            LayerDragState::Brush {
+                layer_idx,
+                mask_idx,
+                erase,
+            } => {
+                if let Some(layer) = self.recipe.layers.get_mut(layer_idx)
+                    && let Some(mask) = layer.masks.get_mut(mask_idx)
+                    && let MaskShape::BrushStrokes { strokes } = &mut mask.shape
+                {
+                    let spacing = (self.brush_radius * 0.25).max(0.004);
+                    let far_enough = strokes.last().is_none_or(|prev| {
+                        let dx = su - prev.x;
+                        let dy = sv - prev.y;
+                        (dx * dx + dy * dy).sqrt() >= spacing
+                    });
+                    if far_enough && strokes.len() < MAX_BRUSH_DABS_PER_MASK {
+                        strokes.push(
+                            BrushDab {
+                                x: su,
+                                y: sv,
+                                radius: self.brush_radius,
+                                hardness: self.brush_hardness,
+                                opacity: self.brush_opacity,
+                                erase,
+                            }
+                            .sanitized(),
+                        );
+                    }
+                }
+            }
+            LayerDragState::Linear {
+                layer_idx,
+                mask_idx,
+                start_uv,
+            } => {
+                if let Some(layer) = self.recipe.layers.get_mut(layer_idx)
+                    && let Some(mask) = layer.masks.get_mut(mask_idx)
+                    && let MaskShape::LinearGradient { start, end, .. } = &mut mask.shape
+                {
+                    *start = start_uv;
+                    *end = [su, sv];
+                }
+            }
+            LayerDragState::Radial {
+                layer_idx,
+                mask_idx,
+                center_uv,
+            } => {
+                if let Some(layer) = self.recipe.layers.get_mut(layer_idx)
+                    && let Some(mask) = layer.masks.get_mut(mask_idx)
+                    && let MaskShape::RadialGradient { center, radius, .. } = &mut mask.shape
+                {
+                    *center = center_uv;
+                    radius[0] = (su - center_uv[0]).abs().clamp(0.02, 1.0);
+                    radius[1] = (sv - center_uv[1]).abs().clamp(0.02, 1.0);
+                }
+            }
+            LayerDragState::Heal { spot_idx } => {
+                if let Some(spot) = self.recipe.heal_spots.get_mut(spot_idx) {
+                    spot.source = [su.clamp(0.0, 1.0), sv.clamp(0.0, 1.0)];
+                }
+            }
+        }
+    }
+
+    pub fn end_canvas_tool_drag_tx(&mut self, tx: &mut Tx) {
+        self.layer_drag = None;
+        self.recipe.preset_name = None;
+        self.catalog.update_active_recipe(self.recipe.clone());
+        if let Some(prev) = self.drag_undo_snapshot.take()
+            && prev != self.recipe
+        {
+            self.history.push(prev);
+        }
+        self.recompute_histogram();
+        self.sync_window_state(tx);
+    }
+
+    /// Projects a source-image UV `[su, sv]` (`0..=1`) into viewport local coordinates (points)
+    /// for crisp Capture One vector canvas guides (Linear/Radial Gradient & Heal/Clone pins).
+    pub fn source_uv_to_viewport_local(&self, uv: [f32; 2], vw_pts: f32, vh_pts: f32) -> [f32; 2] {
+        let scale = self.viewport_scale.max(1.0);
+        let slot_w = (vw_pts * scale).max(1.0);
+        let slot_h = (vh_pts * scale).max(1.0);
+        let geo = &self.recipe.geometry;
+        let [ori_w, ori_h] = geo.oriented_size(self.image.width, self.image.height);
+        let [cx, cy, cw, ch] = geo.sanitized_crop();
+
+        // Un-rotate first via quarter_turns(), then un-flip (exact inverse of oriented_to_source_uv_unclamped).
+        let (mut ou, mut ov) = match geo.quarter_turns() {
+            1 => (1.0 - uv[1], uv[0]),
+            2 => (1.0 - uv[0], 1.0 - uv[1]),
+            3 => (uv[1], 1.0 - uv[0]),
+            _ => (uv[0], uv[1]),
+        };
+        if geo.flip_h {
+            ou = 1.0 - ou;
+        }
+        if geo.flip_v {
+            ov = 1.0 - ov;
+        }
+
+        let (frame_w, frame_h, frame_u, frame_v) = if self.camera.crop_mode {
+            (ori_w as f32, ori_h as f32, ou, ov)
+        } else {
+            (
+                (ori_w as f32 * cw).max(1.0),
+                (ori_h as f32 * ch).max(1.0),
+                (ou - cx) / cw.max(1e-4),
+                (ov - cy) / ch.max(1e-4),
+            )
+        };
+
+        let pad = 28.0_f32;
+        let avail_w = (slot_w - pad * 2.0).max(1.0);
+        let avail_h = (slot_h - pad * 2.0).max(1.0);
+        let fit_scale = (avail_w / frame_w).min(avail_h / frame_h);
+        let fitted_w = frame_w * fit_scale;
+        let fitted_h = frame_h * fit_scale;
+
+        let zoom = self.camera.zoom.max(0.05);
+        let pan_x = self.camera.pan[0] * slot_w * 0.5;
+        let pan_y = self.camera.pan[1] * slot_h * 0.5;
+        let (sn, cs) = self.camera.rotation_deg.to_radians().sin_cos();
+
+        let rx = (frame_u - 0.5) * fitted_w * zoom;
+        let ry = (frame_v - 0.5) * fitted_h * zoom;
+        let px = rx * cs - ry * sn + pan_x;
+        let py = rx * sn + ry * cs + pan_y;
+
+        [(px / slot_w + 0.5) * vw_pts, (py / slot_h + 0.5) * vh_pts]
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5: Film Negative Conversion, Proof Margin, 4-Folder Sessions,
+    // Hot Folder Auto-Ingest, External Editor Handoff & Custom Shortcuts
+    // -------------------------------------------------------------------------
+
+    pub fn set_processing_mode(&mut self, mode: ProcessingMode) {
+        if self.recipe.processing_mode == mode {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.processing_mode = mode;
+        next.preset_name = None;
+        if mode != ProcessingMode::FilmNegative {
+            self.film_base_picker_active = false;
+        }
+        self.commit_recipe_change(next, format!("Processing mode: {}", mode.label()));
+    }
+
+    pub fn set_processing_mode_tx(&mut self, mode: ProcessingMode, tx: &mut Tx) {
+        self.set_processing_mode(mode);
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_film_base_picker_tx(&mut self, tx: &mut Tx) {
+        self.film_base_picker_active = !self.film_base_picker_active;
+        if self.film_base_picker_active {
+            self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.readout_picker_active = false;
+            self.active_tool = CanvasTool::Hand;
+            self.camera.crop_mode = false;
+            self.active_tab = InspectorTab::Light;
+            self.film_neg_open = true;
+            self.status_message =
+                Some("Film Base Picker — click unexposed orange film border on photo".to_owned());
+        } else {
+            self.status_message = Some("Cancelled Film Base Picker".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    /// Samples a 3×3 raw pre-grade linear patch under the viewport click, switches to
+    /// `ProcessingMode::FilmNegative`, and calibrates the C-41 orange film base mask.
+    pub fn pick_film_base_at_viewport(&mut self, local_x: f32, local_y: f32) -> bool {
+        let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            self.film_base_picker_active = false;
+            self.status_message = Some("Click inside the photo to sample the film base".to_owned());
+            return false;
+        };
+        let avg = self.sample_raw_patch_linear(su, sv, 1);
+        let mut next = self.recipe.clone();
+        let base = next.convert_film_negative_from_base(avg);
+        next.preset_name = None;
+        self.film_base_picker_active = false;
+        self.commit_recipe_change(
+            next,
+            format!(
+                "Converted Film Negative (Base RGB {:.2}, {:.2}, {:.2})",
+                base[0], base[1], base[2]
+            ),
+        );
+        true
+    }
+
+    pub fn pick_film_base_at_viewport_tx(&mut self, local_x: f32, local_y: f32, tx: &mut Tx) {
+        self.pick_film_base_at_viewport(local_x, local_y);
+        self.sync_window_state(tx);
+    }
+
+    pub fn convert_film_negative_auto_tx(&mut self, tx: &mut Tx) {
+        // Sample near top-left border (typical film rebate / neutral border) with safe fallback
+        let avg = self.sample_raw_patch_linear(0.03, 0.03, 2);
+        let mut next = self.recipe.clone();
+        let base = next.convert_film_negative_from_base(avg);
+        next.preset_name = None;
+        self.commit_recipe_change(
+            next,
+            format!(
+                "Converted Film Negative (Auto Base {:.2}, {:.2}, {:.2})",
+                base[0], base[1], base[2]
+            ),
+        );
+        self.sync_window_state(tx);
+    }
+
+    pub fn reset_film_negative_tx(&mut self, tx: &mut Tx) {
+        let mut next = self.recipe.clone();
+        next.film_negative = FilmNegativeParams::default();
+        next.preset_name = None;
+        self.commit_recipe_change(next, "Reset Film Negative conversion parameters");
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_proof_margin(&mut self, margin: ProofMargin) {
+        self.proof_margin = margin;
+        self.save_app_settings();
+        self.status_message = Some(format!(
+            "Proof Margin: {} ({})",
+            margin.label(),
+            margin.effective_pt_label()
+        ));
+    }
+
+    pub fn set_proof_margin_tx(&mut self, margin: ProofMargin, tx: &mut Tx) {
+        self.set_proof_margin(margin);
+        self.sync_window_state(tx);
+    }
+
+    pub fn cycle_proof_margin(&mut self) {
+        let next = self.proof_margin.next();
+        self.set_proof_margin(next);
+    }
+
+    pub fn cycle_proof_margin_tx(&mut self, tx: &mut Tx) {
+        self.cycle_proof_margin();
+        self.sync_window_state(tx);
+    }
+
+    /// Creates a Capture One 4-folder session (`Capture/`, `Selects/`, `Output/`, `Trash/`)
+    /// and opens `Capture/` as the active session folder.
+    pub fn create_capture_one_session_tx(&mut self, root: PathBuf, tx: &mut Tx) {
+        match create_capture_one_session(&root) {
+            Ok(layout) => {
+                self.open_folder_tx(layout.capture.clone(), tx);
+                let _ = self.start_hot_folder_watch(layout.capture.clone());
+                self.status_message = Some(format!(
+                    "Created Capture One Session (Capture/Selects/Output/Trash) in {}",
+                    root.display()
+                ));
+                self.sync_window_state(tx);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Create session failed: {err}"));
+            }
+        }
+    }
+
+    /// Safely moves the active photo + `.rune-edit.json` sidecar into `Selects/` (`⌘J`)
+    /// without ever clobbering existing files.
+    pub fn move_active_to_selects_tx(&mut self, tx: &mut Tx) {
+        if self.demo_mode {
+            self.status_message = Some("Open a photo from disk to move it to Selects/".to_owned());
+            return;
+        }
+        let Some(photo_path) = self.image.source_path.clone() else {
+            self.status_message = Some("No disk photo active to move to Selects/".to_owned());
+            return;
+        };
+        let Some(parent) = photo_path.parent() else {
+            return;
+        };
+        let selects_dir = if parent
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("Capture"))
+        {
+            parent
+                .parent()
+                .map(|root| root.join("Selects"))
+                .unwrap_or_else(|| parent.join("Selects"))
+        } else {
+            parent.join("Selects")
+        };
+
+        if let Some(idx) = self.catalog.active_index {
+            self.autosave_dirty_entry_sidecar(idx);
+        }
+        match move_photo_with_sidecar(&photo_path, &selects_dir) {
+            Ok(dest) => {
+                let name = dest
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "photo".to_owned());
+                if let Some(idx) = self.catalog.active_index
+                    && idx < self.catalog.entries.len()
+                {
+                    self.catalog.entries.remove(idx);
+                    if self.catalog.entries.is_empty() {
+                        self.catalog.active_index = None;
+                    } else {
+                        self.catalog.active_index = Some(idx.min(self.catalog.entries.len() - 1));
+                        self.load_active_catalog_photo_tx(tx);
+                    }
+                }
+                self.status_message = Some(format!("Moved {name} + sidecar → Selects/"));
+                self.sync_window_state(tx);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Move to Selects failed: {err}"));
+            }
+        }
+    }
+
+    /// Non-destructively exports a full-resolution 16-bit TIFF sibling (`<stem>_edit.tif`)
+    /// without ever touching the original RAW, then opens it in macOS's default external editor.
+    pub fn edit_with_external_editor_tx(&mut self, tx: &mut Tx) {
+        let Some(src) = self.image.source_path.clone() else {
+            self.status_message =
+                Some("Open a photo from disk to use Edit With External Editor…".to_owned());
+            return;
+        };
+        let parent = src.parent().unwrap_or_else(|| Path::new("."));
+        let stem = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "photo".to_owned());
+        let mut dest = parent.join(format!("{stem}_edit.tif"));
+        let mut suffix = 2u32;
+        while dest.exists() || dest.symlink_metadata().is_ok() {
+            dest = parent.join(format!("{stem}_edit_{suffix}.tif"));
+            suffix += 1;
+        }
+        if let Err(err) = guard_not_source(&src, &dest) {
+            self.status_message = Some(format!("External editor guard: {err}"));
+            return;
+        }
+        let opts = ExportOptions {
+            format: ExportFormat::Tiff16,
+            color_space: ExportColorSpace::DisplayP3,
+            respect_crop: true,
+            ..ExportOptions::default()
+        };
+        match export_image_with_options(&self.image, &self.recipe, &dest, &opts) {
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                let launch = Command::new("open").arg(&dest).spawn();
+                #[cfg(not(target_os = "macos"))]
+                let launch: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "external launch supported on macOS",
+                ));
+                let fname = dest
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "edit.tif".to_owned());
+                match launch {
+                    Ok(_) => {
+                        self.status_message =
+                            Some(format!("Exported 16-bit TIFF {fname} → opened externally"));
+                    }
+                    Err(err) => {
+                        self.status_message =
+                            Some(format!("Exported {fname} (open failed: {err})"));
+                    }
+                }
+                self.sync_window_state(tx);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("External edit export failed: {err}"));
+            }
+        }
+    }
+
+    pub fn start_hot_folder_watch(&mut self, dir: PathBuf) -> Result<(), String> {
+        let watcher = HotFolderWatcher::new(dir.clone()).map_err(|e| e.to_string())?;
+        self.hot_folder_watcher = Some(watcher);
+        self.hot_folder_dir = Some(dir.clone());
+        let name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        self.status_message = Some(format!("Hot Folder watching '{name}' for new shots"));
+        Ok(())
+    }
+
+    pub fn start_hot_folder_watch_tx(&mut self, dir: PathBuf, tx: &mut Tx) {
+        match self.start_hot_folder_watch(dir) {
+            Ok(()) => self.sync_window_state(tx),
+            Err(err) => self.status_message = Some(format!("Hot Folder error: {err}")),
+        }
+    }
+
+    pub fn stop_hot_folder_watch(&mut self) {
+        self.hot_folder_watcher = None;
+        self.hot_folder_dir = None;
+        self.status_message = Some("Hot Folder watch stopped".to_owned());
+    }
+
+    pub fn stop_hot_folder_watch_tx(&mut self, tx: &mut Tx) {
+        self.stop_hot_folder_watch();
+        self.sync_window_state(tx);
+    }
+
+    /// Polls the active `HotFolderWatcher` for newly stable photos, ingests them into the
+    /// session catalog, and optionally applies `hot_folder_style` + saves their sidecars.
+    pub fn poll_hot_folder(&mut self) -> usize {
+        let ready = {
+            let Some(watcher) = self.hot_folder_watcher.as_mut() else {
+                return 0;
+            };
+            match watcher.poll_ready() {
+                Ok(files) => files,
+                Err(_) => return 0,
+            }
+        };
+        if ready.is_empty() {
+            return 0;
+        }
+        let mut ingested = 0usize;
+        for path in ready {
+            if self.catalog.entries.iter().any(|e| e.path == path) {
+                continue;
+            }
+            let mut meta = PhotoMeta::load_sidecar(&path)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if let Some(style_id) = self.hot_folder_style.as_deref()
+                && let Some(preset) = self.presets.iter().find(|p| p.id == style_id)
+            {
+                meta.recipe = preset.recipe.clone();
+                let _ = meta.save_sidecar_in_place(&path);
+            }
+            self.catalog.entries.push(SessionEntry::new(path, meta));
+            ingested += 1;
+        }
+        if ingested > 0 {
+            self.demo_mode = false;
+            self.hot_folder_ingested_count += ingested;
+            self.status_message = Some(format!(
+                "Hot Folder ingested {ingested} new photo(s) ({} total)",
+                self.hot_folder_ingested_count
+            ));
+        }
+        ingested
+    }
+
+    pub fn poll_hot_folder_tx(&mut self, tx: &mut Tx) {
+        let n = self.poll_hot_folder();
+        if n > 0 {
+            self.populate_visible_thumbnails(24);
+            if let Some(last) = self.catalog.entries.len().checked_sub(1) {
+                self.catalog.select_index(last);
+                self.load_active_catalog_photo_tx(tx);
+            }
+        } else {
+            self.status_message = Some("Hot Folder: no new shots ready yet".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_hot_folder_style_tx(&mut self, style_id: Option<String>, tx: &mut Tx) {
+        self.hot_folder_style = style_id;
+        self.save_app_settings();
+        self.status_message = Some(match self.hot_folder_style.as_deref() {
+            Some(id) => format!("Hot Folder auto-apply style: {id}"),
+            None => "Hot Folder auto-apply style: None".to_owned(),
+        });
+        self.sync_window_state(tx);
+    }
+
+    pub fn set_shortcut_binding(
+        &mut self,
+        action: ShortcutAction,
+        key: &str,
+    ) -> Result<(), String> {
+        self.shortcuts.set_key(action, key)?;
+        self.recording_shortcut = None;
+        self.save_app_settings();
+        self.status_message = Some(format!(
+            "Bound '{}' → {}",
+            action.label(),
+            self.shortcuts.display_key(action)
+        ));
+        Ok(())
+    }
+
+    pub fn set_shortcut_binding_tx(
+        &mut self,
+        action: ShortcutAction,
+        key: &str,
+        tx: &mut Tx,
+    ) -> Result<(), String> {
+        let res = self.set_shortcut_binding(action, key);
+        if res.is_ok() {
+            self.sync_window_state(tx);
+        } else if let Err(ref err) = res {
+            self.status_message = Some(err.clone());
+        }
+        res
+    }
+
+    pub fn reset_shortcut_defaults(&mut self) {
+        self.shortcuts.reset_defaults();
+        self.recording_shortcut = None;
+        self.save_app_settings();
+        self.status_message = Some("Reset keyboard shortcuts to Capture One defaults".to_owned());
+    }
+
+    pub fn reset_shortcut_defaults_tx(&mut self, tx: &mut Tx) {
+        self.reset_shortcut_defaults();
+        self.sync_window_state(tx);
+    }
+
+    pub fn clear_compare_variant_tx(&mut self, tx: &mut Tx) {
+        if self.compare_reference.take().is_some() {
+            self.status_message = Some("Cleared Compare Variant reference".to_owned());
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn toggle_clipboard_group(&mut self, group: &str) {
+        if !self.clipboard_groups.remove(group) {
+            self.clipboard_groups.insert(group.to_owned());
+        }
+    }
+
+    pub fn autoselect_adjusted_groups(&mut self) {
+        let adjusted = modified_recipe_groups(&self.recipe);
+        self.clipboard_groups = adjusted.into_iter().map(str::to_owned).collect();
+        self.status_message = Some(format!(
+            "Autoselected {} adjusted group(s)",
+            self.clipboard_groups.len()
+        ));
+    }
+
+    pub fn paste_selected_adjustments(&mut self) -> bool {
+        let Some(copied) = self.catalog.paste_adjustments() else {
+            self.status_message = Some("No adjustments copied yet".to_owned());
+            return false;
+        };
+        let groups: Vec<String> = self.clipboard_groups.iter().cloned().collect();
+        if groups.is_empty() {
+            self.status_message = Some("Select at least one clipboard group to apply".to_owned());
+            return false;
+        }
+        let mut next = self.recipe.clone();
+        if copy_recipe_groups(&mut next, &copied, &groups).is_ok() {
+            next.preset_name = None;
+            let count = groups.len();
+            self.commit_recipe_change(
+                next,
+                format!("Applied {count} selected adjustment group(s)"),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn paste_selected_adjustments_tx(&mut self, tx: &mut Tx) {
+        if self.paste_selected_adjustments() {
+            self.sync_window_state(tx);
+            tx.announce("Applied selected adjustments", LiveRegion::Polite);
+        }
+    }
+
+    pub fn save_current_as_user_style(&mut self, raw_name: &str) -> Result<(), String> {
+        let name = raw_name.trim();
+        let groups: Vec<String> = self.clipboard_groups.iter().cloned().collect();
+        let style = UserStyle::from_recipe(
+            name,
+            format!("Saved from {}", self.image.display_name),
+            &self.recipe,
+            &groups,
+        )
+        .map_err(|e| e.to_string())?;
+        save_user_style(&style).map_err(|e| e.to_string())?;
+        self.user_styles = list_user_styles().unwrap_or_else(|_| vec![style]);
+        self.style_name_edit.clear();
+        self.status_message = Some(format!("Saved User Style: {name}"));
+        Ok(())
+    }
+
+    pub fn save_current_as_user_style_tx(&mut self, tx: &mut Tx) {
+        let name = self.style_name_edit.text.clone();
+        match self.save_current_as_user_style(&name) {
+            Ok(()) => self.sync_window_state(tx),
+            Err(err) => self.status_message = Some(format!("Save Style failed: {err}")),
+        }
+    }
+
+    pub fn apply_user_style(&mut self, idx: usize) -> bool {
+        let Some(style) = self.user_styles.get(idx).cloned() else {
+            return false;
+        };
+        let strength = self.style_strength.clamp(0.0, 1.0);
+        let mut next = self.recipe.clone();
+        let res = if self.stack_styles {
+            stack_style_onto_recipe(&mut next, &style.patch, strength)
+        } else {
+            apply_style_to_recipe(&mut next, &style, strength)
+        };
+        if res.is_ok() {
+            next.preset_name = None;
+            let verb = if self.stack_styles {
+                "Stacked"
+            } else {
+                "Applied"
+            };
+            self.commit_recipe_change(
+                next,
+                format!(
+                    "{verb} User Style: {} ({:.0}%)",
+                    style.name,
+                    strength * 100.0
+                ),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn apply_user_style_tx(&mut self, idx: usize, tx: &mut Tx) {
+        if self.apply_user_style(idx) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn delete_user_style_tx(&mut self, idx: usize, tx: &mut Tx) {
+        let Some(style) = self.user_styles.get(idx).cloned() else {
+            return;
+        };
+        if let Ok(slug) = style.slug() {
+            let _ = delete_user_style(&slug);
+        }
+        self.user_styles.remove(idx);
+        self.status_message = Some(format!("Deleted User Style: {}", style.name));
+        self.sync_window_state(tx);
+    }
+
+    pub fn toggle_loupe_tx(&mut self, tx: &mut Tx) {
+        self.camera.loupe_enabled = !self.camera.loupe_enabled;
+        if self.camera.loupe_enabled {
+            self.show_grid_browser = false;
+            self.camera.crop_mode = false;
+            self.status_message = Some(format!(
+                "120Hz GPU Loupe ON ({:.1}×) — move pointer to inspect",
+                self.camera.loupe_zoom
+            ));
+        } else {
+            self.status_message = Some("GPU Loupe OFF".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn update_loupe_uv(&mut self, local_x: f32, local_y: f32) {
+        let w = self.viewport_rect_pts[0];
+        let h = self.viewport_rect_pts[1];
+        if w > 1.0 && h > 1.0 {
+            self.camera.loupe_uv = [(local_x / w).clamp(0.0, 1.0), (local_y / h).clamp(0.0, 1.0)];
+        }
+    }
+
+    pub fn toggle_readout_picker_tx(&mut self, tx: &mut Tx) {
+        self.readout_picker_active = !self.readout_picker_active;
+        if self.readout_picker_active {
+            self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.camera.crop_mode = false;
+            self.status_message =
+                Some("Pin Readout — click photo to pin live RGB/Lab marker (#1–#4)".to_owned());
+        } else {
+            self.status_message = Some("Pin Readout tool OFF".to_owned());
+        }
+        self.sync_window_state(tx);
+    }
+
+    pub fn pin_color_readout_at_viewport(&mut self, local_x: f32, local_y: f32) -> bool {
+        let w = self.viewport_rect_pts[0];
+        let h = self.viewport_rect_pts[1];
+        if w <= 1.0 || h <= 1.0 {
+            return false;
+        }
+        let Some(source_uv) = self.viewport_local_to_source_uv(local_x, local_y) else {
+            return false;
+        };
+        let slot_uv = [(local_x / w).clamp(0.0, 1.0), (local_y / h).clamp(0.0, 1.0)];
+        if self.pinned_readouts.len() >= MAX_PINNED_READOUTS {
+            self.pinned_readouts.remove(0);
+        }
+        self.pinned_readouts
+            .push(PinnedReadout { source_uv, slot_uv });
+        self.status_message = Some(format!(
+            "Pinned Color Readout #{} (live graded RGB/Lab)",
+            self.pinned_readouts.len()
+        ));
+        true
+    }
+
+    pub fn pin_color_readout_at_viewport_tx(&mut self, local_x: f32, local_y: f32, tx: &mut Tx) {
+        if self.pin_color_readout_at_viewport(local_x, local_y) {
+            self.sync_window_state(tx);
+        }
+    }
+
+    pub fn evaluate_pinned_readout(&self, pin: &PinnedReadout) -> CursorColorReadout {
+        let src_lin = self.sample_raw_pixel_linear(pin.source_uv[0], pin.source_uv[1]);
+        let graded_lin = self.compiled_recipe.evaluate_pixel_linear(src_lin);
+        let srgb = [
+            linear_to_srgb(graded_lin[0]),
+            linear_to_srgb(graded_lin[1]),
+            linear_to_srgb(graded_lin[2]),
+        ];
+        let rgb8 = [
+            (srgb[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (srgb[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (srgb[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        ];
+        let (hsl, lab) = rgb_to_hsl_and_lab(srgb);
+        CursorColorReadout { rgb8, hsl, lab }
+    }
+
+    pub fn current_naming_context(&self, recipe_name: &str) -> NamingContext {
+        let image_name = self
+            .image
+            .source_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Editorial_Portrait".to_owned());
+        let (camera, lens, iso) = self.image.exif.as_ref().map_or_else(
+            || {
+                (
+                    "Leica_Q3".to_owned(),
+                    "28mm".to_owned(),
+                    "ISO100".to_owned(),
+                )
+            },
+            |ex| {
+                (
+                    ex.camera_model.clone().unwrap_or_default(),
+                    ex.lens_model.clone().unwrap_or_default(),
+                    ex.iso.map(|i| format!("ISO{i}")).unwrap_or_default(),
+                )
+            },
+        );
+        NamingContext {
+            image_name,
+            counter: self.catalog.active_index.map_or(1, |i| i + 1),
+            date: "2026-11-26".to_owned(),
+            camera,
+            lens,
+            iso,
+            variant_index: self.active_variant_index(),
+            recipe_name: recipe_name.to_owned(),
+        }
+    }
+
+    pub fn preview_export_filename(&self, spec: &ExportRecipeSpec) -> String {
+        let tpl = if self.export_naming_edit.text.trim().is_empty() {
+            spec.naming_template.as_str()
+        } else {
+            self.export_naming_edit.text.as_str()
+        };
+        let ctx = self.current_naming_context(&spec.name);
+        let stem = expand_naming_template(tpl, &ctx);
+        format!("{stem}.{}", spec.options.format.extension())
+    }
+
+    pub fn run_multi_recipe_export_tx(&mut self, out_dir: PathBuf, tx: &mut Tx) {
+        self.export_output_dir = Some(out_dir.clone());
+        let tpl = if self.export_naming_edit.text.trim().is_empty() {
+            "{ImageName}_{Recipe}".to_owned()
+        } else {
+            self.export_naming_edit.text.clone()
+        };
+        let wm = TextWatermark {
+            enabled: self.export_watermark_enabled,
+            text: self.export_watermark_edit.text.clone(),
+            opacity: self.export_watermark_opacity,
+            scale: 1.0,
+            position: self.export_watermark_position,
+        };
+        let recipes: Vec<ExportRecipeSpec> = self
+            .export_recipes
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.naming_template = tpl.clone();
+                r.options.strip_metadata = self.export_strip_metadata;
+                r.options.watermark = wm.clone();
+                r.options.color_space = self.export_color_space;
+                r
+            })
+            .collect();
+        let ctx = self.current_naming_context("");
+        match export_multi_recipe(
+            &self.image,
+            &self.recipe,
+            &out_dir,
+            &recipes,
+            &ctx,
+            self.image.source_path.as_deref(),
+            false,
+        ) {
+            Ok(items) => {
+                let msg = format!(
+                    "Exported {} recipe(s) to {}",
+                    items.len(),
+                    out_dir.display()
+                );
+                self.status_message = Some(msg.clone());
+                self.show_export = false;
+                self.sync_window_state(tx);
+                tx.announce(msg, LiveRegion::Polite);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Multi-recipe export failed: {err}"));
+            }
+        }
     }
 
     pub fn reset_recipe(&mut self) {
@@ -1010,23 +4273,13 @@ impl AppState {
         tx.announce("Copied adjustments", LiveRegion::Polite);
     }
 
-    pub fn paste_adjustments_tx(&mut self, tx: &mut Tx) {
-        let Some(copied) = self.catalog.paste_adjustments() else {
-            self.status_message = Some("No adjustments copied yet".to_owned());
-            return;
-        };
-        self.commit_recipe_change(copied, "Pasted develop adjustments");
-        self.sync_window_state(tx);
-        tx.announce("Pasted adjustments", LiveRegion::Polite);
-    }
-
     pub fn save_sidecar_tx(&mut self, tx: &mut Tx) {
         let Some(path) = self.image.source_path.as_deref() else {
             self.status_message =
                 Some("Open a photo from disk to save a .rune-edit.json sidecar".to_owned());
             return;
         };
-        let meta = self
+        let mut meta = self
             .catalog
             .active_meta()
             .cloned()
@@ -1035,12 +4288,23 @@ impl AppState {
                 m
             })
             .unwrap_or_else(|| PhotoMeta {
-                rating: 0,
-                flag: CullFlag::None,
                 recipe: self.recipe.clone(),
+                ..PhotoMeta::default()
             });
-        match meta.save_sidecar(path) {
+        let diffs = rune_editor_core::recipe_field_diffs(&self.saved_recipe, &self.recipe);
+        if !diffs.is_empty() {
+            meta.push_history(
+                rune_editor_core::EditActor::Human,
+                format!("GUI save ({} field(s))", diffs.len()),
+                diffs,
+                Some(self.saved_recipe.clone()),
+            );
+        }
+        match meta.save_sidecar_in_place(path) {
             Ok(sidecar) => {
+                if let Some(active) = self.catalog.active_meta_mut() {
+                    *active = meta;
+                }
                 self.saved_recipe = self.recipe.clone();
                 let name = sidecar
                     .file_name()
@@ -1103,6 +4367,9 @@ impl AppState {
                 self.history.clear();
                 self.camera.reset();
                 self.wb_eyedropper_active = false;
+                self.color_slice_picker_active = false;
+                self.skin_picker_active = false;
+                self.camera.view_color_range = -1;
                 self.cursor_readout = None;
                 self.recompute_histogram();
                 self.status_message = Some(format!("Loaded {name} ({dims})"));
@@ -1152,26 +4419,62 @@ impl AppState {
         }
     }
 
+    /// Auto-saves dirty `.rune-edit.json` sidecar edits for `index` before switching away
+    /// in a real folder session so unsaved adjustments are never silently discarded.
+    fn autosave_dirty_entry_sidecar(&mut self, index: usize) {
+        if self.demo_mode || !self.is_dirty() || self.image.source_path.is_none() {
+            return;
+        }
+        let Some(entry) = self.catalog.entries.get_mut(index) else {
+            return;
+        };
+        let diffs = rune_editor_core::recipe_field_diffs(&self.saved_recipe, &self.recipe);
+        entry.meta.recipe = self.recipe.clone();
+        if !diffs.is_empty() {
+            entry.meta.push_history(
+                rune_editor_core::EditActor::Human,
+                format!("GUI auto-save ({} field(s))", diffs.len()),
+                diffs,
+                Some(self.saved_recipe.clone()),
+            );
+        }
+        if entry.meta.save_sidecar_in_place(&entry.path).is_ok() {
+            self.saved_recipe = self.recipe.clone();
+        }
+    }
+
     pub fn switch_catalog_index_tx(&mut self, index: usize, tx: &mut Tx) {
         if self.catalog.active_index == Some(index) {
             return;
         }
+        let prev = self.catalog.active_index;
         self.catalog.update_active_recipe(self.recipe.clone());
         if self.catalog.select_index(index).is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
             self.load_active_catalog_photo_tx(tx);
         }
     }
 
     pub fn select_next_photo_tx(&mut self, tx: &mut Tx) {
+        let prev = self.catalog.active_index;
         self.catalog.update_active_recipe(self.recipe.clone());
         if self.catalog.select_next().is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
             self.load_active_catalog_photo_tx(tx);
         }
     }
 
     pub fn select_prev_photo_tx(&mut self, tx: &mut Tx) {
+        let prev = self.catalog.active_index;
         self.catalog.update_active_recipe(self.recipe.clone());
         if self.catalog.select_prev().is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
             self.load_active_catalog_photo_tx(tx);
         }
     }
@@ -1193,6 +4496,9 @@ impl AppState {
             self.saved_recipe = entry.meta.recipe;
             self.clear_transient_interactions();
             self.wb_eyedropper_active = false;
+            self.color_slice_picker_active = false;
+            self.skin_picker_active = false;
+            self.camera.view_color_range = -1;
             self.cursor_readout = None;
             self.history.clear();
             self.recompute_histogram();
@@ -1225,6 +4531,9 @@ impl AppState {
                 self.history.clear();
                 self.camera.reset();
                 self.wb_eyedropper_active = false;
+                self.color_slice_picker_active = false;
+                self.skin_picker_active = false;
+                self.camera.view_color_range = -1;
                 self.cursor_readout = None;
                 self.recompute_histogram();
                 self.status_message = Some(format!("Loaded {name} ({dims})"));
@@ -1244,14 +4553,84 @@ impl AppState {
         let prev = self.catalog.active_index;
         self.catalog.set_filter(filter);
         if self.catalog.active_index != prev && self.catalog.active_index.is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
             self.load_active_catalog_photo_tx(tx);
         }
     }
 
+    pub fn set_color_tag_filter_tx(&mut self, tag: Option<ColorTag>, tx: &mut Tx) {
+        self.catalog.update_active_recipe(self.recipe.clone());
+        let prev = self.catalog.active_index;
+        self.catalog.set_color_tag_filter(tag);
+        if self.catalog.active_index != prev && self.catalog.active_index.is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
+            self.load_active_catalog_photo_tx(tx);
+        }
+    }
+
+    pub fn set_browser_search_tx(&mut self, query: String, tx: &mut Tx) {
+        self.catalog.update_active_recipe(self.recipe.clone());
+        let prev = self.catalog.active_index;
+        self.catalog.set_search_query(query);
+        if self.catalog.active_index != prev && self.catalog.active_index.is_some() {
+            if let Some(prev_idx) = prev {
+                self.autosave_dirty_entry_sidecar(prev_idx);
+            }
+            self.load_active_catalog_photo_tx(tx);
+        }
+    }
+
+    fn advance_if_auto_tx(&mut self, tx: &mut Tx) {
+        if self.auto_advance {
+            self.select_next_photo_tx(tx);
+        }
+    }
+
+    pub fn set_entry_color_tag(&mut self, index: usize, tag: ColorTag) -> bool {
+        if self.catalog.set_color_tag(index, tag) {
+            if !self.demo_mode {
+                let _ = self.catalog.save_entry_sidecar_mut(index);
+            }
+            if self.catalog.active_index == Some(index) {
+                self.sync_mcp_canvas_snapshot();
+            }
+            let msg = if tag == ColorTag::None {
+                "Cleared color tag".to_owned()
+            } else {
+                format!("Tagged {}", tag.label())
+            };
+            self.status_message = Some(msg);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_entry_color_tag_tx(&mut self, index: usize, tag: ColorTag, tx: &mut Tx) {
+        let was_active = self.catalog.active_index == Some(index);
+        if self.set_entry_color_tag(index, tag) {
+            self.sync_window_state(tx);
+            if was_active {
+                self.advance_if_auto_tx(tx);
+            }
+        }
+    }
+
+    pub fn set_active_color_tag_tx(&mut self, tag: ColorTag, tx: &mut Tx) {
+        if let Some(idx) = self.catalog.active_index {
+            self.set_entry_color_tag_tx(idx, tag, tx);
+        }
+    }
+
     pub fn set_entry_rating_tx(&mut self, index: usize, rating: u8, tx: &mut Tx) {
+        let was_active = self.catalog.active_index == Some(index);
         if self.catalog.set_rating(index, rating) {
             if !self.demo_mode {
-                let _ = self.catalog.save_entry_sidecar(index);
+                let _ = self.catalog.save_entry_sidecar_mut(index);
             }
             let stars = if rating == 0 {
                 "Cleared rating".to_owned()
@@ -1259,7 +4638,11 @@ impl AppState {
                 format!("Rated {rating}★")
             };
             self.status_message = Some(stars.clone());
+            self.sync_window_state(tx);
             tx.announce(stars, LiveRegion::Polite);
+            if was_active {
+                self.advance_if_auto_tx(tx);
+            }
         }
     }
 
@@ -1271,8 +4654,10 @@ impl AppState {
 
     pub fn toggle_active_flag_tx(&mut self, flag: CullFlag, tx: &mut Tx) {
         if let Some(next_flag) = self.catalog.toggle_active_flag(flag) {
-            if !self.demo_mode {
-                let _ = self.catalog.save_active_sidecar();
+            if !self.demo_mode
+                && let Some(idx) = self.catalog.active_index
+            {
+                let _ = self.catalog.save_entry_sidecar_mut(idx);
             }
             let msg = match next_flag {
                 CullFlag::Pick => "Flagged as Pick",
@@ -1280,7 +4665,9 @@ impl AppState {
                 CullFlag::None => "Cleared culling flag",
             };
             self.status_message = Some(msg.to_owned());
+            self.sync_window_state(tx);
             tx.announce(msg, LiveRegion::Polite);
+            self.advance_if_auto_tx(tx);
         }
     }
 
@@ -1334,7 +4721,9 @@ impl AppState {
         }
     }
 
-    /// Prefetches adjacent catalog images on a background thread for instant `←`/`→` switching.
+    /// Prefetches adjacent catalog images on a background thread for instant `←`/`→` switching,
+    /// bounding cached full-resolution images to `MAX_PREFETCH_CACHE_ENTRIES` and deduplicating
+    /// in-flight decodes across rapid key repeats.
     fn spawn_prefetch_neighbors(&self) {
         if self.demo_mode {
             return;
@@ -1343,24 +4732,70 @@ impl AppState {
         if neighbors.is_empty() {
             return;
         }
+        let mut to_fetch = Vec::new();
+        for path in &neighbors {
+            let already_cached = self
+                .prefetch_cache
+                .lock()
+                .map(|c| c.contains_key(path))
+                .unwrap_or(true);
+            if already_cached {
+                continue;
+            }
+            let claimed = self
+                .prefetch_in_flight
+                .lock()
+                .map(|mut set| set.insert(path.clone()))
+                .unwrap_or(false);
+            if claimed {
+                to_fetch.push(path.clone());
+            }
+        }
+        if to_fetch.is_empty() {
+            return;
+        }
+
         let cache = Arc::clone(&self.prefetch_cache);
+        let in_flight = Arc::clone(&self.prefetch_in_flight);
         std::thread::spawn(move || {
-            for path in neighbors {
-                let already = cache.lock().map(|c| c.contains_key(&path)).unwrap_or(true);
-                if already {
-                    continue;
-                }
-                if let Ok(img) = load_file(&path)
+            for path in to_fetch {
+                let decoded = load_file(&path);
+                if let Ok(img) = decoded
                     && let Ok(mut guard) = cache.lock()
                 {
-                    if guard.len() > 8 {
-                        guard.clear();
-                    }
-                    guard.insert(path, Arc::new(img));
+                    insert_prefetch_bounded(&mut guard, path.clone(), Arc::new(img), &neighbors);
+                }
+                if let Ok(mut set) = in_flight.lock() {
+                    set.remove(&path);
                 }
             }
         });
     }
+}
+
+/// Inserts `img` into `cache`, evicting stale non-neighbor entries so at most
+/// `MAX_PREFETCH_CACHE_ENTRIES` full-resolution linear buffers stay resident.
+pub(crate) fn insert_prefetch_bounded(
+    cache: &mut HashMap<PathBuf, Arc<LinearImage>>,
+    path: PathBuf,
+    img: Arc<LinearImage>,
+    keep_paths: &[PathBuf],
+) {
+    if !cache.contains_key(&path) {
+        while cache.len() >= MAX_PREFETCH_CACHE_ENTRIES {
+            let victim = cache
+                .keys()
+                .find(|k| !keep_paths.contains(*k))
+                .or_else(|| cache.keys().next())
+                .cloned();
+            if let Some(k) = victim {
+                cache.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+    cache.insert(path, img);
 }
 
 fn thumbnail_to_pixels(thumb: ThumbnailRgba8) -> Pixels {
@@ -1420,34 +4855,72 @@ fn build_demo_session(
             .unwrap_or_default()
     };
 
-    let frames: [(&str, &str, u8, CullFlag); 5] = [
-        ("Editorial_Portrait.jpg", "neutral", 5, CullFlag::Pick),
-        ("Morning_Coffee_Warm.jpg", "warm_film", 4, CullFlag::Pick),
+    let frames: [(&str, &str, u8, CullFlag, ColorTag, &str, &str); 5] = [
+        (
+            "Editorial_Portrait.jpg",
+            "neutral",
+            5,
+            CullFlag::Pick,
+            ColorTag::Green,
+            "Leica Q3",
+            "Summilux 28mm f/1.7",
+        ),
+        (
+            "Morning_Coffee_Warm.jpg",
+            "warm_film",
+            4,
+            CullFlag::Pick,
+            ColorTag::Orange,
+            "Leica Q3",
+            "Summilux 28mm f/1.7",
+        ),
         (
             "Classic_Chrome_Film.jpg",
             "classic_chrome",
             4,
             CullFlag::None,
+            ColorTag::Blue,
+            "Fujifilm GFX100 II",
+            "GF 55mm f/1.7",
         ),
-        ("Editorial_Mono.jpg", "editorial_bw", 3, CullFlag::None),
-        ("Soft_Dusk_Tone.jpg", "moody_dusk", 2, CullFlag::Reject),
+        (
+            "Editorial_Mono.jpg",
+            "editorial_bw",
+            3,
+            CullFlag::None,
+            ColorTag::Purple,
+            "Leica M11 Monochrom",
+            "APO-Summicron 50mm",
+        ),
+        (
+            "Soft_Dusk_Tone.jpg",
+            "moody_dusk",
+            2,
+            CullFlag::Reject,
+            ColorTag::Red,
+            "Sony A7R V",
+            "FE 35mm f/1.4 GM",
+        ),
     ];
 
     let mut entries = Vec::with_capacity(frames.len());
     let mut thumbs = HashMap::with_capacity(frames.len());
-    for (name, preset_id, rating, flag) in frames {
+    for (name, preset_id, rating, flag, color_tag, cam, lens) in frames {
         let path = PathBuf::from(format!("demo/{name}"));
         let recipe = find_recipe(preset_id);
-        let px = render_graded_demo_pixels(image, &recipe, 180);
+        let px = render_graded_demo_pixels(image, &recipe, 240);
         thumbs.insert(path.clone(), px);
-        entries.push(SessionEntry {
-            path,
-            meta: PhotoMeta {
-                rating,
-                flag,
-                recipe,
-            },
-        });
+        let meta = PhotoMeta {
+            rating,
+            flag,
+            color_tag,
+            recipe,
+            ..PhotoMeta::default()
+        };
+        let mut entry = SessionEntry::new(path, meta);
+        entry.camera_label = Some(cam.to_owned());
+        entry.lens_label = Some(lens.to_owned());
+        entries.push(entry);
     }
 
     let catalog = SessionCatalog {
@@ -1455,6 +4928,8 @@ fn build_demo_session(
         entries,
         active_index: Some(0),
         filter: CullFilter::All,
+        color_tag_filter: None,
+        search_query: String::new(),
         clipboard: None,
     };
 
@@ -1496,10 +4971,51 @@ mod tests {
         assert!(!s.history.can_undo());
         assert!(s.speed_edit_snapshot.is_some());
 
-        // Extreme scrub clamps safely to +/-4.0 EV without NaN/Inf.
+        // Extreme scrub clamps safely to registry +/-5.0 EV without NaN/Inf.
         s.scrub_speed_edit(100.0);
-        assert_eq!(s.recipe.exposure, 4.0);
+        assert_eq!(s.recipe.exposure, 5.0);
+        s.scrub_speed_edit(-100.0);
+        assert_eq!(s.recipe.exposure, -5.0);
         assert!(!s.scrub_speed_edit(f32::NAN));
+    }
+
+    #[test]
+    fn apply_preset_preserves_geometry() {
+        let mut s = AppState::default();
+        s.recipe.geometry.crop = [0.1, 0.15, 0.75, 0.7];
+        s.recipe.geometry.straighten_deg = 3.25;
+        s.recipe.geometry.rotate_90 = 1;
+        s.recipe.geometry.flip_h = true;
+        s.recipe.geometry.aspect_preset = CropAspect::FourFive;
+        let expected_geo = s.recipe.geometry;
+
+        s.apply_preset("warm_film");
+
+        assert_eq!(s.recipe.geometry, expected_geo);
+        assert_eq!(s.recipe.preset_name.as_deref(), Some("Warm Film"));
+        assert!(s.recipe.temperature > 0.0);
+    }
+
+    #[test]
+    fn exposure_bounds_match_core_registry() {
+        let spec = rune_editor_core::find_scalar_param("exposure")
+            .expect("exposure must be registered in SCALAR_PARAMS");
+        assert_eq!(exposure_bounds(), (spec.min, spec.max));
+        assert_eq!(exposure_bounds(), (-5.0, 5.0));
+    }
+
+    #[test]
+    fn prefetch_cache_is_bounded_to_two_entries() {
+        let mut cache: HashMap<PathBuf, Arc<LinearImage>> = HashMap::new();
+        let img = Arc::new(generate_demo_hdr_scene(16, 16));
+        let keep = vec![PathBuf::from("d.arw"), PathBuf::from("e.arw")];
+        for name in ["a.arw", "b.arw", "c.arw", "d.arw", "e.arw"] {
+            insert_prefetch_bounded(&mut cache, PathBuf::from(name), Arc::clone(&img), &keep);
+            assert!(cache.len() <= MAX_PREFETCH_CACHE_ENTRIES);
+        }
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&PathBuf::from("d.arw")));
+        assert!(cache.contains_key(&PathBuf::from("e.arw")));
     }
 
     #[test]
@@ -1541,5 +5057,592 @@ mod tests {
             .geometry
             .cropped_output_size(s.image.width, s.image.height);
         assert!((out_w as i32 - out_h as i32).abs() <= 2);
+    }
+
+    #[test]
+    fn all_gui_scalar_bounds_match_core_registry() {
+        let gui_ids = [
+            "exposure",
+            "contrast",
+            "brightness",
+            "highlights",
+            "shadows",
+            "whites",
+            "blacks",
+            "temperature",
+            "tint",
+            "vibrance",
+            "saturation",
+            "clarity",
+            "structure",
+            "dehaze",
+            "sharpen",
+            "sharpen_radius",
+            "sharpen_threshold",
+            "sharpen_halo",
+            "noise_reduction",
+            "nr_color",
+            "vignette",
+            "grain",
+            "grain_size",
+        ];
+        assert_eq!(gui_ids.len(), rune_editor_core::SCALAR_PARAMS.len());
+        for id in gui_ids {
+            let spec = find_scalar_param(id)
+                .unwrap_or_else(|| panic!("missing `{id}` in core SCALAR_PARAMS"));
+            assert_eq!(scalar_bounds(id), (spec.min, spec.max));
+            assert_eq!(scalar_range(id), spec.min..=spec.max);
+            assert_eq!(scalar_default(id), spec.default);
+        }
+    }
+
+    #[test]
+    fn phase1_state_mutations_record_undo_and_sync_mcp_snapshot() {
+        let mut s = AppState::default();
+        s.recipe.preset_name = Some("Warm Film".to_owned());
+
+        // Film curve
+        s.set_film_curve(FilmCurve::FilmExtraShadow);
+        assert_eq!(s.recipe.film_curve, FilmCurve::FilmExtraShadow);
+        assert!(s.recipe.preset_name.is_none());
+        assert!(s.history.can_undo());
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.film_curve,
+            FilmCurve::FilmExtraShadow
+        );
+
+        // WB Preset
+        s.apply_wb_preset(WbPreset::Cloudy);
+        assert_eq!(s.recipe.wb_preset, WbPreset::Cloudy);
+        assert!(temperature_to_kelvin(s.recipe.temperature) >= 6400);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.wb_preset,
+            WbPreset::Cloudy
+        );
+
+        // Clarity method
+        s.set_clarity_method(ClarityMethod::Punch);
+        assert_eq!(s.recipe.clarity_method, ClarityMethod::Punch);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.clarity_method,
+            ClarityMethod::Punch
+        );
+
+        // Grain type
+        s.set_grain_type(GrainType::SilverRich);
+        assert_eq!(s.recipe.grain_type, GrainType::SilverRich);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.grain_type,
+            GrainType::SilverRich
+        );
+
+        // Undo unwinds each change cleanly and updates MCP snapshot
+        s.undo();
+        assert_eq!(s.recipe.grain_type, GrainType::Fine);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.grain_type,
+            GrainType::Fine
+        );
+        s.undo();
+        assert_eq!(s.recipe.clarity_method, ClarityMethod::Natural);
+        s.undo();
+        assert_eq!(s.recipe.wb_preset, WbPreset::AsShot);
+        s.undo();
+        assert_eq!(s.recipe.film_curve, FilmCurve::FilmStandard);
+    }
+
+    #[test]
+    fn five_tab_tone_curve_and_per_channel_levels_helpers() {
+        assert_eq!(CurveChannel::ALL.len(), 5);
+        assert_eq!(CurveChannel::ALL[0], CurveChannel::Rgb);
+
+        let mut curves = ToneCurves::default();
+        CurveChannel::Rgb
+            .points_mut(&mut curves)
+            .insert(1, [0.5, 0.62]);
+        assert_eq!(curves.rgb.len(), 3);
+        assert_eq!(CurveChannel::Rgb.points(&curves).len(), 3);
+
+        let probe = CursorColorReadout {
+            rgb8: [200, 120, 40],
+            hsl: [30.0, 67.0, 47.0],
+            lab: [58.0, 24.0, 52.0],
+        };
+        for ch in CurveChannel::ALL {
+            let t = ch.probe_tone(&probe);
+            assert!((0.0..=1.0).contains(&t));
+        }
+        assert!(CurveChannel::Red.probe_tone(&probe) > CurveChannel::Blue.probe_tone(&probe));
+
+        let mut lv = LevelsParams::default();
+        assert!(!LevelsChannel::Red.is_modified(&lv));
+        LevelsChannel::Red.set_in_black(&mut lv, 0.12);
+        LevelsChannel::Red.set_in_mid(&mut lv, 0.25);
+        LevelsChannel::Red.set_in_white(&mut lv, 0.90);
+        assert!(LevelsChannel::Red.is_modified(&lv));
+        assert!(!LevelsChannel::Green.is_modified(&lv));
+        assert!(!LevelsChannel::Rgb.is_modified(&lv));
+        lv.red = ChannelLevels::default();
+        assert!(!LevelsChannel::Red.is_modified(&lv));
+    }
+
+    #[test]
+    fn phase2_descriptor_bounds_match_core_registry() {
+        let phase2_ids = [
+            "advanced_color.0.hue_range",
+            "advanced_color.0.sat_range",
+            "advanced_color.0.smoothness",
+            "advanced_color.0.uniformity",
+            "advanced_color.0.hue_shift",
+            "advanced_color.0.saturation",
+            "advanced_color.0.lightness",
+            "skin_tone.smoothness",
+            "skin_tone.uniformity_hue",
+            "skin_tone.uniformity_sat",
+            "skin_tone.uniformity_lightness",
+            "skin_tone.amount_hue",
+            "skin_tone.amount_sat",
+            "skin_tone.amount_lightness",
+            "lens.distortion",
+            "lens.chromatic_aberration",
+            "lens.purple_fringing",
+            "lens.light_falloff",
+            "geometry.keystone_vertical",
+            "geometry.keystone_horizontal",
+            "geometry.keystone_aspect",
+            "geometry.keystone_amount",
+        ];
+        let descriptors = all_param_descriptors();
+        for id in phase2_ids {
+            let desc = descriptors
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("missing `{id}` in core param descriptors"));
+            assert_eq!(
+                descriptor_bounds(id),
+                (desc.min.unwrap(), desc.max.unwrap())
+            );
+            assert_eq!(descriptor_range(id), desc.min.unwrap()..=desc.max.unwrap());
+            let expected_def = desc
+                .default
+                .as_ref()
+                .and_then(|v| v.as_f64())
+                .expect("descriptor default must be numeric") as f32;
+            assert!((descriptor_default(id) - expected_def).abs() < 1e-5);
+        }
+        assert!((descriptor_default("geometry.keystone_amount") - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn phase2_pickers_vignette_method_undo_and_mcp_sync() {
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+        s.recipe.preset_name = Some("Warm Film".to_owned());
+
+        // Vignette method records undo & syncs MCP snapshot
+        s.set_vignette_method(VignetteMethod::CircularOnCrop);
+        assert_eq!(s.recipe.vignette_method, VignetteMethod::CircularOnCrop);
+        assert!(s.recipe.preset_name.is_none());
+        assert!(s.history.can_undo());
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.vignette_method,
+            VignetteMethod::CircularOnCrop
+        );
+
+        // Pick Advanced Color Slice from photo center
+        s.selected_color_slice = 1;
+        s.color_slice_picker_active = true;
+        assert!(s.pick_color_slice_at_viewport(400.0, 300.0));
+        assert!(!s.color_slice_picker_active);
+        assert!(s.recipe.advanced_color[1].enabled);
+        assert!(s.mcp_shared_canvas.lock().unwrap().recipe.advanced_color[1].enabled);
+
+        // Pick Skin Tone from photo center
+        s.skin_picker_active = true;
+        assert!(s.pick_skin_tone_at_viewport(400.0, 300.0));
+        assert!(!s.skin_picker_active);
+        assert!(s.recipe.skin_tone.enabled);
+        assert!(s.mcp_shared_canvas.lock().unwrap().recipe.skin_tone.enabled);
+
+        // View Selected Color Range tracks slice switches and clears on mode/tab change
+        s.set_active_tab(InspectorTab::Color);
+        s.set_color_editor_mode(ColorEditorMode::Advanced);
+        s.toggle_view_color_range(1);
+        assert_eq!(s.camera.view_color_range, 1);
+        s.set_selected_color_slice(2);
+        assert_eq!(s.camera.view_color_range, 2);
+        s.set_color_editor_mode(ColorEditorMode::Basic);
+        assert_eq!(s.camera.view_color_range, -1);
+
+        s.set_color_editor_mode(ColorEditorMode::SkinTone);
+        s.toggle_view_color_range(4);
+        assert_eq!(s.camera.view_color_range, 4);
+        s.set_active_tab(InspectorTab::Light);
+        assert_eq!(s.camera.view_color_range, -1);
+
+        // Undo unwinds Skin Tone -> Color Slice -> Vignette Method cleanly
+        s.undo();
+        assert!(!s.recipe.skin_tone.enabled);
+        s.undo();
+        assert!(!s.recipe.advanced_color[1].enabled);
+        s.undo();
+        assert_eq!(s.recipe.vignette_method, VignetteMethod::EllipticOnCrop);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.vignette_method,
+            VignetteMethod::EllipticOnCrop
+        );
+
+        // Eyedroppers respect Stage 1..=8 WB/Exposure grade and lens distortion UV warp
+        s.recipe.exposure = 1.25;
+        s.recipe.temperature = -0.45;
+        s.recompute_histogram();
+        assert!(s.pick_skin_tone_at_viewport(400.0, 300.0));
+        let shifted_hue = s.recipe.skin_tone.target_hue;
+        let shifted_lum = s.recipe.skin_tone.target_lightness;
+
+        s.recipe.exposure = 0.0;
+        s.recipe.temperature = 0.0;
+        s.recompute_histogram();
+        assert!(s.pick_skin_tone_at_viewport(400.0, 300.0));
+        assert!(
+            (shifted_hue - s.recipe.skin_tone.target_hue).abs() > 1.0
+                || (shifted_lum - s.recipe.skin_tone.target_lightness).abs() > 0.05
+        );
+
+        // Lens distortion shifts off-center viewport UV mapping
+        let uv_flat = s.viewport_local_to_source_uv(280.0, 180.0).unwrap();
+        s.recipe.lens.distortion = -0.45;
+        let uv_distorted = s.viewport_local_to_source_uv(280.0, 180.0).unwrap();
+        assert!(
+            (uv_flat[0] - uv_distorted[0]).abs() > 1e-3
+                || (uv_flat[1] - uv_distorted[1]).abs() > 1e-3
+        );
+    }
+
+    #[test]
+    fn phase3_color_tags_variants_compare_and_auto_advance() {
+        let mut s = AppState::default();
+
+        // Color tag assignment + faceted filtering + live MCP snapshot sync
+        assert!(s.set_entry_color_tag(0, ColorTag::Pink));
+        assert_eq!(s.catalog.entries[0].effective_color_tag(), ColorTag::Pink);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().color_tag,
+            ColorTag::Pink
+        );
+        s.catalog.set_color_tag_filter(Some(ColorTag::Pink));
+        assert_eq!(s.catalog.filtered_indices(), vec![0]);
+        s.catalog.set_color_tag_filter(None);
+
+        // Virtual variants: new, clone, select, delete keep saved_recipe & color_tag synced
+        s.recipe.exposure = 0.75;
+        let v2 = s.clone_variant(Some("Warm Study".to_owned()));
+        assert_eq!(v2, 1);
+        assert_eq!(s.active_variant_count(), 2);
+        assert!((s.recipe.exposure - 0.75).abs() < 1e-5);
+        assert!(!s.is_dirty());
+        assert_eq!(s.catalog.entries[0].effective_color_tag(), ColorTag::Pink);
+        s.recipe.exposure = -0.5;
+        assert!(s.is_dirty());
+        let v3 = s.new_variant(Some("Fresh Neutral".to_owned()));
+        assert_eq!(v3, 2);
+        assert_eq!(s.recipe.exposure, 0.0);
+        assert!(!s.is_dirty());
+        assert_eq!(s.catalog.entries[0].effective_color_tag(), ColorTag::None);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().color_tag,
+            ColorTag::None
+        );
+        assert!(s.select_variant(1));
+        assert!((s.recipe.exposure - (-0.5)).abs() < 1e-5);
+        assert!(!s.is_dirty());
+        assert_eq!(s.catalog.entries[0].effective_color_tag(), ColorTag::Pink);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().color_tag,
+            ColorTag::Pink
+        );
+
+        // Compare Variant pins reference frame
+        s.pin_compare_variant();
+        let cmp = s
+            .compare_reference
+            .as_ref()
+            .expect("compare reference pinned");
+        assert_eq!(cmp.variant_tag, "V2");
+        assert!(s.delete_active_variant());
+        assert_eq!(s.active_variant_count(), 2);
+    }
+
+    #[test]
+    fn phase3_selective_clipboard_stacked_styles_loupe_and_readouts() {
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+
+        // Selective Adjustments Clipboard + Autoselect Adjusted
+        s.recipe.temperature = 0.25;
+        s.recipe.exposure = 0.65;
+        s.recipe.clarity = 0.30;
+        s.autoselect_adjusted_groups();
+        assert!(s.clipboard_groups.contains("wb"));
+        assert!(s.clipboard_groups.contains("tone"));
+        assert!(s.clipboard_groups.contains("detail"));
+
+        s.catalog.copy_adjustments(&s.recipe);
+        s.recipe = DevelopRecipe::default();
+        s.clipboard_groups.clear();
+        s.clipboard_groups.insert("wb".to_owned());
+        assert!(s.paste_selected_adjustments());
+        assert!((s.recipe.temperature - 0.25).abs() < 1e-5);
+        assert_eq!(s.recipe.exposure, 0.0);
+        assert!(s.history.can_undo());
+
+        // Stacked Style preserves geometry and blends additively
+        s.recipe.geometry.crop = [0.1, 0.1, 0.8, 0.8];
+        s.stack_styles = true;
+        s.style_strength = 0.5;
+        s.apply_preset("warm_film");
+        assert_eq!(s.recipe.geometry.crop, [0.1, 0.1, 0.8, 0.8]);
+
+        // Loupe camera UV & Pinned Color Readouts (#1..#4)
+        s.camera.loupe_enabled = true;
+        s.update_loupe_uv(600.0, 300.0);
+        assert!((s.camera.loupe_uv[0] - 0.75).abs() < 1e-5);
+        assert!((s.camera.loupe_uv[1] - 0.5).abs() < 1e-5);
+
+        for i in 0..5 {
+            assert!(s.pin_color_readout_at_viewport(360.0 + i as f32 * 10.0, 300.0));
+        }
+        assert_eq!(s.pinned_readouts.len(), MAX_PINNED_READOUTS);
+        let live = s.evaluate_pinned_readout(&s.pinned_readouts[0]);
+        assert!(live.lab[0].is_finite());
+
+        // Naming template preview expansion
+        let spec = &s.export_recipes[0];
+        let preview = s.preview_export_filename(spec);
+        assert!(preview.ends_with(".jpg"));
+        assert!(preview.contains("Editorial_Portrait"));
+    }
+
+    #[test]
+    fn phase4_layers_masks_ai_subject_heal_undo_and_mcp_sync() {
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+
+        // Add Linear Gradient layer -> updates active_layer_index, camera, history & MCP snapshot
+        let l0 = s
+            .add_layer_with_shape(
+                "Sky Grade".to_owned(),
+                Some(MaskShape::LinearGradient {
+                    start: [0.5, 0.1],
+                    end: [0.5, 0.6],
+                    feather: 0.7,
+                }),
+            )
+            .expect("layer 0 added");
+        assert_eq!(l0, 0);
+        assert_eq!(s.active_layer_index, Some(0));
+        assert_eq!(s.camera.active_layer_index, 0);
+        assert!(s.history.can_undo());
+        assert_eq!(s.mcp_shared_canvas.lock().unwrap().recipe.layers.len(), 1);
+
+        // Combine Masks: add Radial mask and switch combine op to Subtract
+        assert!(s.add_mask_to_active_layer(MaskShape::RadialGradient {
+            center: [0.5, 0.45],
+            radius: [0.25, 0.30],
+            angle_deg: 0.0,
+            feather: 0.4,
+        }));
+        assert_eq!(s.recipe.layers[0].masks.len(), 2);
+        assert!(s.set_layer_mask_op(0, 1, MaskCombineOp::Subtract));
+        assert_eq!(s.recipe.layers[0].masks[1].op, MaskCombineOp::Subtract);
+
+        // Mask overlay shortcuts (M -> Red, ⌥M -> Grayscale, ⌥M -> Off) & Invert
+        s.toggle_red_mask_overlay();
+        assert_eq!(s.camera.mask_overlay_mode, 1);
+        s.toggle_gray_mask_overlay();
+        assert_eq!(s.camera.mask_overlay_mode, 2);
+        s.toggle_gray_mask_overlay();
+        assert_eq!(s.camera.mask_overlay_mode, 0);
+        assert!(s.toggle_active_layer_invert());
+        assert!(s.recipe.layers[0].inverted);
+
+        // AI Subject mask generation adds a valid 256×256 RasterMask layer
+        let l1 = s
+            .add_ai_subject_layer(false)
+            .expect("AI subject layer added");
+        assert_eq!(l1, 1);
+        assert!(matches!(
+            s.recipe.layers[1].masks[0].shape,
+            MaskShape::RasterMask {
+                width: 256,
+                height: 256,
+                ..
+            }
+        ));
+        assert_eq!(s.mcp_shared_canvas.lock().unwrap().recipe.layers.len(), 2);
+
+        // Spot Heal & Clone creation + MCP sync + undo
+        let h0 = s
+            .add_heal_spot([0.45, 0.35], None, HealMode::Heal)
+            .expect("heal spot added");
+        assert_eq!(h0, 0);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.heal_spots.len(),
+            1
+        );
+        s.undo();
+        assert!(s.recipe.heal_spots.is_empty());
+        assert!(
+            s.mcp_shared_canvas
+                .lock()
+                .unwrap()
+                .recipe
+                .heal_spots
+                .is_empty()
+        );
+
+        // Layer deletion keeps active_layer_index & camera valid
+        assert!(s.remove_layer(1));
+        assert_eq!(s.active_layer_index, Some(0));
+        assert_eq!(s.camera.active_layer_index, 0);
+        assert!(s.remove_layer(0));
+        assert_eq!(s.active_layer_index, None);
+        assert_eq!(s.camera.active_layer_index, -1);
+
+        // Vector guide projection roundtrip parity under combined rotation (incl. negative turns) + flip
+        for &(rot, fh, fv) in &[
+            (1i8, true, false),
+            (3i8, false, true),
+            (-1i8, true, false),
+            (2i8, true, true),
+        ] {
+            s.recipe.geometry.rotate_90 = rot;
+            s.recipe.geometry.flip_h = fh;
+            s.recipe.geometry.flip_v = fv;
+            let [su, sv] = s.recipe.geometry.oriented_to_source_uv_unclamped(
+                0.28,
+                0.37,
+                s.image.width,
+                s.image.height,
+            );
+            let [lx, ly] = s.source_uv_to_viewport_local([su, sv], 800.0, 600.0);
+            let [rt_su, rt_sv] = s
+                .viewport_local_to_source_uv(lx, ly)
+                .expect("projected guide point must map back inside photo");
+            assert!(
+                (rt_su - su).abs() < 1e-3 && (rt_sv - sv).abs() < 1e-3,
+                "roundtrip mismatch for rot={rot}, fh={fh}, fv={fv}: got ({rt_su},{rt_sv}) vs ({su},{sv})"
+            );
+        }
+
+        // Brush dab cap is enforced in begin_canvas_tool_drag as well as update_canvas_tool_drag
+        s.recipe.geometry = rune_editor_core::GeometryParams::default();
+        s.add_layer_with_shape(
+            "Brush Cap".to_owned(),
+            Some(MaskShape::BrushStrokes {
+                strokes: vec![BrushDab::default(); MAX_BRUSH_DABS_PER_MASK],
+            }),
+        );
+        s.set_canvas_tool(CanvasTool::Brush);
+        s.begin_canvas_tool_drag(400.0, 300.0);
+        if let MaskShape::BrushStrokes { strokes } = &s.recipe.layers[0].masks[0].shape {
+            assert_eq!(strokes.len(), MAX_BRUSH_DABS_PER_MASK);
+        } else {
+            panic!("expected BrushStrokes mask");
+        }
+    }
+
+    #[test]
+    fn phase5_film_negative_proof_margin_hot_folder_and_shortcuts() {
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+
+        // Film Negative mode + base picker + undo + MCP snapshot sync
+        s.set_processing_mode(ProcessingMode::FilmNegative);
+        assert_eq!(s.recipe.processing_mode, ProcessingMode::FilmNegative);
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.processing_mode,
+            ProcessingMode::FilmNegative
+        );
+        assert!(s.history.can_undo());
+
+        s.film_base_picker_active = true;
+        assert!(s.pick_film_base_at_viewport(400.0, 300.0));
+        assert!(!s.film_base_picker_active);
+        assert_eq!(s.recipe.processing_mode, ProcessingMode::FilmNegative);
+        assert!(s.recipe.film_negative.base_r >= 0.05);
+        s.undo();
+        assert_eq!(s.recipe.film_negative, FilmNegativeParams::default());
+
+        // Proof Margin cycling (Compact -> Studio -> Exhibition -> Compact)
+        s.proof_margin = ProofMargin::Compact;
+        s.cycle_proof_margin();
+        assert_eq!(s.proof_margin, ProofMargin::Studio);
+        s.cycle_proof_margin();
+        assert_eq!(s.proof_margin, ProofMargin::Exhibition);
+        s.cycle_proof_margin();
+        assert_eq!(s.proof_margin, ProofMargin::Compact);
+
+        // Hot Folder watcher initialization & polling on a temp directory
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rune_darkroom_p5_hotfolder_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        assert!(s.start_hot_folder_watch(tmp_dir.clone()).is_ok());
+        assert_eq!(s.hot_folder_dir.as_deref(), Some(tmp_dir.as_path()));
+        assert_eq!(s.poll_hot_folder(), 0);
+        s.stop_hot_folder_watch();
+        assert!(s.hot_folder_watcher.is_none());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // Custom Shortcut persistence & backward-compatible settings.json roundtrip
+        let mut persisted = PersistedAppSettings::default();
+        persisted.mcp.enabled = true;
+        persisted.mcp.port = 37421;
+        persisted.proof_margin = ProofMargin::Exhibition;
+        persisted.hot_folder_style = Some("warm_film".to_owned());
+        assert!(
+            persisted
+                .shortcuts
+                .set_key(ShortcutAction::Loupe, "z")
+                .is_ok()
+        );
+        assert!(
+            persisted
+                .shortcuts
+                .set_key(ShortcutAction::Brush, "3")
+                .is_err()
+        );
+
+        let json = persisted.to_json_pretty();
+        let reloaded = PersistedAppSettings::from_json_str(&json, persisted.mcp.clone());
+        assert_eq!(reloaded.proof_margin, ProofMargin::Exhibition);
+        assert_eq!(reloaded.hot_folder_style.as_deref(), Some("warm_film"));
+        assert_eq!(reloaded.shortcuts.key_for(ShortcutAction::Loupe), "z");
+        assert!(reloaded.shortcuts.is_customized(ShortcutAction::Loupe));
+
+        // Legacy settings.json (McpSettings only) loads cleanly with defaults
+        let legacy = r#"{"enabled": true, "port": 37420, "allow_live_canvas_edits": false}"#;
+        let from_legacy = PersistedAppSettings::from_json_str(legacy, McpSettings::default());
+        assert_eq!(from_legacy.proof_margin, ProofMargin::Compact);
+        assert!(!from_legacy.shortcuts.is_any_customized());
+
+        // Reset defaults clears overrides
+        let mut sc = persisted.shortcuts;
+        sc.reset_defaults();
+        assert!(!sc.is_any_customized());
+        assert_eq!(sc.key_for(ShortcutAction::Loupe), "o");
     }
 }

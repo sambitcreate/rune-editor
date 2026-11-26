@@ -51,10 +51,10 @@ pub mod size {
 
     pub const TITLEBAR_H: f32 = 48.0;
     pub const STATUS_BAR_H: f32 = 28.0;
-    pub const INSPECTOR_W: f32 = 336.0;
-    pub const CARD_INNER_W: f32 = 288.0;
+    pub const INSPECTOR_W: f32 = 356.0;
+    pub const CARD_INNER_W: f32 = 308.0;
 
-    pub const HISTOGRAM_W: f32 = 292.0;
+    pub const HISTOGRAM_W: f32 = 312.0;
     pub const HISTOGRAM_H: f32 = 64.0;
     pub const PROBE_FOOTER_H: f32 = 16.0;
     pub const LEVELS_STRIP_H: f32 = 38.0;
@@ -69,6 +69,7 @@ pub mod size {
     pub const FLAG_BADGE: f32 = 16.0;
 
     pub const WHEEL_DIAMETER: f32 = 88.0;
+    pub const MASTER_WHEEL_DIAMETER: f32 = 148.0;
     pub const WHEEL_PUCK: f32 = 11.0;
     pub const WHEEL_CROSSHAIR_ARM: f32 = 5.0;
 
@@ -78,7 +79,16 @@ pub mod size {
     pub const CHANNEL_DOT: f32 = 6.0;
     pub const BAND_DOT: f32 = 8.0;
     pub const PROBE_SWATCH: f32 = 8.0;
+    pub const TARGET_SWATCH: f32 = 14.0;
+    pub const COLOR_TAG_DOT: f32 = 8.0;
+    pub const COLOR_TAG_BTN: f32 = 16.0;
+    pub const VARIANT_STRIP_H: f32 = 32.0;
+    pub const PIN_MARKER: f32 = 18.0;
+    pub const GRID_CARD_W: f32 = 216.0;
+    pub const GRID_PREVIEW_H: f32 = 132.0;
+    pub const EXPORT_CONTENT_MAX_W: f32 = 720.0;
 
+    pub const PILL_COMPACT_H: f32 = 22.0;
     pub const PILL_H: f32 = 24.0;
     pub const ASPECT_PILL_H: f32 = 26.0;
     pub const ACTION_PILL_H: f32 = 28.0;
@@ -90,6 +100,7 @@ pub mod size {
 
     pub const CURVE_PT: f32 = 8.0;
     pub const CURVE_PT_DRAG: f32 = 10.0;
+    pub const CURVE_PROBE_DOT: f32 = 6.0;
 
     pub const ICON_XS: f32 = 10.0;
     pub const ICON_SM: f32 = 11.0;
@@ -101,10 +112,17 @@ pub mod size {
 
     pub const DIALOG_ABOUT_W: f32 = 360.0;
     pub const DIALOG_CLOSE_W: f32 = 380.0;
+    pub const SETTINGS_SIDEBAR_W: f32 = 220.0;
+    pub const SETTINGS_CONTENT_MAX_W: f32 = 700.0;
+    pub const STATUS_DOT: f32 = 7.0;
 
     pub const HUD_BLUR: f32 = 12.0;
     pub const HUD_BLUR_STRONG: f32 = 14.0;
     pub const SCROLL_FADE: f32 = 14.0;
+
+    /// Phase 5 Capture One Proof Margin outer mat padding (points; adds to shader's ~14pt pad).
+    pub const PROOF_MARGIN_STUDIO: f32 = 34.0;
+    pub const PROOF_MARGIN_EXHIBITION: f32 = 70.0;
 }
 
 /// Border widths, focus rings, and vector stroke weights (points).
@@ -290,6 +308,139 @@ pub mod color {
     }
 
     #[inline]
+    pub fn levels_hist_stroke(k: &Kit) -> Color {
+        k.c.white.alpha(0.38)
+    }
+
+    /// Capture One-style active tool modified indicator dot.
+    #[inline]
+    pub fn tool_modified_dot(k: &Kit) -> Color {
+        k.c.text_accent
+    }
+
+    /// Capture One Pro warm-orange live cursor tonal indicator on the Tone Curve graph.
+    #[inline]
+    pub fn curve_tonal_indicator() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    #[inline]
+    pub fn curve_tonal_indicator_line() -> Color {
+        srgb(0.96, 0.56, 0.16).alpha(0.82)
+    }
+
+    /// Warm-amber bottom bar indicator on modified per-channel Levels & Color Editor tabs.
+    #[inline]
+    pub fn levels_modified_bar() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    /// Viewport diagnostic HUD accent when `View Selected Color Range` mask is active.
+    #[inline]
+    pub fn color_range_hud() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    /// Capture One Pro iconic warm-orange Compare Variant reference border (`#E87A2A`).
+    #[inline]
+    pub fn compare_reference_border() -> Color {
+        srgb(0.91, 0.48, 0.16)
+    }
+
+    #[inline]
+    pub fn compare_reference_bg() -> Color {
+        srgb(0.91, 0.48, 0.16).alpha(0.14)
+    }
+
+    /// High-contrast ring accent for pinned canvas Color Readout markers (`#1..#4`).
+    #[inline]
+    pub fn pin_marker_ring() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    /// Phase 4 Rubylith Red Mask Overlay HUD & active accent.
+    #[inline]
+    pub fn mask_overlay_red() -> Color {
+        srgb(0.94, 0.30, 0.30)
+    }
+
+    /// Phase 4 Grayscale Mask Overlay HUD accent.
+    #[inline]
+    pub fn mask_overlay_gray() -> Color {
+        srgb(0.84, 0.86, 0.90)
+    }
+
+    /// Capture One warm-orange primary vector guide stroke for Linear & Radial gradient masks.
+    #[inline]
+    pub fn mask_guide_primary() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    /// Softer feather boundary stroke for Linear & Radial gradient canvas guides.
+    #[inline]
+    pub fn mask_guide_feather() -> Color {
+        srgb(0.96, 0.56, 0.16).alpha(0.58)
+    }
+
+    /// Spot Heal target ring accent (warm orange).
+    #[inline]
+    pub fn heal_target_ring() -> Color {
+        srgb(0.96, 0.56, 0.16)
+    }
+
+    /// Clone Stamp target ring accent (cool cyan).
+    #[inline]
+    pub fn clone_target_ring() -> Color {
+        srgb(0.32, 0.78, 0.96)
+    }
+
+    /// Spot Heal / Clone source patch circle ring.
+    #[inline]
+    pub fn heal_source_ring() -> Color {
+        srgb(0.94, 0.95, 0.97).alpha(0.90)
+    }
+
+    /// Dashed connector stroke linking a Heal/Clone target to its source patch.
+    #[inline]
+    pub fn heal_connector_line() -> Color {
+        srgb(0.94, 0.95, 0.97).alpha(0.60)
+    }
+
+    /// Phase 5 Studio Proof Margin neutral gallery mat (`#161616`).
+    #[inline]
+    pub fn proof_margin_studio() -> Color {
+        srgb(0.086, 0.086, 0.086)
+    }
+
+    /// Phase 5 Exhibition Proof Margin gallery mat (`#1E1E1E`).
+    #[inline]
+    pub fn proof_margin_exhibition() -> Color {
+        srgb(0.118, 0.118, 0.118)
+    }
+
+    /// Phase 5 Film Negative C-41 amber HUD & badge accent.
+    #[inline]
+    pub fn film_negative_accent() -> Color {
+        srgb(0.95, 0.56, 0.24)
+    }
+
+    /// Converts a Capture One `ColorTag` to a linear `rune::Color` swatch.
+    #[inline]
+    pub fn color_tag_swatch(tag: rune_editor_core::ColorTag, k: &Kit) -> Color {
+        if tag == rune_editor_core::ColorTag::None {
+            return k.c.border_strong;
+        }
+        let [r, g, b] = tag.srgb_u8();
+        srgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+    }
+
+    /// Combined RGB Tone Curve channel stroke/dot accent.
+    #[inline]
+    pub fn channel_rgb() -> Color {
+        srgb(0.84, 0.86, 0.90)
+    }
+
+    #[inline]
     pub fn wheel_crosshair(k: &Kit) -> Color {
         k.c.white.alpha(0.28)
     }
@@ -388,5 +539,28 @@ pub mod color {
     #[inline]
     pub fn wheel_neutral_puck() -> Color {
         srgb(0.85, 0.85, 0.88)
+    }
+
+    /// Live MCP server running status dot & subtle badge tint.
+    #[inline]
+    pub fn mcp_running() -> Color {
+        srgb(0.28, 0.84, 0.48)
+    }
+
+    #[inline]
+    pub fn mcp_running_bg() -> Color {
+        srgb(0.28, 0.84, 0.48).alpha(0.14)
+    }
+
+    /// Stopped / offline muted status indicator.
+    #[inline]
+    pub fn mcp_stopped(k: &Kit) -> Color {
+        k.c.text_muted
+    }
+
+    /// Code block background surface inside Settings connect snippets.
+    #[inline]
+    pub fn code_surface(k: &Kit) -> Color {
+        k.c.bg_deep
     }
 }

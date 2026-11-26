@@ -8,7 +8,8 @@ use rune::{Color, Pixels};
 
 use crate::tokens;
 
-/// Returns a cached 160x160 anti-aliased Capture One-style color balance wheel texture.
+/// Returns a cached 288x288 anti-aliased Capture One-style color balance wheel texture
+/// (crisp at 2x Retina for both 3-Way 88pt wheels and the 148pt Master wheel).
 ///
 /// The wheel maps angle -> hue (0 deg = Red at +X, 120 deg = Green, 240 deg = Blue)
 /// and radius -> saturation with a neutral studio gray center, darkened smoothly so
@@ -16,7 +17,7 @@ use crate::tokens;
 pub fn wheel_pixels() -> &'static Pixels {
     static PIXELS: OnceLock<Pixels> = OnceLock::new();
     PIXELS.get_or_init(|| {
-        let size: u32 = 160;
+        let size: u32 = 288;
         let rgba = build_color_wheel_rgba(size);
         let px = Pixels::new();
         px.set(size, size, rgba);

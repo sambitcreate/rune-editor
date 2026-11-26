@@ -11,7 +11,7 @@ use rune_kit::{
 };
 use rune_theme_opencode::icons;
 
-use crate::menu::{trigger_export_dialog, trigger_open_dialog, trigger_open_folder};
+use crate::menu::{trigger_open_dialog, trigger_open_folder};
 use crate::state::AppState;
 use crate::tokens::{border, size, space, ty};
 
@@ -136,6 +136,45 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         .on_press_tx(|s: &mut AppState, tx| s.toggle_crop_mode_tx(tx))
         .build(k);
 
+    let mask_btn = IconButton::new(&icons::SELECT_ELEMENT)
+        .variant(if s.camera.mask_overlay_mode != 0 {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("Mask Overlay")
+        .help("Toggle Red Rubylith (M) or Grayscale (⌥M) layer mask overlay")
+        .shortcut("M")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_red_mask_overlay_tx(tx))
+        .build(k);
+
+    let loupe_btn = IconButton::new(&icons::MAGNIFYING_GLASS)
+        .variant(if s.camera.loupe_enabled {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("GPU Loupe Magnifier")
+        .help("Toggle 120Hz circular GPU Loupe magnifier")
+        .shortcut("O")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_loupe_tx(tx))
+        .build(k);
+
+    let grid_btn = IconButton::new(&icons::GRID_PLUS)
+        .variant(if s.show_grid_browser {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::Regular)
+        .label("Grid Browser")
+        .help("Toggle multi-column Grid Browser view")
+        .shortcut("G")
+        .on_press_tx(|s: &mut AppState, tx| s.toggle_grid_browser_tx(tx))
+        .build(k);
+
     let center = row()
         .key("toolbar-center")
         .items_center()
@@ -146,7 +185,10 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         .child(el_v_divider(k))
         .child(clip_btn)
         .child(focus_btn)
-        .child(crop_btn);
+        .child(mask_btn)
+        .child(crop_btn)
+        .child(loupe_btn)
+        .child(grid_btn);
 
     // Right cluster: Open / Folder / Undo / Redo / Filmstrip / Inspector / Export CTA
     let open_photo = IconButton::new(&icons::OPEN_FILE)
@@ -223,13 +265,33 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         })
         .build(k);
 
+    let mcp_running = s.is_mcp_running();
+    let settings_btn = Button::new(if mcp_running { "MCP On" } else { "Settings" })
+        .variant(if s.show_settings {
+            ButtonVariant::Contrast
+        } else {
+            ButtonVariant::Neutral
+        })
+        .control_size(ControlSize::Regular)
+        .icon(&icons::MCP)
+        .help("Open Settings & Local MCP Server controls (⌘,)")
+        .shortcut("cmd+,")
+        .on_press_tx(|s: &mut AppState, tx| {
+            let next = !s.show_settings;
+            s.set_show_settings_tx(next, tx);
+        })
+        .build(k);
+
     let export_btn = Button::new("Export")
         .variant(ButtonVariant::Contrast)
         .control_size(ControlSize::Regular)
         .icon(&icons::SHARE)
-        .help("Export full-resolution developed photo")
+        .help("Open Multi-Recipe Export view (⌘⇧E)")
         .shortcut("cmd+shift+e")
-        .on_press_tx(|s: &mut AppState, tx| trigger_export_dialog(s, tx))
+        .on_press_tx(|s: &mut AppState, tx| {
+            let next = !s.show_export;
+            s.set_show_export_tx(next, tx);
+        })
         .build(k);
 
     let right = row()
@@ -246,6 +308,7 @@ pub fn top_toolbar(s: &AppState, k: &Kit, insets: ChromeInsets) -> El {
         .child(filmstrip_btn)
         .child(inspector_btn)
         .child(el_v_divider(k))
+        .child(settings_btn)
         .child(export_btn);
 
     row()

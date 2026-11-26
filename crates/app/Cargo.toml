@@ -15,6 +15,7 @@ rune.workspace = true
 rune-editor-core.workspace = true
 rune-editor-decode.workspace = true
 rune-editor-engine.workspace = true
+rune-editor-mcp.workspace = true
 rune-kit.workspace = true
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "0d2cad27f83747120156c8406f6ecfd2a018bd39" }
 wgpu.workspace = true
