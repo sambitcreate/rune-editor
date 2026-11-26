@@ -9,6 +9,7 @@ pub mod exif;
 pub mod export;
 pub mod folder;
 pub mod raw;
+pub mod vision;
 
 use std::path::{Path, PathBuf};
 
@@ -16,12 +17,22 @@ use half::f16;
 use thiserror::Error;
 
 pub use exif::{PhotoExif, extract_exif_from_bytes, extract_exif_from_path, format_shutter_speed};
-pub use export::{ExportFormat, ExportOptions, export_image, export_image_with_options};
-pub use folder::{ThumbnailRgba8, generate_demo_thumbnail, load_thumbnail, scan_photo_folder};
+pub use export::{
+    ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, MultiRecipeExportItem,
+    NamingContext, TextWatermark, WatermarkPosition, builtin_export_recipes,
+    expand_naming_template, export_image, export_image_to_jpeg_vec, export_image_with_options,
+    export_multi_recipe, guard_not_source, linear_srgb_to_display_p3, plan_multi_recipe_paths,
+    sample_linear_rgb_at_uv, sample_raw_linear_rgb_at_uv, sanitize_filename_stem,
+};
+pub use folder::{
+    HotFolderWatcher, MAX_SCAN_DEPTH, ScanOptions, ThumbnailRgba8, extract_detail_luma_proxy,
+    generate_demo_thumbnail, load_thumbnail, scan_photo_folder, scan_photo_folder_with_options,
+};
 pub use raw::{
     RASTER_EXTENSIONS, RAW_EXTENSIONS, SUPPORTED_EXTENSIONS, is_raw_extension, is_supported_photo,
-    load_file_proxy,
+    load_file_proxy, probe_image_dimensions,
 };
+pub use vision::generate_subject_mask;
 
 /// Decoded linear `Rgba16Float` image buffer plus metadata and fast histogram proxy.
 #[derive(Clone, Debug)]
@@ -65,6 +76,16 @@ pub enum DecodeError {
     EmptyDimensions(u32, u32),
     #[error("Invalid image buffer: {0}")]
     InvalidBuffer(String),
+    #[error(
+        "Refusing to overwrite original source photo '{0}'. Export to a different path or directory."
+    )]
+    SourceOverwrite(PathBuf),
+    #[error("Invalid export path: {0}")]
+    InvalidPath(String),
+    #[error("Duplicate export destination '{0}'")]
+    DuplicateDestination(PathBuf),
+    #[error("Export destination already exists: '{0}' (enable overwrite to replace)")]
+    DestinationExists(PathBuf),
 }
 
 /// Decodes a photo file (Camera RAW, ProRAW, HEIC, JPEG, PNG, TIFF, WebP) from disk
@@ -811,6 +832,7 @@ mod tests {
                 max_edge: Some(60),
                 respect_crop: true,
                 output_sharpen: 0.0,
+                ..ExportOptions::default()
             },
         )
         .expect("export webp");
@@ -830,6 +852,7 @@ mod tests {
                 max_edge: None,
                 respect_crop: true,
                 output_sharpen: 0.0,
+                ..ExportOptions::default()
             },
         )
         .expect("export unsharp off");
@@ -842,6 +865,7 @@ mod tests {
                 max_edge: None,
                 respect_crop: true,
                 output_sharpen: 0.8,
+                ..ExportOptions::default()
             },
         )
         .expect("export unsharp on");
@@ -929,6 +953,7 @@ mod tests {
                 max_edge: None,
                 respect_crop: false,
                 output_sharpen: 0.0,
+                ..ExportOptions::default()
             },
         )
         .expect("export uncropped");
@@ -995,6 +1020,1068 @@ mod tests {
             .expect("export degenerate crop + straighten");
         let dec_straight = image::open(&straight_path).expect("open straight");
         assert!(dec_straight.width() >= 1 && dec_straight.height() >= 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spatial_detail_export_applies_nr_clarity_structure_and_sharpen() {
+        let dir = unique_temp_dir("spatial_detail");
+        let width = 48u32;
+        let height = 48u32;
+
+        // Synthetic linear scene:
+        // - Left half: dark-midtone (0.14) with checkerboard high-frequency chroma/luma noise.
+        // - Right half: brighter midtone (0.38) with fine alternating stripes.
+        let mut rgba16f = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let rgb = if x < width / 2 {
+                    let odd = (x + y) % 2 == 0;
+                    if odd {
+                        [0.18, 0.12, 0.12]
+                    } else {
+                        [0.10, 0.16, 0.16]
+                    }
+                } else {
+                    let stripe = if x % 2 == 0 { 0.42 } else { 0.34 };
+                    [stripe, stripe, stripe]
+                };
+                rgba16f.push(f16::from_f32(rgb[0]));
+                rgba16f.push(f16::from_f32(rgb[1]));
+                rgba16f.push(f16::from_f32(rgb[2]));
+                rgba16f.push(f16::ONE);
+            }
+        }
+        let img = LinearImage {
+            width,
+            height,
+            histogram_proxy: build_histogram_proxy(&rgba16f, width, height),
+            rgba16f,
+            display_name: "SpatialDetail.dng".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+        };
+
+        let export_rgb16 = |name: &str, recipe: &DevelopRecipe| {
+            let p = dir.join(name);
+            export_image(&img, recipe, &p, ExportFormat::Png16).expect("export png16");
+            image::open(&p).expect("open png16").to_rgb16()
+        };
+
+        let base = export_rgb16("base.png", &DevelopRecipe::default());
+
+        // 1. Noise Reduction reduces chroma/luma alternating ripple on the noisy left half.
+        let nr_recipe = DevelopRecipe {
+            noise_reduction: 0.85,
+            ..DevelopRecipe::default()
+        };
+        let nr_img = export_rgb16("nr.png", &nr_recipe);
+        let chroma_diff = |buf: &image::ImageBuffer<Rgb<u16>, Vec<u16>>| -> i64 {
+            let p = buf.get_pixel(10, 24);
+            (p[0] as i64 - p[1] as i64).abs()
+        };
+        assert!(
+            chroma_diff(&nr_img) < chroma_diff(&base) / 2,
+            "NR should smooth chroma noise (base={}, nr={})",
+            chroma_diff(&base),
+            chroma_diff(&nr_img)
+        );
+
+        // 2. Clarity boosts broad midtone step contrast across the center seam.
+        let clarity_recipe = DevelopRecipe {
+            clarity: 0.8,
+            ..DevelopRecipe::default()
+        };
+        let clarity_img = export_rgb16("clarity.png", &clarity_recipe);
+        let seam_contrast = |buf: &image::ImageBuffer<Rgb<u16>, Vec<u16>>| -> i64 {
+            buf.get_pixel(width / 2 + 2, 24)[0] as i64 - buf.get_pixel(width / 2 - 2, 24)[0] as i64
+        };
+        assert!(
+            seam_contrast(&clarity_img) > seam_contrast(&base) + 500,
+            "Clarity should boost broad midtone contrast (base={}, clarity={})",
+            seam_contrast(&base),
+            seam_contrast(&clarity_img)
+        );
+
+        // 3. Structure boosts fine texture contrast on the right-half stripes.
+        let struct_recipe = DevelopRecipe {
+            structure: 0.8,
+            ..DevelopRecipe::default()
+        };
+        let struct_img = export_rgb16("structure.png", &struct_recipe);
+        let stripe_diff = |buf: &image::ImageBuffer<Rgb<u16>, Vec<u16>>| -> i64 {
+            (buf.get_pixel(36, 24)[0] as i64 - buf.get_pixel(37, 24)[0] as i64).abs()
+        };
+        assert!(
+            stripe_diff(&struct_img) > stripe_diff(&base) + 400,
+            "Structure should boost fine stripe micro-contrast (base={}, structure={})",
+            stripe_diff(&base),
+            stripe_diff(&struct_img)
+        );
+
+        // 4. Sharpen boosts tight 1px edge contrast and is deterministic across runs.
+        let sharp_recipe = DevelopRecipe {
+            sharpen: 0.85,
+            ..DevelopRecipe::default()
+        };
+        let sharp_a = export_rgb16("sharp_a.png", &sharp_recipe);
+        let sharp_b = export_rgb16("sharp_b.png", &sharp_recipe);
+        assert_eq!(sharp_a.as_raw(), sharp_b.as_raw());
+        assert!(
+            stripe_diff(&sharp_a) > stripe_diff(&base) + 500,
+            "Sharpen should boost 1px edge contrast (base={}, sharpen={})",
+            stripe_diff(&base),
+            stripe_diff(&sharp_a)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_image_to_jpeg_vec_applies_geometry_detail_and_max_edge() {
+        use rune_editor_core::GeometryParams;
+
+        let img = generate_demo_hdr_scene(160, 120);
+        let recipe = DevelopRecipe {
+            exposure: 0.25,
+            clarity: 0.35,
+            structure: 0.25,
+            sharpen: 0.30,
+            noise_reduction: 0.20,
+            vignette: -0.35,
+            grain: 0.15,
+            geometry: GeometryParams {
+                crop: [0.0, 0.0, 0.5, 1.0],
+                ..GeometryParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+
+        let bytes = export_image_to_jpeg_vec(&img, &recipe, 60, 88).expect("jpeg vec");
+        assert!(bytes.len() > 200);
+        assert_eq!(&bytes[0..2], &[0xFF, 0xD8], "expected JPEG SOI header");
+
+        let decoded = image::load_from_memory(&bytes).expect("decode jpeg vec");
+        // Cropped 80x120 scaled to max_edge=60 -> 40x60.
+        assert_eq!((decoded.width(), decoded.height()), (40, 60));
+
+        // Deterministic output for identical inputs.
+        let bytes2 = export_image_to_jpeg_vec(&img, &recipe, 60, 88).expect("jpeg vec 2");
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn probe_image_dimensions_reads_raster_and_respects_exif_orientation() {
+        let dir = unique_temp_dir("probe_dims");
+        let png_path = dir.join("wide.png");
+        write_top_red_bottom_blue_png(&png_path, 160, 80);
+
+        let dims = probe_image_dimensions(&png_path).expect("probe png");
+        assert_eq!(dims, [160, 80]);
+
+        let missing = probe_image_dimensions(&dir.join("missing.png"));
+        assert!(matches!(missing, Err(DecodeError::Io { .. })));
+
+        #[cfg(target_os = "macos")]
+        {
+            use image::codecs::jpeg::JpegEncoder;
+
+            // Build a 16x8 JPEG carrying EXIF Orientation = 6 (Rotate 90° CW -> upright 8x16).
+            let mut base_jpg = Vec::new();
+            let px = vec![128u8; 16 * 8 * 3];
+            JpegEncoder::new_with_quality(&mut base_jpg, 90)
+                .encode(&px, 16, 8, image::ExtendedColorType::Rgb8)
+                .expect("encode 16x8 jpeg");
+
+            // Minimal big-endian TIFF with 1 IFD0 entry: Orientation (0x0112), SHORT(3), count=1, val=6.
+            let mut tiff = Vec::new();
+            tiff.extend_from_slice(b"MM");
+            tiff.extend_from_slice(&42u16.to_be_bytes());
+            tiff.extend_from_slice(&8u32.to_be_bytes());
+            tiff.extend_from_slice(&1u16.to_be_bytes());
+            tiff.extend_from_slice(&0x0112u16.to_be_bytes());
+            tiff.extend_from_slice(&3u16.to_be_bytes());
+            tiff.extend_from_slice(&1u32.to_be_bytes());
+            tiff.extend_from_slice(&(6u32 << 16).to_be_bytes());
+            tiff.extend_from_slice(&0u32.to_be_bytes());
+
+            let mut app1 = b"Exif\0\0".to_vec();
+            app1.extend_from_slice(&tiff);
+            let seg_len = (app1.len() + 2) as u16;
+
+            let mut oriented_jpg = Vec::with_capacity(base_jpg.len() + app1.len() + 4);
+            oriented_jpg.extend_from_slice(&base_jpg[0..2]);
+            oriented_jpg.extend_from_slice(&[0xFF, 0xE1]);
+            oriented_jpg.extend_from_slice(&seg_len.to_be_bytes());
+            oriented_jpg.extend_from_slice(&app1);
+            oriented_jpg.extend_from_slice(&base_jpg[2..]);
+
+            let oriented_path = dir.join("oriented_rot90.jpg");
+            fs::write(&oriented_path, &oriented_jpg).expect("write oriented jpeg");
+            let probed = probe_image_dimensions(&oriented_path).expect("probe oriented jpeg");
+            assert_eq!(
+                probed,
+                [8, 16],
+                "EXIF Orientation=6 must swap 16x8 to upright 8x16"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guard_not_source_blocks_same_and_symlinked_paths() {
+        let dir = unique_temp_dir("guard_src");
+        let real_sub = dir.join("real");
+        fs::create_dir_all(&real_sub).expect("create real subdir");
+        let src = real_sub.join("DSC0001.ARW");
+        fs::write(&src, b"raw").expect("write src");
+
+        // Same exact path is blocked.
+        assert!(matches!(
+            guard_not_source(&src, &src),
+            Err(DecodeError::SourceOverwrite(_))
+        ));
+
+        // Relative `..` traversing through a non-existent subdir back to src is blocked.
+        let tricky = real_sub
+            .join("nonexistent_sub")
+            .join("..")
+            .join("DSC0001.ARW");
+        assert!(matches!(
+            guard_not_source(&src, &tricky),
+            Err(DecodeError::SourceOverwrite(_))
+        ));
+
+        // Different file in same dir is allowed.
+        let other = real_sub.join("DSC0001.jpg");
+        assert!(guard_not_source(&src, &other).is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_dir = dir.join("alias_dir");
+            symlink(&real_sub, &link_dir).expect("create dir symlink");
+
+            // Symlinked parent pointing to existing src is blocked.
+            assert!(matches!(
+                guard_not_source(&src, &link_dir.join("DSC0001.ARW")),
+                Err(DecodeError::SourceOverwrite(_))
+            ));
+
+            // Even when both paths do not exist yet, canonicalizing parent symlinks catches collision.
+            let future_src = real_sub.join("future.dng");
+            let future_dest = link_dir.join("future.dng");
+            assert!(matches!(
+                guard_not_source(&future_src, &future_dest),
+                Err(DecodeError::SourceOverwrite(_))
+            ));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_photo_folder_skips_symlink_cycles_and_caps_depth() {
+        let dir = unique_temp_dir("symlink_cycle");
+        let sub = dir.join("shoot");
+        fs::create_dir_all(&sub).expect("create shoot dir");
+        fs::write(sub.join("frame01.jpg"), b"").expect("write frame");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // Create a direct parent cycle (`shoot/loop -> dir`) and self-loop (`shoot/self -> shoot`).
+            symlink(&dir, sub.join("loop")).expect("create parent symlink loop");
+            symlink(&sub, sub.join("self_loop")).expect("create self symlink loop");
+        }
+
+        let scanned = scan_photo_folder_with_options(
+            &dir,
+            &ScanOptions {
+                recursive: true,
+                extensions: Vec::new(),
+            },
+        )
+        .expect("recursive scan should survive symlink cycles");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].file_name().and_then(|s| s.to_str()),
+            Some("frame01.jpg")
+        );
+
+        // Verify MAX_SCAN_DEPTH cap prevents unbounded deep recursion.
+        let deep_root = unique_temp_dir("depth_cap");
+        let mut cursor = deep_root.clone();
+        for i in 0..=(MAX_SCAN_DEPTH + 2) {
+            cursor = cursor.join(format!("d{i}"));
+            fs::create_dir_all(&cursor).expect("mkdir deep");
+        }
+        fs::write(cursor.join("too_deep.jpg"), b"").expect("write too_deep");
+        fs::write(deep_root.join("d0").join("shallow.jpg"), b"").expect("write shallow");
+
+        let deep_scanned = scan_photo_folder_with_options(
+            &deep_root,
+            &ScanOptions {
+                recursive: true,
+                extensions: Vec::new(),
+            },
+        )
+        .expect("deep scan");
+        let names: Vec<String> = deep_scanned
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["shallow.jpg"]);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&deep_root);
+    }
+
+    #[test]
+    fn phase1_export_clarity_methods_nr_color_sharpen_controls_grain_types_and_film_curves() {
+        use rune_editor_core::{ClarityMethod, FilmCurve, GrainType};
+
+        let img = generate_demo_hdr_scene(64, 48);
+
+        // 1. FilmCurve modes produce distinct exports in shadows/highlights.
+        let (_, _, std_srgb) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                film_curve: FilmCurve::FilmStandard,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("standard curve");
+        let (_, _, ext_srgb) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                film_curve: FilmCurve::FilmExtraShadow,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("extra shadow curve");
+        let mean = |buf: &[[f32; 3]]| buf.iter().map(|p| p[0] + p[1] + p[2]).sum::<f32>();
+        assert!(mean(&ext_srgb) > mean(&std_srgb));
+
+        // 2. nr_color smooths chroma noise without softening pure luminance stripes.
+        let mut chroma_rgba = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                let odd = (x + y) % 2 == 0;
+                let rgb = if odd {
+                    [0.24, 0.16, 0.16]
+                } else {
+                    [0.12, 0.20, 0.20]
+                };
+                chroma_rgba.push(f16::from_f32(rgb[0]));
+                chroma_rgba.push(f16::from_f32(rgb[1]));
+                chroma_rgba.push(f16::from_f32(rgb[2]));
+                chroma_rgba.push(f16::ONE);
+            }
+        }
+        let chroma_img = LinearImage {
+            width: 32,
+            height: 32,
+            histogram_proxy: build_histogram_proxy(&chroma_rgba, 32, 32),
+            rgba16f: chroma_rgba,
+            display_name: "ChromaNoise.dng".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+        };
+        let (_, _, c_base) = export::render_developed_srgb_f32(
+            &chroma_img,
+            &DevelopRecipe::default(),
+            &ExportOptions::default(),
+        )
+        .expect("base chroma");
+        let (_, _, c_nr) = export::render_developed_srgb_f32(
+            &chroma_img,
+            &DevelopRecipe {
+                nr_color: 0.9,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("nr_color");
+        let idx = 16 * 32 + 16;
+        assert!(
+            (c_nr[idx][0] - c_nr[idx][1]).abs() < (c_base[idx][0] - c_base[idx][1]).abs() * 0.5,
+            "nr_color should smooth chroma noise"
+        );
+
+        // 3. ClarityMethod Punch vs Neutral + Sharpen halo suppression + GrainType Harsh vs Soft.
+        let (_, _, punch) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                clarity: 0.7,
+                clarity_method: ClarityMethod::Punch,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("clarity punch");
+        let (_, _, neutral) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                clarity: 0.7,
+                clarity_method: ClarityMethod::Neutral,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("clarity neutral");
+        assert_ne!(punch, neutral);
+
+        let (_, _, soft_g) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                grain: 0.4,
+                grain_type: GrainType::Soft,
+                grain_size: 0.6,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("soft grain");
+        let (_, _, harsh_g) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                grain: 0.4,
+                grain_type: GrainType::Harsh,
+                grain_size: 0.6,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .expect("harsh grain");
+        assert_ne!(soft_g, harsh_g);
+    }
+
+    #[test]
+    fn phase2_export_vignette_methods_lens_keystone_and_sample_picker() {
+        use rune_editor_core::{GeometryParams, LensParams, VignetteMethod};
+
+        // 80x40 wide image cropped to right half so EllipticOnCrop, CircularOnCrop, and Circular all differ!
+        let mut rgba = Vec::with_capacity(80 * 40 * 4);
+        for _ in 0..(80 * 40) {
+            rgba.push(f16::from_f32(0.30));
+            rgba.push(f16::from_f32(0.30));
+            rgba.push(f16::from_f32(0.30));
+            rgba.push(f16::ONE);
+        }
+        let img = LinearImage {
+            width: 80,
+            height: 40,
+            histogram_proxy: build_histogram_proxy(&rgba, 80, 40),
+            rgba16f: rgba,
+            display_name: "VignetteTest.dng".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+        };
+
+        let crop = GeometryParams {
+            crop: [0.5, 0.0, 0.5, 1.0],
+            ..GeometryParams::default()
+        };
+        let (_, _, ell) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                vignette: -0.8,
+                vignette_method: VignetteMethod::EllipticOnCrop,
+                geometry: crop,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let (_, _, circ_full) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                vignette: -0.8,
+                vignette_method: VignetteMethod::Circular,
+                geometry: crop,
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        // Left edge of right-half crop is at full-image center (ori_u=0.5), so Circular keeps it bright while EllipticOnCrop darkens it!
+        let left_mid_idx = 20 * 40 + 1;
+        assert!(
+            circ_full[left_mid_idx][0] > ell[left_mid_idx][0] + 0.05,
+            "Circular vignette should stay centered on full frame: circ={} vs ell={}",
+            circ_full[left_mid_idx][0],
+            ell[left_mid_idx][0]
+        );
+
+        // Optical light falloff brightens corners relative to center.
+        let (_, _, lf) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                lens: LensParams {
+                    light_falloff: 0.8,
+                    ..LensParams::default()
+                },
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        assert!(lf[0][0] > lf[20 * 80 + 40][0] + 0.05);
+
+        // sample_linear_rgb_at_uv evaluates Stages 1..=8 (exposure/WB) so pickers match Stage 8b/8c,
+        // and checks bounds *after* negative radial distortion pulls rotated edge UVs back inside [0, 1]^2.
+        let sampled = sample_linear_rgb_at_uv(&img, 0.5, 0.5, &DevelopRecipe::default());
+        assert!((sampled[0] - 0.30).abs() < 1e-3);
+
+        let graded_recipe = DevelopRecipe {
+            exposure: 1.0,
+            temperature: 0.4,
+            ..DevelopRecipe::default()
+        };
+        let graded_sample = sample_linear_rgb_at_uv(&img, 0.5, 0.5, &graded_recipe);
+        assert!(
+            graded_sample[0] > sampled[0] * 2.0 && graded_sample[0] > graded_sample[2] * 1.2,
+            "sample_linear_rgb_at_uv should reflect Stage 1..=8 exposure & WB: {graded_sample:?}"
+        );
+
+        let rot_neg_dist = DevelopRecipe {
+            geometry: GeometryParams {
+                straighten_deg: 15.0,
+                ..GeometryParams::default()
+            },
+            lens: LensParams {
+                distortion: -0.9,
+                ..LensParams::default()
+            },
+            ..DevelopRecipe::default()
+        };
+        // Corner UV pulled outside [0,1] by straighten_deg=15° is brought back inside by distortion=-0.9!
+        let corner_sample = sample_linear_rgb_at_uv(&img, 0.04, 0.04, &rot_neg_dist);
+        assert!(
+            corner_sample[0] > 0.25,
+            "corner pulled back inside [0,1] by negative distortion should sample valid pixel, got {corner_sample:?}"
+        );
+    }
+
+    #[test]
+    fn phase3_naming_tokens_watermark_display_p3_and_multi_recipe_export() {
+        // 1. Dynamic naming tokens + traversal sanitization.
+        let ctx = NamingContext {
+            image_name: "DSC_0421".to_owned(),
+            counter: 7,
+            date: "2026-11-26".to_owned(),
+            camera: "Leica Q3".to_owned(),
+            lens: "28mm/f1.7".to_owned(),
+            iso: "ISO400".to_owned(),
+            variant_index: 1,
+            recipe_name: "Web 2048px".to_owned(),
+        };
+        let expanded = expand_naming_template(
+            "{Date}_{ImageName}_{Counter}_{Variant}_{Camera}_{Lens}_{ISO}_{Recipe}",
+            &ctx,
+        );
+        assert_eq!(
+            expanded,
+            "2026-11-26_DSC_0421_0007_V2_Leica_Q3_28mm_f1.7_ISO400_Web_2048px"
+        );
+        let hostile = expand_naming_template("../../etc/passwd\0..\\\\{ImageName}", &ctx);
+        assert!(!hostile.contains(".."));
+        assert!(!hostile.contains('/'));
+        assert!(!hostile.contains('\\'));
+        assert!(!hostile.starts_with('.'));
+        assert!(hostile.contains("DSC_0421"));
+
+        // 2. Display P3 linear matrix preserves neutral gray and compresses wide-gamut sRGB red cleanly.
+        let gray_p3 = linear_srgb_to_display_p3([0.5, 0.5, 0.5]);
+        assert!((gray_p3[0] - 0.5).abs() < 1e-5);
+        assert!((gray_p3[1] - 0.5).abs() < 1e-5);
+        assert!((gray_p3[2] - 0.5).abs() < 1e-5);
+        let red_p3 = linear_srgb_to_display_p3([1.0, 0.0, 0.0]);
+        assert!((red_p3[0] - 0.822462).abs() < 1e-4 && red_p3[1] > 0.03);
+
+        // 3. Text Watermark + Display P3 rendering on a solid image.
+        let w = 160u32;
+        let h = 100u32;
+        let mut rgba16f = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            rgba16f.push(f16::from_f32(0.40));
+            rgba16f.push(f16::from_f32(0.08));
+            rgba16f.push(f16::from_f32(0.06));
+            rgba16f.push(f16::from_f32(1.0));
+        }
+        let img = LinearImage {
+            width: w,
+            height: h,
+            rgba16f,
+            histogram_proxy: vec![[0.40, 0.08, 0.06]; 16],
+            display_name: "p3_wm.dng".to_owned(),
+            source_path: None,
+            format_label: "RAW".to_owned(),
+            exif: None,
+        };
+        let (_, _, srgb_plain) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe::default(),
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let (_, _, p3_plain) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe::default(),
+            &ExportOptions {
+                color_space: ExportColorSpace::DisplayP3,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            p3_plain[0][0] < srgb_plain[0][0] - 0.02 && p3_plain[0][1] > srgb_plain[0][1] + 0.01,
+            "Display P3 export should apply chromaticity transform: p3={:?} srgb={:?}",
+            p3_plain[0],
+            srgb_plain[0]
+        );
+
+        let wm_opts = ExportOptions {
+            watermark: TextWatermark {
+                enabled: true,
+                text: "© RUNE STUDIO".to_owned(),
+                opacity: 0.75,
+                scale: 1.5,
+                position: WatermarkPosition::Center,
+            },
+            ..ExportOptions::default()
+        };
+        let (_, _, srgb_wm) =
+            export::render_developed_srgb_f32(&img, &DevelopRecipe::default(), &wm_opts).unwrap();
+        let changed = srgb_plain
+            .iter()
+            .zip(srgb_wm.iter())
+            .filter(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() > 0.05)
+            .count();
+        assert!(
+            changed >= 40,
+            "TextWatermark should visibly composite glyphs onto image (changed {changed} pixels)"
+        );
+
+        // 4. Multi-Recipe Export: pre-flight collision, subfolder traversal, guard_not_source, overwrite=false, and success.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rune_decode_multi_recipe_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut recipes = builtin_export_recipes();
+        recipes[2].enabled = true; // Enable all 3 recipes (Full-Res JPEG, Web 2048px, Archival 16-bit TIFF)
+        let exported = export_multi_recipe(
+            &img,
+            &DevelopRecipe::default(),
+            &dir,
+            &recipes,
+            &ctx,
+            None,
+            false,
+        )
+        .expect("multi-recipe export should succeed");
+        assert_eq!(exported.len(), 3);
+        for item in &exported {
+            assert!(item.path.exists(), "missing exported file {:?}", item.path);
+            assert_eq!(item.width, w);
+            assert_eq!(item.height, h);
+        }
+
+        // Re-running with overwrite=false must fail with DestinationExists before writing.
+        let err_exists = export_multi_recipe(
+            &img,
+            &DevelopRecipe::default(),
+            &dir,
+            &recipes,
+            &ctx,
+            None,
+            false,
+        );
+        assert!(matches!(err_exists, Err(DecodeError::DestinationExists(_))));
+
+        // Duplicate destination collision check must fail pre-flight.
+        let dup_recipes = vec![
+            ExportRecipeSpec {
+                name: "Same".to_owned(),
+                enabled: true,
+                subfolder: String::new(),
+                naming_template: "{ImageName}".to_owned(),
+                options: ExportOptions::default(),
+            },
+            ExportRecipeSpec {
+                name: "Same2".to_owned(),
+                enabled: true,
+                subfolder: String::new(),
+                naming_template: "{ImageName}".to_owned(),
+                options: ExportOptions::default(),
+            },
+        ];
+        let err_dup = plan_multi_recipe_paths(&dir, &dup_recipes, &ctx, None, true);
+        assert!(matches!(err_dup, Err(DecodeError::DuplicateDestination(_))));
+
+        // Traversal subfolder must be rejected pre-flight.
+        let bad_sub = vec![ExportRecipeSpec {
+            name: "Escape".to_owned(),
+            enabled: true,
+            subfolder: "../escape".to_owned(),
+            naming_template: "{ImageName}".to_owned(),
+            options: ExportOptions::default(),
+        }];
+        assert!(matches!(
+            plan_multi_recipe_paths(&dir, &bad_sub, &ctx, None, true),
+            Err(DecodeError::InvalidPath(_))
+        ));
+
+        // guard_not_source must block overwriting the source photo.
+        let src_collision = dir.join("DSC_0421.jpg");
+        std::fs::write(&src_collision, b"original").unwrap();
+        let single = vec![ExportRecipeSpec {
+            name: "Orig".to_owned(),
+            enabled: true,
+            subfolder: String::new(),
+            naming_template: "{ImageName}".to_owned(),
+            options: ExportOptions::default(),
+        }];
+        assert!(matches!(
+            plan_multi_recipe_paths(&dir, &single, &ctx, Some(&src_collision), true),
+            Err(DecodeError::SourceOverwrite(_))
+        ));
+
+        // Tiny 4x4 watermarked image must export cleanly without clamp min > max panic.
+        let tiny_img = LinearImage {
+            width: 4,
+            height: 4,
+            rgba16f: vec![f16::from_f32(0.25); 4 * 4 * 4],
+            histogram_proxy: vec![[0.25, 0.25, 0.25]; 4],
+            display_name: "tiny.dng".to_owned(),
+            source_path: None,
+            format_label: "RAW".to_owned(),
+            exif: None,
+        };
+        let tiny_out = dir.join("tiny_wm.png");
+        let tiny_opts = ExportOptions {
+            format: ExportFormat::Png8,
+            watermark: TextWatermark {
+                enabled: true,
+                text: "RUNE".to_owned(),
+                opacity: 0.6,
+                scale: 1.0,
+                position: WatermarkPosition::BottomRight,
+            },
+            ..ExportOptions::default()
+        };
+        export_image_with_options(&tiny_img, &DevelopRecipe::default(), &tiny_out, &tiny_opts)
+            .expect("4x4 watermarked export must not panic");
+        assert!(tiny_out.exists());
+
+        // Case-insensitive destination collision check on macOS/Windows (Photo_Web.jpg vs photo_web.jpg).
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            let case_dup = vec![
+                ExportRecipeSpec {
+                    name: "Web".to_owned(),
+                    enabled: true,
+                    subfolder: String::new(),
+                    naming_template: "Photo_{Recipe}".to_owned(),
+                    options: ExportOptions::default(),
+                },
+                ExportRecipeSpec {
+                    name: "web".to_owned(),
+                    enabled: true,
+                    subfolder: String::new(),
+                    naming_template: "photo_{Recipe}".to_owned(),
+                    options: ExportOptions::default(),
+                },
+            ];
+            assert!(matches!(
+                plan_multi_recipe_paths(&dir, &case_dup, &ctx, None, true),
+                Err(DecodeError::DuplicateDestination(_))
+            ));
+        }
+
+        // Dangling symlink at destination must be caught by overwrite=false pre-flight check.
+        #[cfg(unix)]
+        {
+            let dangling = dir.join("dangling_out.jpg");
+            std::os::unix::fs::symlink(dir.join("nonexistent_target.jpg"), &dangling)
+                .expect("create dangling symlink");
+            assert!(!dangling.exists() && dangling.symlink_metadata().is_ok());
+            let dangling_spec = vec![ExportRecipeSpec {
+                name: "Dangling".to_owned(),
+                enabled: true,
+                subfolder: String::new(),
+                naming_template: "dangling_out".to_owned(),
+                options: ExportOptions::default(),
+            }];
+            assert!(matches!(
+                plan_multi_recipe_paths(&dir, &dangling_spec, &ctx, None, false),
+                Err(DecodeError::DestinationExists(_))
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase4_ai_subject_mask_layers_and_heal_clone_export() {
+        use rune_editor_core::{
+            AdjustmentLayer, BrushDab, HealMode, HealSpot, LayerMaskItem, LocalAdjustments,
+            MaskCombineOp, MaskShape,
+        };
+
+        // 1. AI Subject / Background mask on a bright warm subject centered over a dark cool backdrop.
+        let w = 128u32;
+        let h = 128u32;
+        let mut rgba16f = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = (x as f32 + 0.5) / w as f32 - 0.5;
+                let dy = (y as f32 + 0.5) / h as f32 - 0.5;
+                let in_subject = dx * dx + dy * dy < 0.22 * 0.22;
+                let rgb = if in_subject {
+                    [0.72_f32, 0.42, 0.18]
+                } else {
+                    [0.03_f32, 0.06, 0.14]
+                };
+                rgba16f.push(f16::from_f32(rgb[0]));
+                rgba16f.push(f16::from_f32(rgb[1]));
+                rgba16f.push(f16::from_f32(rgb[2]));
+                rgba16f.push(f16::ONE);
+            }
+        }
+        let img = LinearImage {
+            width: w,
+            height: h,
+            rgba16f,
+            histogram_proxy: vec![[0.2, 0.2, 0.2]; 16],
+            display_name: "subject.dng".to_owned(),
+            source_path: None,
+            format_label: "RAW".to_owned(),
+            exif: None,
+        };
+
+        let subj_mask = generate_subject_mask(&img, false);
+        let bg_mask = generate_subject_mask(&img, true);
+        let (sw, sh, subj_bytes) = subj_mask.decode_raster_u8().expect("decode subject mask");
+        let (bw, bh, bg_bytes) = bg_mask.decode_raster_u8().expect("decode bg mask");
+        assert_eq!((sw, sh), (256, 256));
+        assert_eq!((bw, bh), (256, 256));
+
+        // Exact complement between subject and background masks.
+        for (&s, &b) in subj_bytes.iter().zip(bg_bytes.iter()) {
+            assert_eq!(s as u16 + b as u16, 255);
+        }
+        let center_val = subj_bytes[128 * 256 + 128];
+        let corner_val = subj_bytes[8 * 256 + 8];
+        assert!(
+            center_val > 200 && corner_val < 40,
+            "AI Subject mask should isolate center subject ({center_val}) vs dark corner ({corner_val})"
+        );
+
+        // 2. Spot Heal matches surrounding luminance while Clone transfers donor pixels directly.
+        let mut blemish_rgba = vec![f16::ZERO; (64 * 64 * 4) as usize];
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                // Left half bright gray (0.40), right half darker gray (0.16), dark blemish dot at (16, 32).
+                let mut v = if x < 32 { 0.40_f32 } else { 0.16_f32 };
+                if (x as i32 - 16).abs() <= 2 && (y as i32 - 32).abs() <= 2 {
+                    v = 0.02;
+                }
+                let base = ((y * 64 + x) * 4) as usize;
+                blemish_rgba[base] = f16::from_f32(v);
+                blemish_rgba[base + 1] = f16::from_f32(v);
+                blemish_rgba[base + 2] = f16::from_f32(v);
+                blemish_rgba[base + 3] = f16::ONE;
+            }
+        }
+        let blemish_img = LinearImage {
+            width: 64,
+            height: 64,
+            rgba16f: blemish_rgba,
+            histogram_proxy: vec![[0.25, 0.25, 0.25]; 16],
+            display_name: "blemish.dng".to_owned(),
+            source_path: None,
+            format_label: "RAW".to_owned(),
+            exif: None,
+        };
+        let clone_recipe = DevelopRecipe {
+            heal_spots: vec![HealSpot {
+                id: "s1".to_owned(),
+                target: [0.25, 0.5],
+                source: [0.75, 0.5],
+                radius: 0.08,
+                feather: 0.2,
+                opacity: 1.0,
+                mode: HealMode::Clone,
+            }],
+            ..DevelopRecipe::default()
+        };
+        let heal_recipe = DevelopRecipe {
+            heal_spots: vec![HealSpot {
+                id: "s1".to_owned(),
+                target: [0.25, 0.5],
+                source: [0.75, 0.5],
+                radius: 0.08,
+                feather: 0.2,
+                opacity: 1.0,
+                mode: HealMode::Heal,
+            }],
+            ..DevelopRecipe::default()
+        };
+        let (_, _, cloned) = export::render_developed_srgb_f32(
+            &blemish_img,
+            &clone_recipe,
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let (_, _, healed) = export::render_developed_srgb_f32(
+            &blemish_img,
+            &heal_recipe,
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let blemish_px = 32 * 64 + 16;
+        let clean_surr = 32 * 64 + 8;
+        assert!(
+            (healed[blemish_px][0] - healed[clean_surr][0]).abs() < 0.04,
+            "Heal should match target perimeter brightness: healed={} vs surround={}",
+            healed[blemish_px][0],
+            healed[clean_surr][0]
+        );
+        assert!(
+            cloned[blemish_px][0] < healed[blemish_px][0] - 0.12,
+            "Clone from darker donor should be darker than brightness-matched Heal: clone={} vs heal={}",
+            cloned[blemish_px][0],
+            healed[blemish_px][0]
+        );
+
+        // 3. Combined Linear + Brush adjustment layer brightens masked region without touching unmasked region.
+        let mut layer = AdjustmentLayer::new("l1", "Spotlight");
+        layer.masks.push(LayerMaskItem {
+            enabled: true,
+            op: MaskCombineOp::Add,
+            inverted: false,
+            shape: MaskShape::BrushStrokes {
+                strokes: vec![BrushDab {
+                    x: 0.5,
+                    y: 0.5,
+                    radius: 0.2,
+                    hardness: 0.8,
+                    opacity: 1.0,
+                    erase: false,
+                }],
+            },
+        });
+        layer.adjustments = LocalAdjustments {
+            exposure: 1.5,
+            ..LocalAdjustments::default()
+        };
+        let (_, _, plain) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe::default(),
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let (_, _, layered) = export::render_developed_srgb_f32(
+            &img,
+            &DevelopRecipe {
+                layers: vec![layer],
+                ..DevelopRecipe::default()
+            },
+            &ExportOptions::default(),
+        )
+        .unwrap();
+        let center_idx = (64 * 128 + 64) as usize;
+        let corner_idx = (4 * 128 + 4) as usize;
+        assert!(layered[center_idx][0] > plain[center_idx][0] + 0.08);
+        assert!((layered[corner_idx][0] - plain[corner_idx][0]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn phase5_hot_folder_watcher_stability_and_raw_film_base_sample() {
+        let dir = unique_temp_dir("hot_folder_p5");
+
+        // Pre-existing photo should be seeded as known by HotFolderWatcher::new.
+        let existing = dir.join("existing.jpg");
+        fs::write(&existing, b"already-here").unwrap();
+        let mut watcher = HotFolderWatcher::new(dir.clone()).expect("init hot folder watcher");
+        assert_eq!(watcher.known_count(), 1);
+        assert!(watcher.poll_ready().unwrap().is_empty());
+
+        // Simulate a camera/tether arrival: empty file -> growing -> stable across 2 polls.
+        let incoming = dir.join("shot_001.jpg");
+        fs::write(&incoming, b"").unwrap();
+        assert!(
+            watcher.poll_ready().unwrap().is_empty(),
+            "0-byte file must wait"
+        );
+
+        fs::write(&incoming, b"part1").unwrap();
+        assert!(
+            watcher.poll_ready().unwrap().is_empty(),
+            "first non-zero poll records size"
+        );
+
+        fs::write(&incoming, b"part1+part2").unwrap();
+        assert!(
+            watcher.poll_ready().unwrap().is_empty(),
+            "growing file must not emit yet"
+        );
+
+        // Hidden dotfile and symlink must be ignored.
+        fs::write(dir.join(".tmp_shot.jpg"), b"hidden").unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&existing, dir.join("link_shot.jpg"));
+        }
+
+        // Next poll sees stable byte size -> emits shot_001.jpg once and never again.
+        let ready = watcher.poll_ready().unwrap();
+        assert_eq!(ready, vec![incoming.clone()]);
+        assert!(watcher.poll_ready().unwrap().is_empty());
+
+        // HotFolderWatcher::new_empty picks up existing files after 2 stability polls (for `--once`).
+        let mut empty_w = HotFolderWatcher::new_empty(dir.clone()).unwrap();
+        assert!(empty_w.poll_ready().unwrap().is_empty());
+        let all_ready = empty_w.poll_ready().unwrap();
+        assert_eq!(all_ready, vec![existing, incoming]);
+
+        // sample_raw_linear_rgb_at_uv returns raw un-inverted film rebate even when FilmNegative is active.
+        let img = LinearImage {
+            width: 8,
+            height: 8,
+            rgba16f: [
+                f16::from_f32(0.90),
+                f16::from_f32(0.54),
+                f16::from_f32(0.32),
+                f16::ONE,
+            ]
+            .repeat(64),
+            histogram_proxy: vec![[0.90, 0.54, 0.32]; 8],
+            display_name: "neg.dng".to_owned(),
+            source_path: None,
+            format_label: "RAW".to_owned(),
+            exif: None,
+        };
+        let mut neg_recipe = DevelopRecipe::default();
+        neg_recipe.convert_film_negative_from_base([0.90, 0.54, 0.32]);
+        let raw_px = sample_raw_linear_rgb_at_uv(&img, 0.5, 0.5, &neg_recipe);
+        let dev_px = sample_linear_rgb_at_uv(&img, 0.5, 0.5, &neg_recipe);
+        assert!((raw_px[0] - 0.90).abs() < 2e-3 && (raw_px[2] - 0.32).abs() < 2e-3);
+        assert!(dev_px[0] < 1e-3 && dev_px[1] < 1e-3 && dev_px[2] < 1e-3);
 
         let _ = fs::remove_dir_all(&dir);
     }

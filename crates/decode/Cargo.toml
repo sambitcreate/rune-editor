@@ -10,6 +10,7 @@ bytemuck.workspace = true
 half.workspace = true
 image.workspace = true
 rune-editor-core.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 rayon = "1"
 rawler = "0.8"

@@ -7,8 +7,10 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// UI-friendly camera EXIF metadata extracted from a photograph.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhotoExif {
     pub camera_model: Option<String>,
     pub lens_model: Option<String>,

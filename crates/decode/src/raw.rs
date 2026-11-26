@@ -56,6 +56,79 @@ pub(crate) fn extension_lowercase(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+/// Fast header-only dimension probe (`[width, height]` in upright oriented pixels)
+/// with zero pixel decoding (`<1ms` on macOS via `ImageIO`).
+///
+/// Respects EXIF orientation transpose (`5..=8`), falling back cleanly to
+/// `image::image_dimensions` and `rawler` dummy header probing.
+pub fn probe_image_dimensions(path: &Path) -> Result<[u32; 2], DecodeError> {
+    if !path.exists() {
+        return Err(DecodeError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "Image file not found"),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(dims) = macos::probe_imageio_dimensions(path) {
+            return Ok(dims);
+        }
+    }
+
+    if !is_raw_extension(path)
+        && let Ok((w, h)) = image::image_dimensions(path)
+        && w > 0
+        && h > 0
+    {
+        return Ok([w, h]);
+    }
+
+    if is_raw_extension(path)
+        && !is_heif_extension(path)
+        && let Ok(dims) = probe_rawler_dimensions(path)
+    {
+        return Ok(dims);
+    }
+
+    // Last-resort raster probe (handles misnamed files).
+    let (w, h) = image::image_dimensions(path).map_err(|source| DecodeError::Image {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if w == 0 || h == 0 {
+        return Err(DecodeError::EmptyDimensions(w, h));
+    }
+    Ok([w, h])
+}
+
+fn probe_rawler_dimensions(path: &Path) -> Result<[u32; 2], DecodeError> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::rawsource::RawSource;
+
+    let raw_source = RawSource::new(path).map_err(|source| DecodeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let decoder = rawler::get_decoder(&raw_source).map_err(|e| DecodeError::Raw {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    let raw_img = decoder
+        .raw_image(&raw_source, &RawDecodeParams::default(), true)
+        .map_err(|e| DecodeError::Raw {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+    let w = raw_img.width as u32;
+    let h = raw_img.height as u32;
+    if w == 0 || h == 0 {
+        return Err(DecodeError::EmptyDimensions(w, h));
+    }
+    let (transpose, _, _) = raw_img.orientation.to_flips();
+    if transpose { Ok([h, w]) } else { Ok([w, h]) }
+}
+
 /// Decodes a photo file from disk into scene-referred linear `Rgba16Float`,
 /// optionally scaling the longest edge to `max_edge` for fast interactive editing proxies.
 pub fn load_file_proxy(path: &Path, max_edge: Option<u32>) -> Result<LinearImage, DecodeError> {
@@ -550,22 +623,114 @@ pub(crate) mod macos {
     use std::ffi::c_void;
     use std::path::Path;
     use std::ptr::NonNull;
+    use std::sync::OnceLock;
 
     use half::f16;
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::AnyObject;
-    use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
+    use objc2_core_foundation::{
+        CFDictionary, CFNumber, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
+    };
     use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedLinearSRGB};
     use objc2_core_image::{
         CIContext, CIImage, CIRAWFilter, kCIFormatRGBAh, kCIImageApplyOrientationProperty,
     };
     use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
+    use objc2_image_io::{
+        CGImageSource, kCGImagePropertyOrientation, kCGImagePropertyPixelHeight,
+        kCGImagePropertyPixelWidth, kCGImagePropertyTIFFDictionary,
+    };
 
     use super::{file_display_name, file_ext_upper, sanitize_linear};
     use crate::{DecodeError, LinearImage, build_histogram_proxy};
 
     /// Maximum single-axis dimension accepted from CoreImage to prevent runaway allocations.
     const MAX_RENDER_DIM: usize = 32_768;
+
+    /// Thread-safe wrapper around Apple's `CIContext`.
+    struct SharedCIContext(Retained<CIContext>);
+
+    // SAFETY: Apple documents `CIContext` as immutable and thread-safe for concurrent
+    // `render:toBitmap:rowBytes:bounds:format:colorSpace:` invocations across threads.
+    unsafe impl Send for SharedCIContext {}
+    unsafe impl Sync for SharedCIContext {}
+
+    fn shared_ci_context() -> &'static CIContext {
+        static CTX: OnceLock<SharedCIContext> = OnceLock::new();
+        &CTX.get_or_init(|| SharedCIContext(unsafe { CIContext::context() }))
+            .0
+    }
+
+    /// Header-only `<1ms` dimension probe via `ImageIO::CGImageSourceCopyPropertiesAtIndex`,
+    /// respecting EXIF orientation transpose (`5..=8`).
+    pub(crate) fn probe_imageio_dimensions(path: &Path) -> Result<[u32; 2], DecodeError> {
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+
+        autoreleasepool(|_| {
+            let cf_url = CFURL::from_file_path(&abs_path).ok_or_else(|| DecodeError::Raw {
+                path: path.to_path_buf(),
+                message: "Failed to construct CFURL for dimension probe".to_owned(),
+            })?;
+            let source = unsafe { CGImageSource::with_url(&cf_url, None) }.ok_or_else(|| {
+                DecodeError::Raw {
+                    path: path.to_path_buf(),
+                    message: "CGImageSourceCreateWithURL returned null".to_owned(),
+                }
+            })?;
+            let props =
+                unsafe { source.properties_at_index(0, None) }.ok_or_else(|| DecodeError::Raw {
+                    path: path.to_path_buf(),
+                    message: "CGImageSourceCopyPropertiesAtIndex returned null".to_owned(),
+                })?;
+
+            let w = dict_get_i64(&props, unsafe { kCGImagePropertyPixelWidth }).unwrap_or(0);
+            let h = dict_get_i64(&props, unsafe { kCGImagePropertyPixelHeight }).unwrap_or(0);
+            if w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64 {
+                return Err(DecodeError::EmptyDimensions(
+                    w.max(0) as u32,
+                    h.max(0) as u32,
+                ));
+            }
+
+            let orientation = dict_get_i64(&props, unsafe { kCGImagePropertyOrientation })
+                .or_else(|| {
+                    let tiff = dict_get_raw(&props, unsafe { kCGImagePropertyTIFFDictionary })?
+                        .downcast_ref::<CFDictionary>()?;
+                    let key = CFString::from_static_str("Orientation");
+                    dict_get_i64(tiff, &key)
+                })
+                .unwrap_or(1);
+
+            if (5..=8).contains(&orientation) {
+                Ok([h as u32, w as u32])
+            } else {
+                Ok([w as u32, h as u32])
+            }
+        })
+    }
+
+    fn dict_get_raw<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> {
+        let key_ptr: *const CFString = key;
+        let val = unsafe { dict.value(key_ptr.cast::<c_void>()) };
+        if val.is_null() {
+            None
+        } else {
+            // SAFETY: ImageIO property dictionaries hold CFType values borrowed for `dict`'s lifetime.
+            Some(unsafe { &*val.cast::<CFType>() })
+        }
+    }
+
+    fn dict_get_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
+        dict_get_raw(dict, key)?
+            .downcast_ref::<CFNumber>()?
+            .as_i64()
+    }
 
     /// Decodes a RAW, ProRAW, HEIC, or raster file into scene-referred linear `Rgba16Float`
     /// using Apple's native `CIRAWFilter` / `CoreImage` pipeline.
@@ -693,7 +858,7 @@ pub(crate) mod macos {
                     DecodeError::InvalidBuffer("Null destination buffer pointer".to_owned())
                 })?;
 
-            let ci_context = unsafe { CIContext::context() };
+            let ci_context = shared_ci_context();
             unsafe {
                 ci_context.render_toBitmap_rowBytes_bounds_format_colorSpace(
                     &ci_image,

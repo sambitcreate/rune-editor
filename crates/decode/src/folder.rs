@@ -5,6 +5,7 @@
 //! automatic EXIF orientation correction. On other platforms (or if ImageIO fails),
 //! it falls back cleanly to `rawler` embedded previews or `image::open` + fast resize.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rune_editor_core::{DevelopRecipe, linear_to_srgb};
@@ -21,34 +22,165 @@ pub struct ThumbnailRgba8 {
     pub rgba: Vec<u8>,
 }
 
+/// Options for [`scan_photo_folder_with_options`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanOptions {
+    /// When `true`, recursively traverses subdirectories (skipping hidden dotfiles/dirs).
+    pub recursive: bool,
+    /// Optional lowercase extension whitelist (e.g. `["arw", "dng"]`); empty = all supported.
+    pub extensions: Vec<String>,
+}
+
 /// Scans `dir` (non-recursively) and returns all supported photo paths (RAW + raster),
 /// skipping hidden dotfiles (including macOS `._*` AppleDouble files) and sorting
 /// deterministically by filename (case-insensitive, with exact path tiebreaker).
 pub fn scan_photo_folder(dir: &Path) -> Result<Vec<PathBuf>, DecodeError> {
+    scan_photo_folder_with_options(dir, &ScanOptions::default())
+}
+
+/// Zero-dependency polling watcher for Capture One-style Hot Folder auto-ingest.
+///
+/// Tracks file byte lengths across consecutive [`Self::poll_ready`] calls and only emits
+/// newly arrived, non-empty regular image files once their size stabilizes across two
+/// consecutive polls (preventing half-written camera/tether writes from decoding prematurely).
+/// Skips symlinks and hidden dotfiles/AppleDouble files.
+#[derive(Clone, Debug)]
+pub struct HotFolderWatcher {
+    watch_dir: PathBuf,
+    known_files: HashSet<PathBuf>,
+    pending_sizes: HashMap<PathBuf, u64>,
+}
+
+impl HotFolderWatcher {
+    /// Creates a watcher over `dir`, seeding `known_files` with all existing top-level
+    /// supported photo files so only *new* arrivals trigger [`Self::poll_ready`].
+    pub fn new(dir: PathBuf) -> Result<Self, DecodeError> {
+        let mut watcher = Self::new_empty(dir)?;
+        for (path, _) in scan_top_level_regular_photos(&watcher.watch_dir)? {
+            watcher.known_files.insert(path);
+        }
+        Ok(watcher)
+    }
+
+    /// Creates a watcher over `dir` starting with an empty `known_files` set (useful for
+    /// deterministic `--once` ingest or fresh session capture directories).
+    pub fn new_empty(dir: PathBuf) -> Result<Self, DecodeError> {
+        let meta = std::fs::metadata(&dir).map_err(|source| DecodeError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        if !meta.is_dir() {
+            return Err(DecodeError::InvalidPath(format!(
+                "Hot folder path '{}' is not a directory",
+                dir.display()
+            )));
+        }
+        Ok(Self {
+            watch_dir: dir,
+            known_files: HashSet::new(),
+            pending_sizes: HashMap::new(),
+        })
+    }
+
+    pub fn watch_dir(&self) -> &Path {
+        &self.watch_dir
+    }
+
+    pub fn known_count(&self) -> usize {
+        self.known_files.len()
+    }
+
+    /// Polls `watch_dir` once and returns newly arrived regular photo files whose byte size
+    /// is non-zero and stable across two consecutive polls, sorted deterministically.
+    pub fn poll_ready(&mut self) -> Result<Vec<PathBuf>, DecodeError> {
+        let current = scan_top_level_regular_photos(&self.watch_dir)?;
+        let mut seen_this_poll = HashSet::with_capacity(current.len());
+        let mut ready = Vec::new();
+
+        for (path, size) in current {
+            seen_this_poll.insert(path.clone());
+            if self.known_files.contains(&path) {
+                continue;
+            }
+            if size == 0 {
+                self.pending_sizes.insert(path, 0);
+                continue;
+            }
+            if self.pending_sizes.get(&path).copied() == Some(size) {
+                self.pending_sizes.remove(&path);
+                self.known_files.insert(path.clone());
+                ready.push(path);
+            } else {
+                self.pending_sizes.insert(path, size);
+            }
+        }
+
+        self.pending_sizes.retain(|p, _| seen_this_poll.contains(p));
+        ready.sort_by(|a, b| {
+            let a_name = a
+                .file_name()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let b_name = b
+                .file_name()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            a_name.cmp(&b_name).then_with(|| a.cmp(b))
+        });
+        Ok(ready)
+    }
+}
+
+fn scan_top_level_regular_photos(dir: &Path) -> Result<Vec<(PathBuf, u64)>, DecodeError> {
     let entries = std::fs::read_dir(dir).map_err(|source| DecodeError::Io {
         path: dir.to_path_buf(),
         source,
     })?;
-
-    let mut photos = Vec::new();
+    let mut out = Vec::new();
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entry) = entry else {
+            continue;
         };
         let path = entry.path();
-
-        // Skip hidden files and macOS AppleDouble resource forks (`.DS_Store`, `._IMG_001.DNG`).
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && name.starts_with('.')
         {
             continue;
         }
-
-        if path.is_file() && is_supported_photo(&path) {
-            photos.push(path);
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        // Strictly skip symlinks and directories to prevent symlink escapes/cycles.
+        if ft.is_symlink() || !ft.is_file() {
+            continue;
         }
+        if !is_supported_photo(&path) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        out.push((path, meta.len()));
     }
+    Ok(out)
+}
+
+/// Maximum directory recursion depth during recursive folder scans (protects against deep trees/cycles).
+pub const MAX_SCAN_DEPTH: usize = 32;
+
+/// Scans `dir` according to [`ScanOptions`] and returns deterministically sorted photo paths.
+pub fn scan_photo_folder_with_options(
+    dir: &Path,
+    opts: &ScanOptions,
+) -> Result<Vec<PathBuf>, DecodeError> {
+    let mut photos = Vec::new();
+    let allowed: Vec<String> = opts
+        .extensions
+        .iter()
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    collect_photos(dir, opts.recursive, &allowed, 0, &mut photos)?;
 
     photos.sort_by(|a, b| {
         let a_name = a
@@ -63,6 +195,90 @@ pub fn scan_photo_folder(dir: &Path) -> Result<Vec<PathBuf>, DecodeError> {
     });
 
     Ok(photos)
+}
+
+fn collect_photos(
+    dir: &Path,
+    recursive: bool,
+    allowed_exts: &[String],
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), DecodeError> {
+    if depth > MAX_SCAN_DEPTH {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(dir).map_err(|source| DecodeError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+
+        // Skip hidden files/dirs and macOS AppleDouble resource forks (`.DS_Store`, `._IMG_001.DNG`).
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with('.')
+        {
+            continue;
+        }
+
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        // Never recurse into directory symlinks (prevents symlink cycle crashes / infinite recursion).
+        if ft.is_symlink() {
+            if !path.is_file() {
+                continue;
+            }
+        } else if ft.is_dir() {
+            if recursive && depth < MAX_SCAN_DEPTH {
+                let _ = collect_photos(&path, true, allowed_exts, depth + 1, out);
+            }
+            continue;
+        } else if !ft.is_file() {
+            continue;
+        }
+
+        if is_supported_photo(&path) {
+            if !allowed_exts.is_empty() {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !allowed_exts.iter().any(|a| a == &ext) {
+                    continue;
+                }
+            }
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Loads a fast detail proxy (`max_edge`, typically `1024px`) and converts it to
+/// perceptual luma `sqrt(luma709(linear_rgb))` for sharpness & focus-mask analysis.
+pub fn extract_detail_luma_proxy(
+    path: &Path,
+    max_edge: u32,
+) -> Result<(Vec<f32>, u32, u32), DecodeError> {
+    let thumb = load_thumbnail(path, max_edge.max(64))?;
+    let px_count = (thumb.width as usize) * (thumb.height as usize);
+    let mut luma = Vec::with_capacity(px_count);
+    for chunk in thumb.rgba.as_chunks::<4>().0 {
+        let r = rune_editor_core::srgb_to_linear(chunk[0] as f32 / 255.0);
+        let g = rune_editor_core::srgb_to_linear(chunk[1] as f32 / 255.0);
+        let b = rune_editor_core::srgb_to_linear(chunk[2] as f32 / 255.0);
+        let y = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(0.0);
+        luma.push(y.sqrt());
+    }
+    Ok((luma, thumb.width, thumb.height))
 }
 
 /// Loads a fast filmstrip thumbnail whose longest edge is at most `max_edge` pixels.

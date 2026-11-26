@@ -6,7 +6,11 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use rune_editor_core::{CURVE_LUT_SIZE, DevelopRecipe, HSL_BAND_COUNT, ToneCurves, ViewportCamera};
+use rune_editor_core::{
+    ADVANCED_COLOR_SLICE_COUNT, CURVE_LUT_SIZE, DevelopRecipe, HSL_BAND_COUNT,
+    LAYER_MASK_ATLAS_HEIGHT, LAYER_MASK_ATLAS_WIDTH, LayerMaskAtlas, LayerMaskItem,
+    MAX_ADJUSTMENT_LAYERS, MAX_HEAL_SPOTS, ToneCurves, ViewportCamera, bake_layer_mask_atlas,
+};
 use rune_editor_decode::LinearImage;
 
 const DEVELOP_WGSL: &str = include_str!("../../../shaders/develop.wgsl");
@@ -51,6 +55,52 @@ pub struct DevelopUniforms {
     pub geo_xform: [f32; 4],
     /// Viewer overlays `[exposure_warning, focus_mask, crop_mode, grid_mode]`.
     pub overlay_flags: [f32; 4],
+    /// Capture One Color Balance Master wheel `[hue_x, hue_y, luma, 0.0]`.
+    pub master_wheel: [f32; 4],
+    /// B&W Split Toning `[split_shadow_hue, split_shadow_sat, split_highlight_hue, split_highlight_sat]`.
+    pub bw_split: [f32; 4],
+    /// Per-channel Red Levels input `[in_black, in_mid, in_white, r_active (0/1)]`.
+    pub levels_r_in: [f32; 4],
+    /// Per-channel Green Levels input `[in_black, in_mid, in_white, g_active (0/1)]`.
+    pub levels_g_in: [f32; 4],
+    /// Per-channel Blue Levels input `[in_black, in_mid, in_white, b_active (0/1)]`.
+    pub levels_b_in: [f32; 4],
+    /// Per-channel R/G Levels output `[r.out_black, r.out_white, g.out_black, g.out_white]`.
+    pub levels_rgb_out: [f32; 4],
+    /// `[b.out_black, b.out_white, film_curve (0..3), master_levels_active (0/1)]`.
+    pub levels_b_out_curve: [f32; 4],
+    /// Extended spatial detail `[sharpen_radius, sharpen_threshold, sharpen_halo, nr_color]`.
+    pub detail_ext: [f32; 4],
+    /// Mode selectors & grain size `[clarity_method (0..3), grain_type (0..5), grain_size (0..1), vignette_method (0..2)]`.
+    pub style_modes: [f32; 4],
+    /// Advanced Color Editor (4 slices × 3 `vec4<f32>`).
+    pub advanced_color: [[f32; 4]; ADVANCED_COLOR_SLICE_COUNT * 3],
+    /// Skin Tone Uniformity (3 `vec4<f32>`).
+    pub skin_tone: [[f32; 4]; 3],
+    /// Optical Lens Correction `[distortion, chromatic_aberration, purple_fringing, light_falloff]`.
+    pub lens: [f32; 4],
+    /// Perspective Keystone `[keystone_vertical, keystone_horizontal, keystone_aspect, keystone_amount]`.
+    pub geo_keystone: [f32; 4],
+    /// Transient viewport flags `[view_color_range (-1..4), loupe_enabled (0/1), 0.0, 0.0]`.
+    pub viewport_extra: [f32; 4],
+    /// 120Hz GPU Loupe overlay `[loupe_u (0..1), loupe_v (0..1), loupe_zoom (1.25..16), loupe_radius_px]`.
+    pub loupe_params: [f32; 4],
+    /// Mask overlay & counts `[mask_overlay_mode (0/1/2), active_layer_index (-1..7), layer_count (0..8), heal_count (0..16)]`.
+    pub mask_overlay: [f32; 4],
+    /// Per-layer metadata (8 layers): `[enabled (0/1), opacity (0..1), inverted (0/1), has_spatial (0/1)]`.
+    pub layer_meta: [[f32; 4]; MAX_ADJUSTMENT_LAYERS],
+    /// Per-layer local adjustments (8 layers × 3 `vec4<f32>`).
+    pub layer_adj: [[f32; 4]; MAX_ADJUSTMENT_LAYERS * 3],
+    /// Per-layer live Luma Range params `[low, high, low_falloff, high_falloff]`.
+    pub layer_luma_a: [[f32; 4]; MAX_ADJUSTMENT_LAYERS],
+    /// Per-layer live Luma Range flags `[enabled (0/1), op (0/1/2), inverted (0/1), 0.0]`.
+    pub layer_luma_b: [[f32; 4]; MAX_ADJUSTMENT_LAYERS],
+    /// Spot Heal & Clone stamps (16 spots × 2 `vec4<f32>`).
+    pub heal_spots: [[f32; 4]; MAX_HEAL_SPOTS * 2],
+    /// Film Negative Conversion `[base_r, base_g, base_b, processing_mode (0/1)]`.
+    pub film_neg_a: [f32; 4],
+    /// Film Negative Conversion `[density, contrast, black_clip, white_clip]`.
+    pub film_neg_b: [f32; 4],
 }
 
 impl DevelopUniforms {
@@ -73,8 +123,91 @@ impl DevelopUniforms {
                 0.0
             }
         };
+        let clamp_pos = |v: f32, default_v: f32, min_v: f32, max_v: f32| {
+            if v.is_finite() {
+                v.clamp(min_v, max_v)
+            } else {
+                default_v
+            }
+        };
         let levels = recipe.levels.sanitized();
         let levels_active = if levels.is_identity() { 0.0 } else { 1.0 };
+        let master_levels_active = if levels.is_master_identity() {
+            0.0
+        } else {
+            1.0
+        };
+        let r_active = if levels.red.is_identity() { 0.0 } else { 1.0 };
+        let g_active = if levels.green.is_identity() { 0.0 } else { 1.0 };
+        let b_active = if levels.blue.is_identity() { 0.0 } else { 1.0 };
+
+        let mut advanced_color = [[0.0_f32; 4]; ADVANCED_COLOR_SLICE_COUNT * 3];
+        for (i, slice) in recipe.advanced_color.iter().enumerate() {
+            let packed = slice.to_uniforms();
+            advanced_color[i * 3] = packed[0];
+            advanced_color[i * 3 + 1] = packed[1];
+            advanced_color[i * 3 + 2] = packed[2];
+        }
+
+        let layer_count = recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS);
+        let heal_count = recipe.heal_spots.len().min(MAX_HEAL_SPOTS);
+        let mut layer_meta = [[0.0_f32; 4]; MAX_ADJUSTMENT_LAYERS];
+        let mut layer_adj = [[0.0_f32; 4]; MAX_ADJUSTMENT_LAYERS * 3];
+        let mut layer_luma_a = [[0.0_f32; 4]; MAX_ADJUSTMENT_LAYERS];
+        let mut layer_luma_b = [[0.0_f32; 4]; MAX_ADJUSTMENT_LAYERS];
+
+        for (i, layer) in recipe.layers.iter().take(MAX_ADJUSTMENT_LAYERS).enumerate() {
+            let clean = layer.sanitized();
+            let mut has_spatial = false;
+            let mut luma_spec = rune_editor_core::LayerLumaRangeSpec::default();
+            for item in &clean.masks {
+                if !item.enabled {
+                    continue;
+                }
+                if let rune_editor_core::MaskShape::LumaRange {
+                    low,
+                    high,
+                    low_falloff,
+                    high_falloff,
+                } = item.shape
+                {
+                    if !luma_spec.enabled {
+                        luma_spec = rune_editor_core::LayerLumaRangeSpec {
+                            enabled: true,
+                            low,
+                            high,
+                            low_falloff,
+                            high_falloff,
+                            op: item.op,
+                            inverted: item.inverted,
+                        };
+                    }
+                } else {
+                    has_spatial = true;
+                }
+            }
+            layer_meta[i] = [
+                if clean.enabled { 1.0 } else { 0.0 },
+                clean.opacity,
+                if clean.inverted { 1.0 } else { 0.0 },
+                if has_spatial { 1.0 } else { 0.0 },
+            ];
+            let adj_u = clean.adjustments.to_uniforms();
+            layer_adj[i * 3] = adj_u[0];
+            layer_adj[i * 3 + 1] = adj_u[1];
+            layer_adj[i * 3 + 2] = adj_u[2];
+            let (la, lb) = luma_spec.to_uniforms();
+            layer_luma_a[i] = la;
+            layer_luma_b[i] = lb;
+        }
+
+        let mut heal_spots = [[0.0_f32; 4]; MAX_HEAL_SPOTS * 2];
+        for (i, spot) in recipe.heal_spots.iter().take(MAX_HEAL_SPOTS).enumerate() {
+            let packed = spot.to_uniforms();
+            heal_spots[i * 2] = packed[0];
+            heal_spots[i * 2 + 1] = packed[1];
+        }
+        let (film_neg_a, film_neg_b) = recipe.film_negative.to_uniforms(recipe.processing_mode);
 
         Self {
             slot_rect,
@@ -114,9 +247,9 @@ impl DevelopUniforms {
                 if camera.show_original { 1.0 } else { 0.0 },
                 if srgb_blend { 1.0 } else { 0.0 },
             ],
-            shadows_wheel: recipe.shadows_wheel.to_uniform(),
-            midtones_wheel: recipe.midtones_wheel.to_uniform(),
-            highlights_wheel: recipe.highlights_wheel.to_uniform(),
+            shadows_wheel: recipe.shadows_wheel.clamped().to_uniform(),
+            midtones_wheel: recipe.midtones_wheel.clamped().to_uniform(),
+            highlights_wheel: recipe.highlights_wheel.clamped().to_uniform(),
             hsl,
             detail: [
                 recipe.clarity,
@@ -145,6 +278,81 @@ impl DevelopUniforms {
                 if camera.crop_mode { 1.0 } else { 0.0 },
                 recipe.geometry.grid.to_uniform_f32(),
             ],
+            master_wheel: recipe.master_wheel.clamped().to_uniform(),
+            bw_split: recipe.bw.to_split_uniform(),
+            levels_r_in: [
+                levels.red.in_black,
+                levels.red.in_mid,
+                levels.red.in_white,
+                r_active,
+            ],
+            levels_g_in: [
+                levels.green.in_black,
+                levels.green.in_mid,
+                levels.green.in_white,
+                g_active,
+            ],
+            levels_b_in: [
+                levels.blue.in_black,
+                levels.blue.in_mid,
+                levels.blue.in_white,
+                b_active,
+            ],
+            levels_rgb_out: [
+                levels.red.out_black,
+                levels.red.out_white,
+                levels.green.out_black,
+                levels.green.out_white,
+            ],
+            levels_b_out_curve: [
+                levels.blue.out_black,
+                levels.blue.out_white,
+                recipe.film_curve.to_uniform_f32(),
+                master_levels_active,
+            ],
+            detail_ext: [
+                clamp_pos(recipe.sharpen_radius, 1.0, 0.5, 4.0),
+                clamp_pos(recipe.sharpen_threshold, 0.0, 0.0, 1.0),
+                clamp_pos(recipe.sharpen_halo, 0.0, 0.0, 1.0),
+                clamp_pos(recipe.nr_color, 0.0, 0.0, 1.0),
+            ],
+            style_modes: [
+                recipe.clarity_method.to_uniform_f32(),
+                recipe.grain_type.to_uniform_f32(),
+                clamp_pos(recipe.grain_size, 0.35, 0.0, 1.0),
+                recipe.vignette_method.to_uniform_f32(),
+            ],
+            advanced_color,
+            skin_tone: recipe.skin_tone.to_uniforms(),
+            lens: recipe.lens.to_uniform(),
+            geo_keystone: recipe.geometry.to_keystone_uniform(),
+            viewport_extra: [
+                camera.view_color_range.clamp(-1, 4) as f32,
+                if camera.loupe_enabled { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+            loupe_params: [
+                clamp_pos(camera.loupe_uv[0], 0.5, 0.0, 1.0),
+                clamp_pos(camera.loupe_uv[1], 0.5, 0.0, 1.0),
+                clamp_pos(camera.loupe_zoom, 2.5, 1.25, 16.0),
+                clamp_pos(camera.loupe_radius_px, 96.0, 24.0, 320.0),
+            ],
+            mask_overlay: [
+                camera.mask_overlay_mode.clamp(0, 2) as f32,
+                camera
+                    .active_layer_index
+                    .clamp(-1, (MAX_ADJUSTMENT_LAYERS as i32) - 1) as f32,
+                layer_count as f32,
+                heal_count as f32,
+            ],
+            layer_meta,
+            layer_adj,
+            layer_luma_a,
+            layer_luma_b,
+            heal_spots,
+            film_neg_a,
+            film_neg_b,
         }
     }
 }
@@ -160,6 +368,9 @@ pub struct DevelopGpuResources {
     curve_lut_texture: wgpu::Texture,
     curve_lut_view: wgpu::TextureView,
     uploaded_curves: Option<ToneCurves>,
+    layer_mask_atlas_texture: wgpu::Texture,
+    layer_mask_atlas_view: wgpu::TextureView,
+    uploaded_layer_masks: Option<Vec<Vec<LayerMaskItem>>>,
     photo_texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     uploaded_generation: u64,
@@ -212,6 +423,16 @@ impl DevelopGpuResources {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -255,6 +476,23 @@ impl DevelopGpuResources {
         });
         let curve_lut_view = curve_lut_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let layer_mask_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rune-editor layer mask atlas 1024x512 r8unorm"),
+            size: wgpu::Extent3d {
+                width: LAYER_MASK_ATLAS_WIDTH,
+                height: LAYER_MASK_ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let layer_mask_atlas_view =
+            layer_mask_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             shader,
             bind_group_layout,
@@ -265,6 +503,9 @@ impl DevelopGpuResources {
             curve_lut_texture,
             curve_lut_view,
             uploaded_curves: None,
+            layer_mask_atlas_texture,
+            layer_mask_atlas_view,
+            uploaded_layer_masks: None,
             photo_texture: None,
             bind_group: None,
             uploaded_generation: 0,
@@ -309,9 +550,49 @@ impl DevelopGpuResources {
         self.uploaded_curves = Some(recipe.curves.clone());
     }
 
+    fn write_layer_mask_atlas(&self, queue: &wgpu::Queue, atlas: &LayerMaskAtlas) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layer_mask_atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width),
+                rows_per_image: Some(atlas.height),
+            },
+            wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Bakes and uploads the `1024×512` `R8Unorm` layer mask atlas ONLY when layer masks
+    /// have changed since the last upload (zero re-bake or allocation on 120Hz local slider drags).
+    pub fn ensure_layer_masks_uploaded(&mut self, queue: &wgpu::Queue, recipe: &DevelopRecipe) {
+        let slice = &recipe.layers[..recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS)];
+        let unchanged = self.uploaded_layer_masks.as_ref().is_some_and(|cached| {
+            cached.len() == slice.len()
+                && cached
+                    .iter()
+                    .zip(slice.iter())
+                    .all(|(c, l)| c.as_slice() == l.masks.as_slice())
+        });
+        if unchanged {
+            return;
+        }
+        let atlas = bake_layer_mask_atlas(slice);
+        self.write_layer_mask_atlas(queue, &atlas);
+        self.uploaded_layer_masks = Some(slice.iter().map(|l| l.masks.clone()).collect());
+    }
+
     /// Uploads the scene-referred `Rgba16Float` image texture only when `generation` changes.
-    /// Also initializes the tone curve LUT to an identity ramp on first upload if
-    /// `ensure_curve_lut_uploaded` has not yet been called.
+    /// Also initializes the tone curve LUT and layer mask atlas on first upload if not yet uploaded.
     pub fn ensure_image_uploaded(
         &mut self,
         device: &wgpu::Device,
@@ -323,6 +604,11 @@ impl DevelopGpuResources {
             let identity = ToneCurves::identity_lut_f16();
             self.write_curve_lut_f16(queue, &identity);
             self.uploaded_curves = Some(ToneCurves::default());
+        }
+        if self.uploaded_layer_masks.is_none() {
+            let empty = LayerMaskAtlas::empty();
+            self.write_layer_mask_atlas(queue, &empty);
+            self.uploaded_layer_masks = Some(Vec::new());
         }
 
         if self.uploaded_generation == generation && self.bind_group.is_some() {
@@ -384,6 +670,10 @@ impl DevelopGpuResources {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&self.curve_lut_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.layer_mask_atlas_view),
                 },
             ],
         });
@@ -450,32 +740,51 @@ impl DevelopGpuResources {
 mod tests {
     use super::*;
     use rune_editor_core::{
-        BlackAndWhiteParams, ColorWheel, CompositionGrid, GeometryParams, HslBand, LevelsParams,
-        ToneCurves, evaluate_pixel_linear,
+        BlackAndWhiteParams, ChannelLevels, ClarityMethod, ColorEditorSlice, ColorWheel,
+        CompositionGrid, FilmCurve, GeometryParams, GrainType, HslBand, LensParams, LevelsParams,
+        SkinToneParams, ToneCurves, VignetteMethod, evaluate_pixel_linear,
     };
 
     #[test]
     fn develop_uniforms_alignment_and_packing() {
         let size = std::mem::size_of::<DevelopUniforms>();
-        assert_eq!(size, 416);
+        assert_eq!(size, 2192);
         assert_eq!(size % 16, 0);
 
         let mut recipe = DevelopRecipe {
+            film_curve: FilmCurve::FilmExtraShadow,
             shadows_wheel: ColorWheel::new(-0.2, -0.3, -0.1),
             midtones_wheel: ColorWheel::new(0.1, 0.05, 0.02),
             highlights_wheel: ColorWheel::new(0.3, 0.2, 0.04),
+            master_wheel: ColorWheel::new(0.15, -0.1, 0.08),
             clarity: 0.35,
+            clarity_method: ClarityMethod::Punch,
             sharpen: 0.5,
+            sharpen_radius: 2.2,
+            sharpen_threshold: 0.25,
+            sharpen_halo: 0.4,
             noise_reduction: 0.25,
+            nr_color: 0.6,
             structure: 0.42,
             brightness: 0.30,
             dehaze: 0.28,
+            grain: 0.2,
+            grain_type: GrainType::SilverRich,
+            grain_size: 0.65,
             levels: LevelsParams {
                 in_black: 0.05,
                 in_mid: 0.15,
                 in_white: 0.92,
                 out_black: 0.01,
                 out_white: 0.98,
+                red: ChannelLevels {
+                    in_black: 0.03,
+                    in_mid: 0.1,
+                    in_white: 0.95,
+                    out_black: 0.02,
+                    out_white: 0.97,
+                },
+                ..LevelsParams::default()
             },
             bw: BlackAndWhiteParams {
                 enabled: true,
@@ -485,6 +794,10 @@ mod tests {
                 cyan: -0.3,
                 blue: -0.6,
                 magenta: 0.1,
+                split_shadow_hue: 220.0,
+                split_shadow_sat: 0.35,
+                split_highlight_hue: 40.0,
+                split_highlight_sat: 0.25,
             },
             geometry: GeometryParams {
                 crop: [0.1, 0.2, 0.8, 0.7],
@@ -503,6 +816,10 @@ mod tests {
             exposure_warning: true,
             focus_mask: true,
             crop_mode: true,
+            loupe_enabled: true,
+            loupe_uv: [0.35, 0.65],
+            loupe_zoom: 3.0,
+            loupe_radius_px: 112.0,
             ..ViewportCamera::default()
         };
         let u = DevelopUniforms::build(
@@ -516,16 +833,48 @@ mod tests {
         assert_eq!(u.shadows_wheel, [-0.2, -0.3, -0.1, 0.0]);
         assert_eq!(u.midtones_wheel, [0.1, 0.05, 0.02, 0.0]);
         assert_eq!(u.highlights_wheel, [0.3, 0.2, 0.04, 0.0]);
+        assert_eq!(u.master_wheel, [0.15, -0.1, 0.08, 0.0]);
         assert_eq!(u.hsl[5], [0.15, -0.4, -0.2, 0.0]);
         assert_eq!(u.detail, [0.35, 0.5, 0.25, 0.42]);
+        assert_eq!(u.detail_ext, [2.2, 0.25, 0.4, 0.6]);
+        assert_eq!(u.style_modes, [1.0, 1.0, 0.65, 0.0]);
+        assert_eq!(u.geo_keystone, [0.0, 0.0, 0.0, 0.8]);
+        assert_eq!(u.viewport_extra, [-1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(u.loupe_params, [0.35, 0.65, 3.0, 112.0]);
         assert_eq!(u.atmosphere, [0.30, 0.28, 0.01, 0.98]);
         assert_eq!(u.levels, [0.05, 0.15, 0.92, 1.0]);
+        assert_eq!(u.levels_r_in, [0.03, 0.1, 0.95, 1.0]);
+        assert_eq!(u.levels_g_in[3], 0.0);
+        assert_eq!(u.levels_rgb_out[0..2], [0.02, 0.97]);
+        assert_eq!(u.levels_b_out_curve[2..4], [1.0, 1.0]);
         assert_eq!(u.bw_channels[0], [1.0, 0.4, 0.2, -0.1]);
         assert_eq!(u.bw_channels[1], [-0.3, -0.6, 0.1, 0.0]);
+        assert_eq!(u.bw_split, [220.0, 0.35, 40.0, 0.25]);
         assert_eq!(u.geo_crop, [0.1, 0.2, 0.8, 0.7]);
         assert!((u.geo_xform[0] - 5.0_f32.to_radians()).abs() < 1e-6);
         assert_eq!(u.geo_xform[1..4], [1.0, 1.0, 0.0]);
         assert_eq!(u.overlay_flags, [1.0, 1.0, 1.0, 2.0]);
+
+        // Out-of-disk / NaN wheels must be clamped safely in DevelopUniforms::build.
+        let wild = DevelopRecipe {
+            shadows_wheel: ColorWheel::new(3.0, 4.0, 5.0),
+            midtones_wheel: ColorWheel::new(f32::NAN, f32::INFINITY, f32::NEG_INFINITY),
+            master_wheel: ColorWheel::new(3.0, 4.0, f32::NAN),
+            ..DevelopRecipe::default()
+        };
+        let uw = DevelopUniforms::build(
+            [0.0, 0.0, 100.0, 100.0],
+            [100, 100],
+            [100, 100],
+            &ViewportCamera::default(),
+            &wild,
+            false,
+        );
+        let len = uw.shadows_wheel[0].hypot(uw.shadows_wheel[1]);
+        assert!((len - 1.0).abs() < 1e-5 && uw.shadows_wheel[2] == 1.0);
+        assert_eq!(uw.midtones_wheel, [0.0, 0.0, 0.0, 0.0]);
+        let mlen = uw.master_wheel[0].hypot(uw.master_wheel[1]);
+        assert!((mlen - 1.0).abs() < 1e-5 && uw.master_wheel[2] == 0.0);
     }
 
     fn block_on_simple<F: std::future::Future>(fut: F) -> F::Output {
@@ -552,6 +901,7 @@ mod tests {
         target_h: u32,
     ) -> Vec<[f32; 4]> {
         gpu.ensure_curve_lut_uploaded(queue, recipe);
+        gpu.ensure_layer_masks_uploaded(queue, recipe);
         let target_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("parity target"),
             size: wgpu::Extent3d {
@@ -703,13 +1053,31 @@ mod tests {
                 in_white: 0.92,
                 out_black: 0.02,
                 out_white: 0.98,
+                red: ChannelLevels {
+                    in_black: 0.02,
+                    in_mid: 0.12,
+                    in_white: 0.96,
+                    out_black: 0.01,
+                    out_white: 0.99,
+                },
+                green: ChannelLevels {
+                    in_mid: -0.08,
+                    ..ChannelLevels::default()
+                },
+                blue: ChannelLevels {
+                    in_black: 0.03,
+                    out_white: 0.95,
+                    ..ChannelLevels::default()
+                },
             },
             vibrance: 0.25,
             saturation: 0.10,
             shadows_wheel: ColorWheel::new(-0.18, -0.24, -0.05),
             midtones_wheel: ColorWheel::new(0.12, 0.06, 0.04),
             highlights_wheel: ColorWheel::new(0.25, 0.15, 0.02),
+            master_wheel: ColorWheel::new(0.10, -0.08, 0.05),
             curves: ToneCurves {
+                rgb: vec![[0.0, 0.01], [0.5, 0.54], [1.0, 0.99]],
                 luma: vec![[0.0, 0.02], [0.25, 0.20], [0.75, 0.82], [1.0, 0.98]],
                 red: vec![[0.0, 0.0], [0.5, 0.54], [1.0, 1.0]],
                 blue: vec![[0.0, 0.02], [0.5, 0.47], [1.0, 0.96]],
@@ -719,24 +1087,54 @@ mod tests {
         };
         recipe.hsl[5] = HslBand::new(-0.12, 0.18, -0.10);
         recipe.hsl[6] = HslBand::new(0.08, -0.15, 0.08);
+        recipe.advanced_color[0] = ColorEditorSlice {
+            enabled: true,
+            target_hue: 255.0,
+            target_sat: 0.45,
+            hue_range: 45.0,
+            sat_range: 0.50,
+            smoothness: 0.40,
+            hue_shift: 0.20,
+            saturation: 0.15,
+            lightness: -0.10,
+            uniformity: 0.35,
+        };
+        recipe.skin_tone = SkinToneParams {
+            enabled: true,
+            target_hue: 255.0,
+            target_sat: 0.45,
+            target_lightness: 0.60,
+            smoothness: 0.50,
+            uniformity_hue: 0.30,
+            uniformity_sat: 0.25,
+            uniformity_lightness: 0.20,
+            amount_hue: -0.10,
+            amount_sat: 0.12,
+            amount_lightness: 0.08,
+        };
 
         let camera = ViewportCamera {
             zoom: 4.0,
             ..ViewportCamera::default()
         };
-        let pixels = render_offscreen_rgba32f(&device, &queue, &mut gpu, &camera, &recipe, 64, 64);
-        let center_gpu = pixels[32 * 64 + 32];
-        let cpu = evaluate_pixel_linear(src_rgb, &recipe);
-        for ch in 0..3 {
-            assert!(
-                (center_gpu[ch] - cpu[ch]).abs() < 2e-3,
-                "Color GPU/CPU parity drift ch {ch}: gpu={} vs cpu={}",
-                center_gpu[ch],
-                cpu[ch]
-            );
+        for curve in FilmCurve::ALL {
+            recipe.film_curve = curve;
+            let pixels =
+                render_offscreen_rgba32f(&device, &queue, &mut gpu, &camera, &recipe, 64, 64);
+            let center_gpu = pixels[32 * 64 + 32];
+            let cpu = evaluate_pixel_linear(src_rgb, &recipe);
+            for ch in 0..3 {
+                assert!(
+                    (center_gpu[ch] - cpu[ch]).abs() < 2e-3,
+                    "Color GPU/CPU parity drift ({curve:?}) ch {ch}: gpu={} vs cpu={}",
+                    center_gpu[ch],
+                    cpu[ch]
+                );
+            }
         }
+        recipe.film_curve = FilmCurve::FilmStandard;
 
-        // Same full stack + 6-Channel B&W Mixer enabled.
+        // Same full stack + 6-Channel B&W Mixer + Split Toning enabled.
         recipe.bw = BlackAndWhiteParams {
             enabled: true,
             red: 0.35,
@@ -745,6 +1143,10 @@ mod tests {
             cyan: -0.35,
             blue: -0.65,
             magenta: 0.25,
+            split_shadow_hue: 220.0,
+            split_shadow_sat: 0.45,
+            split_highlight_hue: 38.0,
+            split_highlight_sat: 0.35,
         };
         let bw_pixels =
             render_offscreen_rgba32f(&device, &queue, &mut gpu, &camera, &recipe, 64, 64);
@@ -809,6 +1211,7 @@ mod tests {
                 in_white: 1.0,
                 out_black: 0.0,
                 out_white: 1.0,
+                ..LevelsParams::default()
             },
             ..DevelopRecipe::default()
         };
@@ -893,6 +1296,648 @@ mod tests {
         assert!(
             edge_px[1] > edge_px[0] && edge_px[1] > 0.4,
             "Focus mask should highlight sharp step edge green, got {edge_px:?}"
+        );
+
+        // Full-resolution 1:1 GPU vs CPU spatial detail (NR + Clarity + Structure + Sharpen) + Vignette + Grain parity.
+        // 40x40 textured linear scene rendered into a 96x96 target (pad = 28px -> exact 1:1 40x40 interior pixels;
+        // 96 * 16 = 1536 bytes/row respects wgpu's 256-byte COPY_BYTES_PER_ROW_ALIGNMENT).
+        let mut tex_rgba = Vec::with_capacity(40 * 40 * 4);
+        for y in 0..40u32 {
+            for x in 0..40u32 {
+                let base = if x < 20 { 0.14 } else { 0.34 };
+                let wave = ((x as f32 * 0.9).sin() * 0.04) + ((y as f32 * 1.1).cos() * 0.03);
+                let r = (base + wave + 0.02).max(0.01);
+                let g = (base + wave * 0.6).max(0.01);
+                let b = (base - wave * 0.5 + 0.04).max(0.01);
+                tex_rgba.push(half::f16::from_f32(r));
+                tex_rgba.push(half::f16::from_f32(g));
+                tex_rgba.push(half::f16::from_f32(b));
+                tex_rgba.push(half::f16::from_f32(1.0));
+            }
+        }
+        let tex_img = LinearImage {
+            width: 40,
+            height: 40,
+            rgba16f: tex_rgba,
+            histogram_proxy: vec![[0.2, 0.2, 0.2]],
+            display_name: "spatial_parity".to_owned(),
+            source_path: None,
+            format_label: "TEST".to_owned(),
+            exif: None,
+        };
+        gpu.ensure_image_uploaded(&device, &queue, 3, &tex_img);
+
+        let fit_cam = ViewportCamera::default();
+        let stage_cases: [(&str, DevelopRecipe); 18] = [
+            (
+                "noise_reduction",
+                DevelopRecipe {
+                    noise_reduction: 0.35,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "nr_color_only",
+                DevelopRecipe {
+                    nr_color: 0.70,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "clarity_natural",
+                DevelopRecipe {
+                    clarity: 0.45,
+                    clarity_method: ClarityMethod::Natural,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "clarity_punch",
+                DevelopRecipe {
+                    clarity: 0.45,
+                    clarity_method: ClarityMethod::Punch,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "clarity_neutral",
+                DevelopRecipe {
+                    clarity: 0.45,
+                    clarity_method: ClarityMethod::Neutral,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "clarity_classic",
+                DevelopRecipe {
+                    clarity: 0.45,
+                    clarity_method: ClarityMethod::Classic,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "structure",
+                DevelopRecipe {
+                    structure: 0.40,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "sharpen_default",
+                DevelopRecipe {
+                    sharpen: 0.50,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "sharpen_extended",
+                DevelopRecipe {
+                    sharpen: 0.65,
+                    sharpen_radius: 2.2,
+                    sharpen_threshold: 0.20,
+                    sharpen_halo: 0.55,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "vignette",
+                DevelopRecipe {
+                    exposure: 0.20,
+                    vignette: -0.35,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "vignette_circular_crop",
+                DevelopRecipe {
+                    vignette: -0.45,
+                    vignette_method: VignetteMethod::CircularOnCrop,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "vignette_circular_full",
+                DevelopRecipe {
+                    vignette: -0.45,
+                    vignette_method: VignetteMethod::Circular,
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "lens_light_falloff_and_fringing",
+                DevelopRecipe {
+                    lens: LensParams {
+                        purple_fringing: 0.75,
+                        light_falloff: 0.65,
+                        ..LensParams::default()
+                    },
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "lens_distortion_and_ca",
+                DevelopRecipe {
+                    lens: LensParams {
+                        distortion: 0.35,
+                        chromatic_aberration: 0.50,
+                        ..LensParams::default()
+                    },
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "keystone_perspective",
+                DevelopRecipe {
+                    geometry: GeometryParams {
+                        keystone_vertical: 0.35,
+                        keystone_horizontal: -0.20,
+                        keystone_aspect: 0.15,
+                        keystone_amount: 0.80,
+                        ..GeometryParams::default()
+                    },
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "straighten_keystone_and_neg_distortion",
+                DevelopRecipe {
+                    geometry: GeometryParams {
+                        straighten_deg: 12.0,
+                        keystone_vertical: 0.30,
+                        keystone_amount: 0.80,
+                        ..GeometryParams::default()
+                    },
+                    lens: LensParams {
+                        distortion: -0.85,
+                        ..LensParams::default()
+                    },
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "advanced_color_and_skin_tone",
+                DevelopRecipe {
+                    advanced_color: [
+                        ColorEditorSlice {
+                            enabled: true,
+                            target_hue: 215.0,
+                            target_sat: 0.25,
+                            hue_range: 60.0,
+                            sat_range: 0.50,
+                            smoothness: 0.45,
+                            hue_shift: 0.25,
+                            saturation: 0.20,
+                            lightness: -0.10,
+                            uniformity: 0.40,
+                        },
+                        ColorEditorSlice::default(),
+                        ColorEditorSlice::default(),
+                        ColorEditorSlice::default(),
+                    ],
+                    skin_tone: SkinToneParams {
+                        enabled: true,
+                        target_hue: 35.0,
+                        target_sat: 0.20,
+                        target_lightness: 0.55,
+                        smoothness: 0.50,
+                        uniformity_hue: 0.40,
+                        uniformity_sat: 0.30,
+                        uniformity_lightness: 0.25,
+                        amount_hue: 0.10,
+                        amount_sat: 0.15,
+                        amount_lightness: 0.05,
+                    },
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "combined_spatial_and_vignette",
+                DevelopRecipe {
+                    exposure: 0.20,
+                    film_curve: FilmCurve::FilmExtraShadow,
+                    noise_reduction: 0.35,
+                    nr_color: 0.50,
+                    clarity: 0.45,
+                    clarity_method: ClarityMethod::Punch,
+                    structure: 0.40,
+                    sharpen: 0.50,
+                    sharpen_radius: 1.8,
+                    sharpen_threshold: 0.15,
+                    sharpen_halo: 0.40,
+                    vignette: -0.35,
+                    ..DevelopRecipe::default()
+                },
+            ),
+        ];
+
+        for (label, spatial_recipe) in stage_cases {
+            let gpu_px = render_offscreen_rgba32f(
+                &device,
+                &queue,
+                &mut gpu,
+                &fit_cam,
+                &spatial_recipe,
+                96,
+                96,
+            );
+            let (cw, ch, cpu_srgb) = rune_editor_decode::export::render_developed_srgb_f32(
+                &tex_img,
+                &spatial_recipe,
+                &rune_editor_decode::ExportOptions::default(),
+            )
+            .expect("render cpu spatial parity");
+            assert_eq!((cw, ch), (40, 40));
+
+            let mut max_diff = 0.0_f32;
+            let mut worst = (0u32, 0u32, 0usize, 0.0_f32, 0.0_f32);
+            for y in 2..38u32 {
+                for x in 2..38u32 {
+                    let gp = gpu_px[((28 + y) * 96 + (28 + x)) as usize];
+                    let cp = cpu_srgb[(y * cw + x) as usize];
+                    for ch in 0..3 {
+                        let gpu_srgb = rune_editor_core::linear_to_srgb(gp[ch]);
+                        let diff = (gpu_srgb - cp[ch]).abs();
+                        if diff > max_diff {
+                            max_diff = diff;
+                            worst = (x, y, ch, gpu_srgb, cp[ch]);
+                        }
+                    }
+                }
+            }
+            assert!(
+                max_diff < 2e-3,
+                "GPU vs CPU parity drift for '{label}': max={max_diff} at ({},{}) ch={} gpu={} cpu={}",
+                worst.0,
+                worst.1,
+                worst.2,
+                worst.3,
+                worst.4
+            );
+        }
+
+        // Step 12 post-vignette film grain parity across all 6 Capture One GrainType profiles + grain_size.
+        // Chaotic `fract()` in `hash12` can flip across an integer boundary on ~0.1% of coordinates due to
+        // GPU vs CPU FMA rounding; verify >=99% exact (<2e-3) pixel parity across the frame.
+        for grain_type in GrainType::ALL {
+            let grain_recipe = DevelopRecipe {
+                exposure: 1.0,
+                vignette: -0.6,
+                grain: 0.35,
+                grain_type,
+                grain_size: 0.60,
+                ..DevelopRecipe::default()
+            };
+            let gpu_grain = render_offscreen_rgba32f(
+                &device,
+                &queue,
+                &mut gpu,
+                &fit_cam,
+                &grain_recipe,
+                96,
+                96,
+            );
+            let (cw, _ch, cpu_grain) = rune_editor_decode::export::render_developed_srgb_f32(
+                &tex_img,
+                &grain_recipe,
+                &rune_editor_decode::ExportOptions::default(),
+            )
+            .expect("render cpu grain parity");
+            let mut total_px = 0usize;
+            let mut exact_px = 0usize;
+            for y in 2..38u32 {
+                for x in 2..38u32 {
+                    total_px += 1;
+                    let gp = gpu_grain[((28 + y) * 96 + (28 + x)) as usize];
+                    let cp = cpu_grain[(y * cw + x) as usize];
+                    let px_ok = (0..3)
+                        .all(|ch| (rune_editor_core::linear_to_srgb(gp[ch]) - cp[ch]).abs() < 2e-3);
+                    if px_ok {
+                        exact_px += 1;
+                    }
+                }
+            }
+            assert!(
+                exact_px * 100 >= total_px * 99,
+                "GPU vs CPU grain parity too low for {grain_type:?}: {exact_px}/{total_px} pixels within 2e-3"
+            );
+        }
+
+        // Verify transient `view_color_range` desaturates out-of-range colors on GPU without altering target colors.
+        let mut vr_recipe = DevelopRecipe::default();
+        vr_recipe.advanced_color[0] = ColorEditorSlice {
+            enabled: true,
+            target_hue: 0.0, // Red
+            target_sat: 0.85,
+            hue_range: 25.0,
+            sat_range: 0.45,
+            smoothness: 0.2,
+            ..ColorEditorSlice::default()
+        };
+        gpu.ensure_image_uploaded(&device, &queue, 4, &quad_img);
+        let vr_cam = ViewportCamera {
+            view_color_range: 0,
+            ..ViewportCamera::default()
+        };
+        let vr_px =
+            render_offscreen_rgba32f(&device, &queue, &mut gpu, &vr_cam, &vr_recipe, 96, 96);
+        // Top-left quadrant (Red) stays colorful; top-right quadrant (Green) desaturates to grayscale.
+        let red_sample = vr_px[36 * 96 + 36];
+        let green_sample = vr_px[36 * 96 + 56];
+        assert!(
+            red_sample[0] > red_sample[1] + 0.2,
+            "view_color_range should preserve selected red slice: {red_sample:?}"
+        );
+        assert!(
+            (green_sample[0] - green_sample[1]).abs() < 0.02
+                && (green_sample[1] - green_sample[2]).abs() < 0.02,
+            "view_color_range should desaturate out-of-range green: {green_sample:?}"
+        );
+
+        // Verify 120Hz GPU Loupe overlay magnifies around loupe_uv, draws neutral rim,
+        // and leaves pixels outside the loupe circle identical to loupe_enabled=false.
+        let base_px = render_offscreen_rgba32f(
+            &device,
+            &queue,
+            &mut gpu,
+            &ViewportCamera::default(),
+            &DevelopRecipe::default(),
+            96,
+            96,
+        );
+        let loupe_cam = ViewportCamera {
+            loupe_enabled: true,
+            loupe_uv: [0.55, 0.55],
+            loupe_zoom: 3.0,
+            loupe_radius_px: 24.0,
+            ..ViewportCamera::default()
+        };
+        let loupe_px = render_offscreen_rgba32f(
+            &device,
+            &queue,
+            &mut gpu,
+            &loupe_cam,
+            &DevelopRecipe::default(),
+            96,
+            96,
+        );
+        // Pixel well outside loupe radius (dist ~32px > 24 + 3.5) inside the photo frame must be bit-identical.
+        let out_a = base_px[30 * 96 + 30];
+        let out_b = loupe_px[30 * 96 + 30];
+        for ch in 0..3 {
+            assert!(
+                (out_a[ch] - out_b[ch]).abs() < 1e-4,
+                "pixel outside GPU loupe changed: base={out_a:?} loupe={out_b:?}"
+            );
+        }
+        // Pixel on loupe rim (round(52.8 + 24.0)=77, 53) should reflect the bright neutral studio rim.
+        let rim_px = loupe_px[53 * 96 + 77];
+        assert!(
+            rim_px[0] > 0.35 && (rim_px[0] - rim_px[2]).abs() < 0.12,
+            "GPU loupe rim should be neutral and visible: {rim_px:?}"
+        );
+        // Center crosshair pixel (53, 53) must be finite and bright.
+        let center_px = loupe_px[53 * 96 + 53];
+        assert!(
+            center_px.iter().all(|v| v.is_finite()) && center_px[0] > 0.4,
+            "GPU loupe center crosshair should be bright & finite: {center_px:?}"
+        );
+
+        // Phase 4 GPU <-> CPU (< 2e-3) parity across Linear+Radial combined masks, Luma Range,
+        // Brush mask, Local Adjustments (exposure/temp/contrast/sat/dehaze/clarity/sharpen), and Heal/Clone!
+        use rune_editor_core::{
+            AdjustmentLayer, BrushDab, HealMode, HealSpot, LayerMaskItem, LocalAdjustments,
+            MaskCombineOp, MaskShape,
+        };
+        gpu.ensure_image_uploaded(&device, &queue, 5, &tex_img);
+
+        let mut combo_layer = AdjustmentLayer::new("l1", "Linear+Radial");
+        combo_layer.opacity = 0.85;
+        combo_layer.masks.push(LayerMaskItem {
+            enabled: true,
+            op: MaskCombineOp::Add,
+            inverted: false,
+            shape: MaskShape::LinearGradient {
+                start: [0.5, 0.0],
+                end: [0.5, 0.85],
+                feather: 0.4,
+            },
+        });
+        combo_layer.masks.push(LayerMaskItem {
+            enabled: true,
+            op: MaskCombineOp::Subtract,
+            inverted: false,
+            shape: MaskShape::RadialGradient {
+                center: [0.5, 0.35],
+                radius: [0.22, 0.22],
+                angle_deg: 0.0,
+                feather: 0.35,
+            },
+        });
+        combo_layer.adjustments = LocalAdjustments {
+            exposure: 0.65,
+            contrast: 0.2,
+            temperature: 0.25,
+            saturation: 0.15,
+            dehaze: 0.18,
+            ..LocalAdjustments::default()
+        };
+
+        let mut luma_layer = AdjustmentLayer::new("l2", "Highlights Luma");
+        luma_layer.masks.push(LayerMaskItem {
+            enabled: true,
+            op: MaskCombineOp::Add,
+            inverted: false,
+            shape: MaskShape::LumaRange {
+                low: 0.45,
+                high: 1.0,
+                low_falloff: 0.15,
+                high_falloff: 0.0,
+            },
+        });
+        luma_layer.adjustments = LocalAdjustments {
+            highlights: -0.45,
+            brightness: -0.15,
+            ..LocalAdjustments::default()
+        };
+
+        let mut brush_layer = AdjustmentLayer::new("l3", "Brush Dodge");
+        brush_layer.masks.push(LayerMaskItem {
+            enabled: true,
+            op: MaskCombineOp::Add,
+            inverted: false,
+            shape: MaskShape::BrushStrokes {
+                strokes: vec![
+                    BrushDab {
+                        x: 0.35,
+                        y: 0.65,
+                        radius: 0.22,
+                        hardness: 0.45,
+                        opacity: 0.9,
+                        erase: false,
+                    },
+                    BrushDab {
+                        x: 0.35,
+                        y: 0.65,
+                        radius: 0.08,
+                        hardness: 0.6,
+                        opacity: 0.8,
+                        erase: true,
+                    },
+                ],
+            },
+        });
+        brush_layer.adjustments = LocalAdjustments {
+            exposure: 0.55,
+            clarity: 0.25,
+            sharpen: 0.3,
+            ..LocalAdjustments::default()
+        };
+
+        let phase4_cases: [(&str, DevelopRecipe); 5] = [
+            (
+                "linear_radial_combined_layer",
+                DevelopRecipe {
+                    layers: vec![combo_layer.clone()],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "luma_range_layer",
+                DevelopRecipe {
+                    layers: vec![luma_layer],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "brush_clarity_sharpen_layer",
+                DevelopRecipe {
+                    layers: vec![brush_layer],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "spot_heal_and_clone",
+                DevelopRecipe {
+                    heal_spots: vec![
+                        HealSpot {
+                            id: "h1".to_owned(),
+                            target: [0.30, 0.30],
+                            source: [0.70, 0.30],
+                            radius: 0.10,
+                            feather: 0.4,
+                            opacity: 1.0,
+                            mode: HealMode::Heal,
+                        },
+                        HealSpot {
+                            id: "c1".to_owned(),
+                            target: [0.70, 0.70],
+                            source: [0.25, 0.70],
+                            radius: 0.10,
+                            feather: 0.3,
+                            opacity: 0.9,
+                            mode: HealMode::Clone,
+                        },
+                    ],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "film_negative_conversion",
+                DevelopRecipe {
+                    processing_mode: rune_editor_core::ProcessingMode::FilmNegative,
+                    film_negative: rune_editor_core::FilmNegativeParams {
+                        base_r: 0.88,
+                        base_g: 0.54,
+                        base_b: 0.33,
+                        density: 0.25,
+                        contrast: 0.18,
+                        black_clip: 0.04,
+                        white_clip: 0.96,
+                    },
+                    exposure: 0.2,
+                    temperature: -0.1,
+                    ..DevelopRecipe::default()
+                },
+            ),
+        ];
+
+        for (name, p4_recipe) in &phase4_cases {
+            let gpu_p4 = render_offscreen_rgba32f(
+                &device,
+                &queue,
+                &mut gpu,
+                &ViewportCamera::default(),
+                p4_recipe,
+                96,
+                96,
+            );
+            let (cw, ch, cpu_p4) = rune_editor_decode::export::render_developed_srgb_f32(
+                &tex_img,
+                p4_recipe,
+                &rune_editor_decode::ExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!((cw, ch), (40, 40));
+            let mut max_diff = 0.0_f32;
+            for y in 2..38u32 {
+                for x in 2..38u32 {
+                    let gp = gpu_p4[((28 + y) * 96 + (28 + x)) as usize];
+                    let cp = cpu_p4[(y * cw + x) as usize];
+                    for ch in 0..3 {
+                        let d = (rune_editor_core::linear_to_srgb(gp[ch]) - cp[ch]).abs();
+                        if d > max_diff {
+                            max_diff = d;
+                        }
+                    }
+                }
+            }
+            assert!(
+                max_diff < 2e-3,
+                "Phase 4 GPU vs CPU parity failed for '{name}': max sRGB diff {max_diff:.6} >= 2e-3"
+            );
+        }
+
+        // Verify Mask Overlay Display Modes (1 = Red Rubylith, 2 = Grayscale) on GPU.
+        let overlay_recipe = DevelopRecipe {
+            layers: vec![combo_layer],
+            ..DevelopRecipe::default()
+        };
+        let red_cam = ViewportCamera {
+            mask_overlay_mode: 1,
+            active_layer_index: 0,
+            ..ViewportCamera::default()
+        };
+        let gray_cam = ViewportCamera {
+            mask_overlay_mode: 2,
+            active_layer_index: 0,
+            ..ViewportCamera::default()
+        };
+        let red_px =
+            render_offscreen_rgba32f(&device, &queue, &mut gpu, &red_cam, &overlay_recipe, 96, 96);
+        let gray_px = render_offscreen_rgba32f(
+            &device,
+            &queue,
+            &mut gpu,
+            &gray_cam,
+            &overlay_recipe,
+            96,
+            96,
+        );
+        // Top-left inside mask (28+4, 28+4) -> red tint in mode 1, bright white in mode 2.
+        let top_red = red_px[32 * 96 + 32];
+        let top_gray = gray_px[32 * 96 + 32];
+        let bot_gray = gray_px[64 * 96 + 48];
+        assert!(
+            top_red[0] > top_red[1] + 0.25,
+            "Red mask overlay should tint masked region red: {top_red:?}"
+        );
+        assert!(
+            top_gray[0] > 0.85 && (top_gray[0] - top_gray[2]).abs() < 1e-3,
+            "Grayscale mask overlay should render masked top pure white: {top_gray:?}"
+        );
+        assert!(
+            bot_gray[0] < 0.05 && (bot_gray[0] - bot_gray[2]).abs() < 1e-3,
+            "Grayscale mask overlay should render unmasked bottom pure black: {bot_gray:?}"
         );
     }
 }
