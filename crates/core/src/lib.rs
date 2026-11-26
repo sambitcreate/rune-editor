@@ -6,23 +6,64 @@
 //! built-in styles, and scene-referred linear color math (including fast
 //! precompiled evaluation for live histograms and full-resolution export).
 
+pub mod analysis;
 pub mod color_science;
 pub mod curves;
 pub mod geometry;
+pub mod layers;
+pub mod patch;
+pub mod registry;
 pub mod session;
+pub mod styles;
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::analysis::{
+    ImageAnalysis, RecipeDiff, analyze_linear_proxy, ciede2000, diff_recipes,
+};
 pub use crate::color_science::{
-    BlackAndWhiteParams, LevelsParams, auto_exposure_and_tone, auto_levels, auto_white_balance,
-    pick_white_balance, rgb_to_hsl_and_lab,
+    ADVANCED_COLOR_SLICE_COUNT, BlackAndWhiteParams, ChannelLevels, ColorEditorSlice,
+    FilmNegativeParams, LevelsParams, ProcessingMode, SkinToneParams, WbPreset,
+    auto_exposure_and_tone, auto_levels, auto_white_balance, invert_film_negative_linear,
+    kelvin_to_temperature, pick_white_balance, rgb_to_hsl_and_lab, sample_color_slice_from_rgb,
+    sample_film_base_from_rgb, temperature_to_kelvin, wb_preset_values,
 };
 pub use crate::curves::{CURVE_LUT_SIZE, ToneCurves, default_curve_points, sample_curve_lut};
-pub use crate::geometry::{CompositionGrid, CropAspect, GeometryParams};
-pub use crate::session::{CullFilter, CullFlag, PhotoMeta, SessionCatalog, SessionEntry};
+pub use crate::geometry::{
+    CompositionGrid, CropAspect, GeometryParams, LensParams, apply_lens_distortion_uv,
+};
+pub use crate::layers::{
+    AdjustmentLayer, BrushDab, HealMode, HealSpot, LAYER_MASK_ATLAS_HEIGHT, LAYER_MASK_ATLAS_WIDTH,
+    LAYER_MASK_TILE_SIZE, LayerLumaRangeSpec, LayerMaskAtlas, LayerMaskItem, LocalAdjustments,
+    MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK, MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER,
+    MaskCombineOp, MaskShape, apply_local_adjustments_linear, bake_layer_mask_atlas, decode_base64,
+    encode_base64, evaluate_spatial_mask_shape, luma_range_mask,
+};
+pub use crate::patch::{
+    BatchJob, EditActor, EditHistoryEntry, EditOp, FieldDiff, HslBandId, MatchReferenceOp,
+    RecipePatch, ScalarOp, blend_recipes, recipe_to_sparse_patch, resolve_builtin_preset,
+};
+pub use crate::registry::{
+    ALL_CLIPBOARD_GROUPS, ParamDescriptor, ParamGroup, SCALAR_PARAMS, ScalarParamSpec,
+    all_param_descriptors, canonical_param_key, copy_recipe_groups, find_scalar_param,
+    get_scalar_by_path, modified_recipe_groups, parse_hsl_band_index, recipe_field_diffs,
+    recipe_non_default_map, recipe_schema_json, reset_recipe_group, search_params,
+    set_param_by_str,
+};
+pub use crate::session::{
+    ColorTag, CullFilter, CullFlag, META_SCHEMA_VERSION, PhotoMeta, PhotoVariant, SessionCatalog,
+    SessionEntry, SessionFolderLayout, create_capture_one_session, move_photo_with_sidecar,
+};
+pub use crate::styles::{
+    UserStyle, apply_style_to_recipe, default_styles_dir, delete_user_style,
+    delete_user_style_in_dir, list_user_styles, list_user_styles_in_dir, load_user_style,
+    load_user_style_in_dir, sanitize_style_slug, save_user_style, save_user_style_in_dir,
+    stack_style_onto_recipe,
+};
 
 /// Version tag embedded in `.rune-edit.json` sidecar files.
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
@@ -134,6 +175,243 @@ impl HslBand {
     }
 }
 
+const fn default_one() -> f32 {
+    1.0
+}
+
+const fn default_grain_size() -> f32 {
+    0.35
+}
+
+/// Capture One-style Base Characteristics Film Curve response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilmCurve {
+    #[default]
+    FilmStandard,
+    FilmExtraShadow,
+    FilmHighContrast,
+    LinearResponse,
+}
+
+impl FilmCurve {
+    pub const ALL: [Self; 4] = [
+        Self::FilmStandard,
+        Self::FilmExtraShadow,
+        Self::FilmHighContrast,
+        Self::LinearResponse,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FilmStandard => "Standard",
+            Self::FilmExtraShadow => "Extra Shadow",
+            Self::FilmHighContrast => "High Contrast",
+            Self::LinearResponse => "Linear",
+        }
+    }
+
+    pub const fn cli_slug(self) -> &'static str {
+        match self {
+            Self::FilmStandard => "film_standard",
+            Self::FilmExtraShadow => "film_extra_shadow",
+            Self::FilmHighContrast => "film_high_contrast",
+            Self::LinearResponse => "linear_response",
+        }
+    }
+
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "film_standard" | "standard" => Some(Self::FilmStandard),
+            "film_extra_shadow" | "extra_shadow" | "extra" => Some(Self::FilmExtraShadow),
+            "film_high_contrast" | "high_contrast" | "contrast" => Some(Self::FilmHighContrast),
+            "linear_response" | "linear" => Some(Self::LinearResponse),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn to_uniform_f32(self) -> f32 {
+        match self {
+            Self::FilmStandard => 0.0,
+            Self::FilmExtraShadow => 1.0,
+            Self::FilmHighContrast => 2.0,
+            Self::LinearResponse => 3.0,
+        }
+    }
+}
+
+/// Capture One-style Clarity local contrast algorithm selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClarityMethod {
+    #[default]
+    Natural,
+    Punch,
+    Neutral,
+    Classic,
+}
+
+impl ClarityMethod {
+    pub const ALL: [Self; 4] = [Self::Natural, Self::Punch, Self::Neutral, Self::Classic];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "Natural",
+            Self::Punch => "Punch",
+            Self::Neutral => "Neutral",
+            Self::Classic => "Classic",
+        }
+    }
+
+    pub const fn cli_slug(self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::Punch => "punch",
+            Self::Neutral => "neutral",
+            Self::Classic => "classic",
+        }
+    }
+
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "natural" => Some(Self::Natural),
+            "punch" => Some(Self::Punch),
+            "neutral" => Some(Self::Neutral),
+            "classic" => Some(Self::Classic),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn to_uniform_f32(self) -> f32 {
+        match self {
+            Self::Natural => 0.0,
+            Self::Punch => 1.0,
+            Self::Neutral => 2.0,
+            Self::Classic => 3.0,
+        }
+    }
+}
+
+/// Capture One-style photographic Film Grain emulsion profiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrainType {
+    #[default]
+    Fine,
+    SilverRich,
+    Soft,
+    Cubic,
+    Tabular,
+    Harsh,
+}
+
+impl GrainType {
+    pub const ALL: [Self; 6] = [
+        Self::Fine,
+        Self::SilverRich,
+        Self::Soft,
+        Self::Cubic,
+        Self::Tabular,
+        Self::Harsh,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fine => "Fine",
+            Self::SilverRich => "Silver Rich",
+            Self::Soft => "Soft",
+            Self::Cubic => "Cubic",
+            Self::Tabular => "Tabular",
+            Self::Harsh => "Harsh",
+        }
+    }
+
+    pub const fn cli_slug(self) -> &'static str {
+        match self {
+            Self::Fine => "fine",
+            Self::SilverRich => "silver_rich",
+            Self::Soft => "soft",
+            Self::Cubic => "cubic",
+            Self::Tabular => "tabular",
+            Self::Harsh => "harsh",
+        }
+    }
+
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "fine" | "fine_grain" => Some(Self::Fine),
+            "silver_rich" | "silver" => Some(Self::SilverRich),
+            "soft" | "soft_grain" => Some(Self::Soft),
+            "cubic" | "cubic_grain" => Some(Self::Cubic),
+            "tabular" | "tabular_grain" => Some(Self::Tabular),
+            "harsh" | "harsh_grain" => Some(Self::Harsh),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn to_uniform_f32(self) -> f32 {
+        match self {
+            Self::Fine => 0.0,
+            Self::SilverRich => 1.0,
+            Self::Soft => 2.0,
+            Self::Cubic => 3.0,
+            Self::Tabular => 4.0,
+            Self::Harsh => 5.0,
+        }
+    }
+}
+
+/// Capture One-style Crop-Aware Vignetting geometry method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VignetteMethod {
+    #[default]
+    EllipticOnCrop,
+    CircularOnCrop,
+    Circular,
+}
+
+impl VignetteMethod {
+    pub const ALL: [Self; 3] = [Self::EllipticOnCrop, Self::CircularOnCrop, Self::Circular];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EllipticOnCrop => "Elliptic Crop",
+            Self::CircularOnCrop => "Circular Crop",
+            Self::Circular => "Circular",
+        }
+    }
+
+    pub const fn cli_slug(self) -> &'static str {
+        match self {
+            Self::EllipticOnCrop => "elliptic_on_crop",
+            Self::CircularOnCrop => "circular_on_crop",
+            Self::Circular => "circular",
+        }
+    }
+
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "elliptic_on_crop" | "elliptic_crop" | "elliptic" => Some(Self::EllipticOnCrop),
+            "circular_on_crop" | "circular_crop" => Some(Self::CircularOnCrop),
+            "circular" | "circular_full" => Some(Self::Circular),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn to_uniform_f32(self) -> f32 {
+        match self {
+            Self::EllipticOnCrop => 0.0,
+            Self::CircularOnCrop => 1.0,
+            Self::Circular => 2.0,
+        }
+    }
+}
+
 /// Non-destructive develop parameters for a single photograph.
 ///
 /// All tone & color operations evaluate in **scene-referred linear light**
@@ -141,6 +419,9 @@ impl HslBand {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DevelopRecipe {
     pub schema_version: u32,
+    /// Base Characteristics Film Curve response (default `FilmStandard`).
+    #[serde(default)]
+    pub film_curve: FilmCurve,
     /// Exposure compensation in photographic stops (`-5.0..=+5.0`).
     pub exposure: f32,
     /// Filmic S-curve contrast around 18% middle gray (`-1.0..=+1.0`).
@@ -153,6 +434,9 @@ pub struct DevelopRecipe {
     pub whites: f32,
     /// Black point trim (`-1.0..=+1.0`).
     pub blacks: f32,
+    /// Active white balance illuminant preset (default `AsShot`).
+    #[serde(default)]
+    pub wb_preset: WbPreset,
     /// White balance temperature shift (`-1.0` cool blue .. `+1.0` warm amber).
     pub temperature: f32,
     /// White balance green/magenta tint (`-1.0` green .. `+1.0` magenta).
@@ -163,8 +447,17 @@ pub struct DevelopRecipe {
     pub saturation: f32,
     /// Optical radial vignette (`-1.0` dark edges .. `+1.0` bright edges).
     pub vignette: f32,
+    /// Crop-aware vignette falloff geometry (`EllipticOnCrop`, `CircularOnCrop`, `Circular`).
+    #[serde(default)]
+    pub vignette_method: VignetteMethod,
     /// Subtle photographic film grain amount (`0.0..=1.0`).
     pub grain: f32,
+    /// Film grain emulsion profile (default `Fine`).
+    #[serde(default)]
+    pub grain_type: GrainType,
+    /// Film grain granularity / clump size (`0.0..=1.0`, default `0.35`).
+    #[serde(default = "default_grain_size")]
+    pub grain_size: f32,
     /// Active preset name if unmodified from a style.
     pub preset_name: Option<String>,
     /// Capture One 3-Way Color Balance — Shadows wheel.
@@ -176,21 +469,45 @@ pub struct DevelopRecipe {
     /// Capture One 3-Way Color Balance — Highlights wheel.
     #[serde(default)]
     pub highlights_wheel: ColorWheel,
-    /// RGB + Master Luma monotonic cubic Hermite tone curves.
+    /// Capture One Color Balance — Master global wheel.
+    #[serde(default)]
+    pub master_wheel: ColorWheel,
+    /// RGB Combined, Master Luma, and per-channel R/G/B monotonic cubic Hermite tone curves.
     #[serde(default)]
     pub curves: ToneCurves,
     /// 8-Band HSL Color Editor (`Red`, `Orange`, `Yellow`, `Green`, `Aqua`, `Blue`, `Purple`, `Magenta`).
     #[serde(default)]
     pub hsl: [HslBand; HSL_BAND_COUNT],
+    /// Capture One Advanced Color Editor (4 customizable hue/saturation range slices).
+    #[serde(default)]
+    pub advanced_color: [ColorEditorSlice; ADVANCED_COLOR_SLICE_COUNT],
+    /// Capture One Skin Tone Uniformity & Amount controls.
+    #[serde(default)]
+    pub skin_tone: SkinToneParams,
     /// Local midtone contrast (`-1.0..=+1.0`).
     #[serde(default)]
     pub clarity: f32,
+    /// Clarity algorithm method (`Natural`, `Punch`, `Neutral`, `Classic`).
+    #[serde(default)]
+    pub clarity_method: ClarityMethod,
     /// Unsharp mask sharpening amount (`0.0..=1.0`).
     #[serde(default)]
     pub sharpen: f32,
-    /// Edge-aware chroma/luma noise reduction (`0.0..=1.0`).
+    /// Unsharp mask sharpening radius in pixels (`0.5..=4.0`, default `1.0`).
+    #[serde(default = "default_one")]
+    pub sharpen_radius: f32,
+    /// Unsharp mask edge threshold (`0.0..=1.0`, default `0.0`).
+    #[serde(default)]
+    pub sharpen_threshold: f32,
+    /// Unsharp mask halo suppression (`0.0..=1.0`, default `0.0`).
+    #[serde(default)]
+    pub sharpen_halo: f32,
+    /// Edge-aware luminance / combined noise reduction (`0.0..=1.0`).
     #[serde(default)]
     pub noise_reduction: f32,
+    /// Edge-aware color / chroma noise reduction (`0.0..=1.0`, default `0.0`).
+    #[serde(default)]
+    pub nr_color: f32,
     /// Capture One midtone-weighted luminance lift preserving black/white endpoints (`-1.0..=+1.0`).
     #[serde(default)]
     pub brightness: f32,
@@ -200,48 +517,81 @@ pub struct DevelopRecipe {
     /// Atmospheric contrast / airlight dehaze (`-1.0..=+1.0`).
     #[serde(default)]
     pub dehaze: f32,
-    /// Capture One Input/Output Levels controls.
+    /// Capture One Master RGB + per-channel R/G/B Input/Output Levels controls.
     #[serde(default)]
     pub levels: LevelsParams,
-    /// Capture One 6-Channel Black & White color sensitivity mixer.
+    /// Capture One 6-Channel Black & White color sensitivity mixer + Split Toning.
     #[serde(default)]
     pub bw: BlackAndWhiteParams,
-    /// Persistent non-destructive Crop, Straighten, Rotation, and Flip geometry.
+    /// Capture One Optical Lens Correction (distortion, chromatic aberration, purple fringing, light falloff).
+    #[serde(default)]
+    pub lens: LensParams,
+    /// Persistent non-destructive Crop, Straighten, Rotation, Flip, and Keystone geometry.
     #[serde(default)]
     pub geometry: GeometryParams,
+    /// Capture One-style local Adjustment Layers with composable masks (up to `MAX_ADJUSTMENT_LAYERS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<AdjustmentLayer>,
+    /// Spot Heal & Clone retouching stamps (up to `MAX_HEAL_SPOTS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heal_spots: Vec<HealSpot>,
+    /// Base Characteristics processing mode (`Photography` default, or `FilmNegative`).
+    #[serde(default)]
+    pub processing_mode: ProcessingMode,
+    /// Film Negative Conversion parameters (C-41 orange mask base, density, contrast, clips).
+    #[serde(default)]
+    pub film_negative: FilmNegativeParams,
 }
 
 impl Default for DevelopRecipe {
     fn default() -> Self {
         Self {
             schema_version: RECIPE_SCHEMA_VERSION,
+            film_curve: FilmCurve::FilmStandard,
             exposure: 0.0,
             contrast: 0.0,
             highlights: 0.0,
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            wb_preset: WbPreset::AsShot,
             temperature: 0.0,
             tint: 0.0,
             vibrance: 0.0,
             saturation: 0.0,
             vignette: 0.0,
+            vignette_method: VignetteMethod::EllipticOnCrop,
             grain: 0.0,
+            grain_type: GrainType::Fine,
+            grain_size: default_grain_size(),
             preset_name: Some("Neutral".to_owned()),
             shadows_wheel: ColorWheel::default(),
             midtones_wheel: ColorWheel::default(),
             highlights_wheel: ColorWheel::default(),
+            master_wheel: ColorWheel::default(),
             curves: ToneCurves::default(),
             hsl: [HslBand::default(); HSL_BAND_COUNT],
+            advanced_color: [ColorEditorSlice::default(); ADVANCED_COLOR_SLICE_COUNT],
+            skin_tone: SkinToneParams::default(),
             clarity: 0.0,
+            clarity_method: ClarityMethod::Natural,
             sharpen: 0.0,
+            sharpen_radius: default_one(),
+            sharpen_threshold: 0.0,
+            sharpen_halo: 0.0,
             noise_reduction: 0.0,
+            nr_color: 0.0,
             brightness: 0.0,
             structure: 0.0,
             dehaze: 0.0,
             levels: LevelsParams::default(),
             bw: BlackAndWhiteParams::default(),
+            lens: LensParams::default(),
             geometry: GeometryParams::default(),
+            layers: Vec::new(),
+            heal_spots: Vec::new(),
+            processing_mode: ProcessingMode::Photography,
+            film_negative: FilmNegativeParams::default(),
         }
     }
 }
@@ -249,32 +599,101 @@ impl Default for DevelopRecipe {
 impl DevelopRecipe {
     pub fn is_neutral(&self) -> bool {
         let d = Self::default();
-        self.exposure == d.exposure
+        self.film_curve == d.film_curve
+            && self.exposure == d.exposure
             && self.contrast == d.contrast
             && self.highlights == d.highlights
             && self.shadows == d.shadows
             && self.whites == d.whites
             && self.blacks == d.blacks
+            && self.wb_preset == d.wb_preset
             && self.temperature == d.temperature
             && self.tint == d.tint
             && self.vibrance == d.vibrance
             && self.saturation == d.saturation
             && self.vignette == d.vignette
+            && self.vignette_method == d.vignette_method
             && self.grain == d.grain
+            && self.grain_type == d.grain_type
+            && (self.grain_size - d.grain_size).abs() <= 1e-6
             && self.shadows_wheel.is_neutral()
             && self.midtones_wheel.is_neutral()
             && self.highlights_wheel.is_neutral()
+            && self.master_wheel.is_neutral()
             && self.curves.is_identity()
             && self.hsl.iter().all(HslBand::is_neutral)
+            && self.advanced_color.iter().all(ColorEditorSlice::is_neutral)
+            && self.skin_tone.is_neutral()
             && self.clarity == 0.0
+            && self.clarity_method == d.clarity_method
             && self.sharpen == 0.0
+            && (self.sharpen_radius - d.sharpen_radius).abs() <= 1e-6
+            && self.sharpen_threshold == 0.0
+            && self.sharpen_halo == 0.0
             && self.noise_reduction == 0.0
+            && self.nr_color == 0.0
             && self.brightness == 0.0
             && self.structure == 0.0
             && self.dehaze == 0.0
             && self.levels.is_identity()
             && self.bw.is_neutral()
+            && self.lens.is_identity()
             && self.geometry.is_identity()
+            && self.layers.is_empty()
+            && self.heal_spots.is_empty()
+            && self.processing_mode == ProcessingMode::Photography
+            && self.film_negative.is_default()
+    }
+
+    /// Samples a raw pre-grade linear RGB pixel from the film negative rebate border,
+    /// switches `processing_mode` to [`ProcessingMode::FilmNegative`], and configures
+    /// `film_negative.base_r/g/b`. Returns the sanitized `[base_r, base_g, base_b]`.
+    pub fn convert_film_negative_from_base(&mut self, raw_linear_rgb: [f32; 3]) -> [f32; 3] {
+        let base = sample_film_base_from_rgb(raw_linear_rgb);
+        self.processing_mode = ProcessingMode::FilmNegative;
+        self.film_negative.base_r = base[0];
+        self.film_negative.base_g = base[1];
+        self.film_negative.base_b = base[2];
+        self.preset_name = None;
+        base
+    }
+
+    /// Applies a [`WbPreset`], updating `wb_preset` and (for non-`Custom` presets)
+    /// setting `temperature` and `tint` to the preset's standard illuminant values.
+    pub fn apply_wb_preset(&mut self, preset: WbPreset) {
+        self.wb_preset = preset;
+        if let Some((temp, tint)) = wb_preset_values(preset) {
+            self.temperature = temp;
+            self.tint = tint;
+        }
+    }
+
+    /// Samples a scene-referred linear RGB pixel to configure and enable Advanced Color Editor
+    /// slice `slice_index` (`0..4`). Returns `Some((hue_deg, sat, lightness))` on success.
+    pub fn pick_color_slice_from_rgb(
+        &mut self,
+        slice_index: usize,
+        linear_rgb: [f32; 3],
+    ) -> Option<(f32, f32, f32)> {
+        let slot = self.advanced_color.get_mut(slice_index)?;
+        let (h, s, v) = sample_color_slice_from_rgb(linear_rgb);
+        slot.enabled = true;
+        slot.target_hue = h;
+        slot.target_sat = s;
+        self.preset_name = None;
+        Some((h, s, v))
+    }
+
+    /// Samples a scene-referred linear RGB pixel to configure and enable Skin Tone Uniformity.
+    /// Returns `(hue_deg, sat, lightness)`.
+    pub fn pick_skin_tone_from_rgb(&mut self, linear_rgb: [f32; 3]) -> (f32, f32, f32) {
+        let (h, s, v) = sample_color_slice_from_rgb(linear_rgb);
+        self.skin_tone.enabled = true;
+        self.skin_tone.target_hue = h;
+        self.skin_tone.target_sat = s;
+        self.skin_tone.target_lightness = v;
+        self.preset_name = None;
+        (h, s, v)
     }
 
     /// Compiles this recipe into a fast per-pixel evaluator with a pre-baked 256-entry
@@ -283,17 +702,82 @@ impl DevelopRecipe {
         CompiledRecipe::from_recipe(self)
     }
 
+    /// Returns a sanitized copy of this recipe with all non-finite values zeroed and every
+    /// parameter clamped to its canonical bounds from `registry::SCALAR_PARAMS`.
+    pub fn sanitized(mut self) -> Self {
+        for spec in SCALAR_PARAMS {
+            let raw = (spec.get)(&self);
+            let clean = if raw.is_finite() {
+                raw.clamp(spec.min, spec.max)
+            } else {
+                spec.default
+            };
+            (spec.set)(&mut self, clean);
+        }
+        self.shadows_wheel = self.shadows_wheel.clamped();
+        self.midtones_wheel = self.midtones_wheel.clamped();
+        self.highlights_wheel = self.highlights_wheel.clamped();
+        self.master_wheel = self.master_wheel.clamped();
+        for band in &mut self.hsl {
+            band.hue = if band.hue.is_finite() {
+                band.hue.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            band.saturation = if band.saturation.is_finite() {
+                band.saturation.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            band.luminance = if band.luminance.is_finite() {
+                band.luminance.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+        for slice in &mut self.advanced_color {
+            *slice = slice.sanitized();
+        }
+        self.skin_tone = self.skin_tone.sanitized();
+        self.levels = self.levels.sanitized();
+        self.bw = self.bw.sanitized();
+        self.lens = self.lens.sanitized();
+        self.geometry.crop = self.geometry.sanitized_crop();
+        self.geometry.straighten_deg = self.geometry.sanitized_straighten_deg();
+        self.geometry.rotate_90 = self.geometry.quarter_turns() as i8;
+        let [kv, kh, ka, k_amt] = self.geometry.sanitized_keystone();
+        self.geometry.keystone_vertical = kv;
+        self.geometry.keystone_horizontal = kh;
+        self.geometry.keystone_aspect = ka;
+        self.geometry.keystone_amount = k_amt;
+        self.layers = self
+            .layers
+            .iter()
+            .take(MAX_ADJUSTMENT_LAYERS)
+            .map(AdjustmentLayer::sanitized)
+            .collect();
+        self.heal_spots = self
+            .heal_spots
+            .iter()
+            .take(MAX_HEAL_SPOTS)
+            .map(HealSpot::sanitized)
+            .collect();
+        self.film_negative = self.film_negative.sanitized();
+        self
+    }
+
     pub fn sidecar_path_for(photo_path: &Path) -> PathBuf {
         let mut s = photo_path.as_os_str().to_os_string();
         s.push(".rune-edit.json");
         PathBuf::from(s)
     }
 
+    /// Saves this recipe into the photo's `.rune-edit.json` sidecar atomically,
+    /// preserving any existing `PhotoMeta` rating, cull flag, revision, and provenance history.
     pub fn save_sidecar(&self, photo_path: &Path) -> Result<PathBuf, CoreError> {
-        let sidecar = Self::sidecar_path_for(photo_path);
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&sidecar, json)?;
-        Ok(sidecar)
+        let mut meta = PhotoMeta::load_sidecar(photo_path)?.unwrap_or_default();
+        meta.recipe = self.clone().sanitized();
+        meta.save_sidecar(photo_path)
     }
 
     /// Loads a `DevelopRecipe` from a `.rune-edit.json` sidecar.
@@ -310,27 +794,78 @@ impl DevelopRecipe {
     }
 }
 
+const fn default_loupe_uv() -> [f32; 2] {
+    [0.5, 0.5]
+}
+
+const fn default_loupe_zoom() -> f32 {
+    2.5
+}
+
+const fn default_loupe_radius_px() -> f32 {
+    96.0
+}
+
+const fn default_view_color_range() -> i32 {
+    -1
+}
+
+const fn default_split_pos() -> f32 {
+    0.5
+}
+
 /// Interactive camera/viewport transform state for the central darkroom canvas.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ViewportCamera {
     /// Zoom multiplier relative to fit-to-viewport (`1.0` = Fit, `0.25..=16.0`).
+    #[serde(default = "default_one")]
     pub zoom: f32,
     /// Pan offset in normalized viewport units (`[-2.0, 2.0]`).
+    #[serde(default)]
     pub pan: [f32; 2],
     /// View rotation in degrees (`-180.0..=180.0`).
+    #[serde(default)]
     pub rotation_deg: f32,
     /// Whether Before/After comparison is enabled.
+    #[serde(default)]
     pub split_compare: bool,
     /// Horizontal split divider position in `[0.0, 1.0]` (`0.5` = center).
+    #[serde(default = "default_split_pos")]
     pub split_pos: f32,
     /// Momentary full-canvas "Before" preview (hold `\`).
+    #[serde(default)]
     pub show_original: bool,
     /// Highlight (red) & shadow (blue) clipping diagnostic overlay.
+    #[serde(default)]
     pub exposure_warning: bool,
     /// Real-time green acutance focus mask overlay.
+    #[serde(default)]
     pub focus_mask: bool,
     /// Interactive crop framing mode (shows full uncropped frame with dimmed outer mask & grid).
+    #[serde(default)]
     pub crop_mode: bool,
+    /// Transient `View Selected Color Range` mask preview (`-1` = off, `0..=3` = Advanced slice, `4` = Skin Tone).
+    #[serde(default = "default_view_color_range")]
+    pub view_color_range: i32,
+    /// Enables the 120Hz circular GPU Loupe magnifier overlay.
+    #[serde(default)]
+    pub loupe_enabled: bool,
+    /// Loupe center in viewport slot UV coordinates (`[0.0, 1.0]^2`).
+    #[serde(default = "default_loupe_uv")]
+    pub loupe_uv: [f32; 2],
+    /// Optical magnification factor inside the Loupe lens (`1.25..=16.0`, default `2.5`).
+    #[serde(default = "default_loupe_zoom")]
+    pub loupe_zoom: f32,
+    /// Loupe circle radius in viewport device pixels (`24.0..=320.0`, default `96.0`).
+    #[serde(default = "default_loupe_radius_px")]
+    pub loupe_radius_px: f32,
+    /// Mask overlay display mode (`0` = Off, `1` = Red Rubylith overlay, `2` = Grayscale mask).
+    #[serde(default)]
+    pub mask_overlay_mode: i32,
+    /// Active adjustment layer index for mask overlay visualization (`-1` = none, `0..8`).
+    #[serde(default = "default_view_color_range")]
+    pub active_layer_index: i32,
 }
 
 impl Default for ViewportCamera {
@@ -345,6 +880,13 @@ impl Default for ViewportCamera {
             exposure_warning: false,
             focus_mask: false,
             crop_mode: false,
+            view_color_range: -1,
+            loupe_enabled: false,
+            loupe_uv: default_loupe_uv(),
+            loupe_zoom: default_loupe_zoom(),
+            loupe_radius_px: default_loupe_radius_px(),
+            mask_overlay_mode: 0,
+            active_layer_index: -1,
         }
     }
 }
@@ -427,6 +969,7 @@ pub fn builtin_presets() -> Vec<StylePreset> {
                 blacks: -0.06,
                 temperature: 0.22,
                 tint: 0.05,
+                wb_preset: WbPreset::Custom,
                 vibrance: 0.18,
                 saturation: -0.04,
                 vignette: -0.18,
@@ -457,6 +1000,7 @@ pub fn builtin_presets() -> Vec<StylePreset> {
                 shadows: -0.10,
                 whites: 0.08,
                 blacks: -0.14,
+                wb_preset: WbPreset::Custom,
                 temperature: -0.10,
                 tint: -0.03,
                 vibrance: -0.08,
@@ -488,6 +1032,7 @@ pub fn builtin_presets() -> Vec<StylePreset> {
                 shadows: 0.14,
                 whites: 0.20,
                 blacks: -0.22,
+                wb_preset: WbPreset::Custom,
                 temperature: 0.06,
                 tint: 0.0,
                 vibrance: 0.0,
@@ -522,6 +1067,7 @@ pub fn builtin_presets() -> Vec<StylePreset> {
                 shadows: 0.32,
                 whites: 0.10,
                 blacks: -0.16,
+                wb_preset: WbPreset::Custom,
                 temperature: -0.18,
                 tint: 0.10,
                 vibrance: 0.26,
@@ -553,6 +1099,7 @@ pub fn builtin_presets() -> Vec<StylePreset> {
                 shadows: 0.22,
                 whites: 0.14,
                 blacks: -0.10,
+                wb_preset: WbPreset::Custom,
                 temperature: -0.06,
                 tint: 0.02,
                 vibrance: 0.20,
@@ -673,28 +1220,40 @@ impl Default for HistogramData {
 /// scalar gains for fast per-pixel evaluation during live histogram and full-res export.
 #[derive(Clone, Debug)]
 pub struct CompiledRecipe {
+    pub film_curve: FilmCurve,
     pub wb_exp: [f32; 3],
     pub brightness: f32,
     pub contrast_pow: f32,
+    pub contrast_active: bool,
     pub highlights: f32,
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    pub tones_active: bool,
     pub levels: LevelsParams,
     pub levels_active: bool,
     pub dehaze: f32,
     pub vibrance: f32,
     pub saturation: f32,
+    pub sat_active: bool,
     pub shadows_wheel: ColorWheel,
     pub midtones_wheel: ColorWheel,
     pub highlights_wheel: ColorWheel,
+    pub master_wheel: ColorWheel,
     pub wheels_active: bool,
     pub curve_lut: [[f32; 4]; CURVE_LUT_SIZE],
     pub curves_active: bool,
     pub hsl: [HslBand; HSL_BAND_COUNT],
     pub hsl_active: bool,
+    pub advanced_color: [ColorEditorSlice; ADVANCED_COLOR_SLICE_COUNT],
+    pub advanced_color_active: bool,
+    pub skin_tone: SkinToneParams,
+    pub skin_tone_active: bool,
     pub bw_enabled: bool,
     pub bw_channels: [f32; 6],
+    pub bw_split: [f32; 4],
+    pub processing_mode: ProcessingMode,
+    pub film_negative: FilmNegativeParams,
 }
 
 impl CompiledRecipe {
@@ -720,78 +1279,121 @@ impl CompiledRecipe {
         let shadows_wheel = recipe.shadows_wheel.clamped();
         let midtones_wheel = recipe.midtones_wheel.clamped();
         let highlights_wheel = recipe.highlights_wheel.clamped();
+        let master_wheel = recipe.master_wheel.clamped();
         let wheels_active = !shadows_wheel.is_neutral()
             || !midtones_wheel.is_neutral()
-            || !highlights_wheel.is_neutral();
+            || !highlights_wheel.is_neutral()
+            || !master_wheel.is_neutral();
 
         let curves_active = !recipe.curves.is_identity();
         let curve_lut = recipe.curves.bake_curve_lut_f32();
         let hsl_active = recipe.hsl.iter().any(|b| !b.is_neutral());
+        let mut advanced_color = recipe.advanced_color;
+        for s in &mut advanced_color {
+            *s = s.sanitized();
+        }
+        let advanced_color_active = advanced_color.iter().any(ColorEditorSlice::is_active);
+        let skin_tone = recipe.skin_tone.sanitized();
+        let skin_tone_active = skin_tone.is_active();
         let bw_enabled = recipe.bw.enabled;
         let bw_channels = recipe.bw.channels_clamped();
+        let bw_split = recipe.bw.split_tones_clamped();
+
+        let contrast_pow = 2.0_f32.powf(recipe.contrast * 0.85);
+        let contrast_active = recipe.contrast.abs() > 1e-6;
+        let tones_active = recipe.shadows.abs() > 1e-6
+            || recipe.highlights.abs() > 1e-6
+            || recipe.blacks.abs() > 1e-6
+            || recipe.whites.abs() > 1e-6
+            || brightness.abs() > 1e-6;
+        let sat_active = recipe.saturation.abs() > 1e-6 || recipe.vibrance.abs() > 1e-6;
 
         Self {
+            film_curve: recipe.film_curve,
             wb_exp: [wb_r * exp_gain, wb_g * exp_gain, wb_b * exp_gain],
             brightness,
-            contrast_pow: 2.0_f32.powf(recipe.contrast * 0.85),
+            contrast_pow,
+            contrast_active,
             highlights: recipe.highlights,
             shadows: recipe.shadows,
             whites: recipe.whites,
             blacks: recipe.blacks,
+            tones_active,
             levels,
             levels_active,
             dehaze,
             vibrance: recipe.vibrance,
             saturation: recipe.saturation,
+            sat_active,
             shadows_wheel,
             midtones_wheel,
             highlights_wheel,
+            master_wheel,
             wheels_active,
             curve_lut,
             curves_active,
             hsl: recipe.hsl,
             hsl_active,
+            advanced_color,
+            advanced_color_active,
+            skin_tone,
+            skin_tone_active,
             bw_enabled,
             bw_channels,
+            bw_split,
+            processing_mode: recipe.processing_mode,
+            film_negative: recipe.film_negative.sanitized(),
         }
     }
 
-    /// Evaluates all per-pixel color & tone stages in scene-referred linear light *before*
-    /// optical vignette, film grain, and filmic highlight roll-off (matching `shaders/develop.wgsl`).
+    /// Evaluates Stages 0.5..=8 (Film Negative inversion, White Balance, Exposure, Tones,
+    /// Contrast, Levels, Dehaze, Tone Curves, 3-Way + Master Color Wheels, and 8-Band HSL)
+    /// in scene-referred linear light right *before* Stage 8b/8c (Advanced Color & Skin Tone).
     ///
-    /// Use this in full-resolution export when applying vignette/grain pre-tonemap, then
-    /// finish with [`filmic_tonemap`].
+    /// Use this for Color Slice / Skin Tone eyedroppers so picked targets match the exact
+    /// color space evaluated by `advanced_slice_mask`, `skin_tone_mask`, and `View Selected Color Range`.
     #[inline]
-    pub fn evaluate_pixel_scene_linear(&self, rgb: [f32; 3]) -> [f32; 3] {
+    pub fn evaluate_pre_advanced_color_linear(&self, rgb: [f32; 3]) -> [f32; 3] {
+        // 0.5. Optional Film Negative optical inversion (zero cost when Photography mode)
+        let rgb = if self.processing_mode == ProcessingMode::FilmNegative {
+            invert_film_negative_linear(rgb, &self.film_negative)
+        } else {
+            rgb
+        };
+
         // 1. White balance + Exposure (linear stops)
         let mut r = (rgb[0] * self.wb_exp[0]).max(0.0);
         let mut g = (rgb[1] * self.wb_exp[1]).max(0.0);
         let mut b = (rgb[2] * self.wb_exp[2]).max(0.0);
 
         // 2. Tonal regions (Shadows / Highlights / Whites / Blacks / Midtone Brightness)
-        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(1e-5);
-        let t = (luma / (luma + 0.18)).clamp(0.0, 1.0);
-        let shadow_w = (1.0 - t) * (1.0 - t);
-        let highlight_w = t * t;
-        let black_w = shadow_w * shadow_w;
-        let white_w = highlight_w * highlight_w;
-        let mid_w = 4.0 * t * (1.0 - t);
+        if self.tones_active {
+            let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(1e-5);
+            let t = (luma / (luma + 0.18)).clamp(0.0, 1.0);
+            let shadow_w = (1.0 - t) * (1.0 - t);
+            let highlight_w = t * t;
+            let black_w = shadow_w * shadow_w;
+            let white_w = highlight_w * highlight_w;
+            let mid_w = 4.0 * t * (1.0 - t);
 
-        let tone_stops = self.shadows * 1.15 * shadow_w
-            + self.highlights * 1.15 * highlight_w
-            + self.blacks * 0.90 * black_w
-            + self.whites * 0.75 * white_w
-            + self.brightness * 0.95 * mid_w;
-        let tone_gain = 2.0_f32.powf(tone_stops);
-        r *= tone_gain;
-        g *= tone_gain;
-        b *= tone_gain;
+            let tone_stops = self.shadows * 1.15 * shadow_w
+                + self.highlights * 1.15 * highlight_w
+                + self.blacks * 0.90 * black_w
+                + self.whites * 0.75 * white_w
+                + self.brightness * 0.95 * mid_w;
+            let tone_gain = 2.0_f32.powf(tone_stops);
+            r *= tone_gain;
+            g *= tone_gain;
+            b *= tone_gain;
+        }
 
         // 3. Contrast around 18% middle gray pivot
-        let pivot = 0.18_f32;
-        r = pivot * (r / pivot).max(0.0).powf(self.contrast_pow);
-        g = pivot * (g / pivot).max(0.0).powf(self.contrast_pow);
-        b = pivot * (b / pivot).max(0.0).powf(self.contrast_pow);
+        if self.contrast_active {
+            let pivot = 0.18_f32;
+            r = pivot * (r / pivot).max(0.0).powf(self.contrast_pow);
+            g = pivot * (g / pivot).max(0.0).powf(self.contrast_pow);
+            b = pivot * (b / pivot).max(0.0).powf(self.contrast_pow);
+        }
 
         // 4. Levels (Input black/mid/white + Output black/white)
         if self.levels_active {
@@ -808,13 +1410,14 @@ impl CompiledRecipe {
             [r, g, b] = apply_tone_curves_lut([r, g, b], &self.curve_lut);
         }
 
-        // 7. Capture One 3-Way Color Balance (Shadows / Midtones / Highlights wheels)
+        // 7. Capture One Color Balance (3-Way Shadows / Midtones / Highlights + Master wheel)
         if self.wheels_active {
             [r, g, b] = apply_color_wheels(
                 [r, g, b],
                 self.shadows_wheel,
                 self.midtones_wheel,
                 self.highlights_wheel,
+                self.master_wheel,
             );
         }
 
@@ -823,34 +1426,60 @@ impl CompiledRecipe {
             [r, g, b] = apply_hsl_bands([r, g, b], &self.hsl);
         }
 
-        // 9. Vibrance & Saturation
-        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let max_c = r.max(g).max(b);
-        let min_c = r.min(g).min(b);
-        let est_sat = if max_c > 1e-5 {
-            ((max_c - min_c) / max_c).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let sat_scale = (1.0 + self.saturation + self.vibrance * (1.0 - est_sat) * 0.75).max(0.0);
-        r = (y + (r - y) * sat_scale).max(0.0);
-        g = (y + (g - y) * sat_scale).max(0.0);
-        b = (y + (b - y) * sat_scale).max(0.0);
+        [r, g, b]
+    }
 
-        // 10. 6-Channel Black & White Mixer
+    /// Evaluates all per-pixel color & tone stages in scene-referred linear light *before*
+    /// optical vignette, film grain, and filmic highlight roll-off (matching `shaders/develop.wgsl`).
+    ///
+    /// Use this in full-resolution export when applying vignette/grain pre-tonemap, then
+    /// finish with [`filmic_tonemap_with_curve`].
+    #[inline]
+    pub fn evaluate_pixel_scene_linear(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let [mut r, mut g, mut b] = self.evaluate_pre_advanced_color_linear(rgb);
+
+        // 8b. Advanced Color Editor (4 customizable range slices)
+        if self.advanced_color_active {
+            [r, g, b] = crate::color_science::apply_advanced_color([r, g, b], &self.advanced_color);
+        }
+
+        // 8c. Skin Tone Uniformity & Amount
+        if self.skin_tone_active {
+            [r, g, b] = crate::color_science::apply_skin_tone([r, g, b], self.skin_tone);
+        }
+
+        // 9. Vibrance & Saturation
+        if self.sat_active {
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let max_c = r.max(g).max(b);
+            let min_c = r.min(g).min(b);
+            let est_sat = if max_c > 1e-5 {
+                ((max_c - min_c) / max_c).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let sat_scale =
+                (1.0 + self.saturation + self.vibrance * (1.0 - est_sat) * 0.75).max(0.0);
+            r = (y + (r - y) * sat_scale).max(0.0);
+            g = (y + (g - y) * sat_scale).max(0.0);
+            b = (y + (b - y) * sat_scale).max(0.0);
+        }
+
+        // 10. 6-Channel Black & White Mixer + Split Toning
         if self.bw_enabled {
-            [r, g, b] = crate::color_science::apply_bw_mixer([r, g, b], self.bw_channels);
+            [r, g, b] =
+                crate::color_science::apply_bw_mixer([r, g, b], self.bw_channels, self.bw_split);
         }
 
         [r, g, b]
     }
 
     /// Evaluates a single scene-referred linear RGB pixel, matching `shaders/develop.wgsl`
-    /// across WB, Exposure, Tones, Contrast, Tone Curves, 3-Way Color Balance,
-    /// 8-Band HSL, Vibrance/Saturation, and Filmic tone mapping.
+    /// across WB, Exposure, Tones, Contrast, Tone Curves, 3-Way + Master Color Balance,
+    /// 8-Band HSL, Vibrance/Saturation, B&W + Split Toning, and Base Characteristics film curve.
     #[inline]
     pub fn evaluate_pixel_linear(&self, rgb: [f32; 3]) -> [f32; 3] {
-        filmic_tonemap(self.evaluate_pixel_scene_linear(rgb))
+        filmic_tonemap_with_curve(self.evaluate_pixel_scene_linear(rgb), self.film_curve)
     }
 }
 
@@ -907,6 +1536,7 @@ fn apply_color_wheels(
     shadows: ColorWheel,
     midtones: ColorWheel,
     highlights: ColorWheel,
+    master: ColorWheel,
 ) -> [f32; 3] {
     let luma = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).max(1e-5);
     let t = (luma / (luma + 0.18)).clamp(0.0, 1.0);
@@ -917,13 +1547,14 @@ fn apply_color_wheels(
     let ts = wheel_tint_rgb(shadows);
     let tm = wheel_tint_rgb(midtones);
     let th = wheel_tint_rgb(highlights);
+    let tg = wheel_tint_rgb(master);
 
-    let luma_shift = shadows.luma * w_s + midtones.luma * w_m + highlights.luma * w_h;
+    let luma_shift = shadows.luma * w_s + midtones.luma * w_m + highlights.luma * w_h + master.luma;
     let shadow_lift = w_s * w_s * 0.025;
 
     let mut out = [0.0_f32; 3];
     for i in 0..3 {
-        let color_shift = ts[i] * w_s + tm[i] * w_m + th[i] * w_h;
+        let color_shift = ts[i] * w_s + tm[i] * w_m + th[i] * w_h + tg[i];
         let gain = 2.0_f32.powf(color_shift * 0.65 + luma_shift * 0.75);
         out[i] = (rgb[i] * gain + ts[i] * shadow_lift).max(0.0);
     }
@@ -965,7 +1596,7 @@ pub(crate) fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
 }
 
 #[inline]
-fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
+pub(crate) fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
     let h = hsv[0].rem_euclid(360.0);
     let s = hsv[1].clamp(0.0, 1.0);
     let v = hsv[2].max(0.0);
@@ -1054,39 +1685,113 @@ fn apply_hsl_bands(rgb: [f32; 3], bands: &[HslBand; HSL_BAND_COUNT]) -> [f32; 3]
     ]
 }
 
-/// Soft filmic highlight roll-off matching `filmic_tonemap` in `shaders/develop.wgsl`.
+/// Soft filmic highlight roll-off (`FilmCurve::FilmStandard`) matching `filmic_tonemap`
+/// in `shaders/develop.wgsl`.
 ///
 /// Leaves midtones (`<= 0.75` linear) untouched and smoothly compresses `> 0.75` HDR highlights
 /// into `(0.75, 1.0)`.
 #[inline]
 pub fn filmic_tonemap(rgb: [f32; 3]) -> [f32; 3] {
+    filmic_tonemap_with_curve(rgb, FilmCurve::FilmStandard)
+}
+
+/// Evaluates the Base Characteristics [`FilmCurve`] tone map in linear light,
+/// matching `filmic_tonemap_curve` in `shaders/develop.wgsl`.
+#[inline]
+pub fn filmic_tonemap_with_curve(rgb: [f32; 3], curve: FilmCurve) -> [f32; 3] {
     [
-        filmic_tonemap_channel(rgb[0]),
-        filmic_tonemap_channel(rgb[1]),
-        filmic_tonemap_channel(rgb[2]),
+        filmic_tonemap_channel_curve(rgb[0], curve),
+        filmic_tonemap_channel_curve(rgb[1], curve),
+        filmic_tonemap_channel_curve(rgb[2], curve),
     ]
 }
 
 #[inline]
-fn filmic_tonemap_channel(x: f32) -> f32 {
-    // Gentle shoulder starting above ~0.75 so midtones stay faithful and >1.0 HDR rolls off smoothly.
-    let x = x.max(0.0);
-    if x <= 0.75 {
-        x
-    } else {
-        let over = x - 0.75;
-        0.75 + (over / (1.0 + over * 4.0))
+fn filmic_tonemap_channel_curve(x: f32, curve: FilmCurve) -> f32 {
+    let v = x.max(0.0);
+    match curve {
+        FilmCurve::FilmStandard => {
+            // Gentle shoulder starting above ~0.75 so midtones stay faithful and >1.0 HDR rolls off smoothly.
+            if v <= 0.75 {
+                v
+            } else {
+                let over = v - 0.75;
+                0.75 + (over / (1.0 + over * 4.0))
+            }
+        }
+        FilmCurve::FilmExtraShadow => {
+            // Smooth shadow lift preserving black point (0 -> 0) with gentle highlight shoulder at 0.70.
+            let lifted = v * (1.0 + 0.55 / (1.0 + v * 7.0));
+            if lifted <= 0.70 {
+                lifted
+            } else {
+                let over = lifted - 0.70;
+                0.70 + (over / (1.0 + over * (1.0 / 0.30)))
+            }
+        }
+        FilmCurve::FilmHighContrast => {
+            // S-curve contrast around 18% middle gray with crisp filmic highlight shoulder at 0.72.
+            if v <= 0.0 {
+                return 0.0;
+            }
+            let c = 0.18 * (v / 0.18).powf(1.22);
+            if c <= 0.72 {
+                c
+            } else {
+                let over = c - 0.72;
+                0.72 + (over / (1.0 + over * (1.0 / 0.28)))
+            }
+        }
+        FilmCurve::LinearResponse => {
+            // Scientific / reproduction linear response with display [0, 1] clamp.
+            v.clamp(0.0, 1.0)
+        }
     }
 }
 
+const LINEAR_TO_SRGB_LUT_SIZE: usize = 4096;
+
+#[inline]
+fn linear_to_srgb_lut() -> &'static [f32; LINEAR_TO_SRGB_LUT_SIZE] {
+    static LUT: OnceLock<[f32; LINEAR_TO_SRGB_LUT_SIZE]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0.0_f32; LINEAR_TO_SRGB_LUT_SIZE];
+        let denom = (LINEAR_TO_SRGB_LUT_SIZE - 1) as f32;
+        for (i, slot) in table.iter_mut().enumerate() {
+            let c = i as f32 / denom;
+            *slot = if c <= 0.0031308 {
+                12.92 * c
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
+        }
+        table[0] = 0.0;
+        table[LINEAR_TO_SRGB_LUT_SIZE - 1] = 1.0;
+        table
+    })
+}
+
+/// Fast IEC 61966-2-1 linear-to-sRGB transfer using the exact linear toe below `0.0031308`
+/// and a linearly-interpolated 4096-entry LUT above it (max error `< 2e-5` vs exact `powf`).
 #[inline]
 pub fn linear_to_srgb(x: f32) -> f32 {
-    let c = x.clamp(0.0, 1.0);
-    if c <= 0.0031308 {
-        12.92 * c
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
+    if !x.is_finite() || x <= 0.0 {
+        return 0.0;
     }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    if x <= 0.0031308 {
+        return 12.92 * x;
+    }
+    let scaled = x * (LINEAR_TO_SRGB_LUT_SIZE - 1) as f32;
+    let idx = scaled as usize;
+    if idx >= LINEAR_TO_SRGB_LUT_SIZE - 1 {
+        return 1.0;
+    }
+    let frac = scaled - idx as f32;
+    let lut = linear_to_srgb_lut();
+    lut[idx] + (lut[idx + 1] - lut[idx]) * frac
 }
 
 #[inline]
@@ -1169,6 +1874,14 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Validation error: {0}")]
+    Validation(String),
+    #[error("Unknown parameter '{0}'")]
+    UnknownParam(String),
+    #[error("Unknown preset '{0}'")]
+    UnknownPreset(String),
+    #[error("Sidecar conflict: expected revision {expected}, found {actual}")]
+    SidecarConflict { expected: u64, actual: u64 },
 }
 
 #[cfg(test)]
@@ -1372,6 +2085,14 @@ mod tests {
             [1.60, 1.10, 0.50],
         ];
         for preset in &presets {
+            if preset.recipe.temperature.abs() > 1e-5 || preset.recipe.tint.abs() > 1e-5 {
+                assert_ne!(
+                    preset.recipe.wb_preset,
+                    WbPreset::AsShot,
+                    "Preset '{}' shifts WB so wb_preset must not be AsShot",
+                    preset.name
+                );
+            }
             let compiled = preset.recipe.compile();
             for &px in &samples {
                 let a = evaluate_pixel_linear(px, &preset.recipe);
@@ -1472,6 +2193,16 @@ mod tests {
         assert!(parsed_recipe.levels.is_identity());
         assert!(parsed_recipe.bw.is_neutral());
         assert!(parsed_recipe.geometry.is_identity());
+        assert_eq!(parsed_recipe.film_curve, FilmCurve::FilmStandard);
+        assert_eq!(parsed_recipe.wb_preset, WbPreset::AsShot);
+        assert_eq!(parsed_recipe.clarity_method, ClarityMethod::Natural);
+        assert_eq!(parsed_recipe.grain_type, GrainType::Fine);
+        assert!((parsed_recipe.grain_size - 0.35).abs() < 1e-6);
+        assert!((parsed_recipe.sharpen_radius - 1.0).abs() < 1e-6);
+        assert_eq!(parsed_recipe.sharpen_threshold, 0.0);
+        assert_eq!(parsed_recipe.sharpen_halo, 0.0);
+        assert_eq!(parsed_recipe.nr_color, 0.0);
+        assert!(parsed_recipe.master_wheel.is_neutral());
 
         let parsed_meta = PhotoMeta::from_sidecar_json(legacy_json)
             .expect("PhotoMeta must load legacy bare DevelopRecipe sidecar");
@@ -1498,6 +2229,7 @@ mod tests {
                 noise_reduction: 0.18,
                 ..DevelopRecipe::default()
             },
+            ..PhotoMeta::default()
         };
         meta.recipe.hsl[1] = HslBand::new(-0.1, 0.2, 0.05);
 
@@ -1510,7 +2242,10 @@ mod tests {
             .expect("recipe should exist");
 
         let _ = std::fs::remove_file(&sidecar_path);
-        assert_eq!(loaded_meta, meta);
+        assert_eq!(loaded_meta.rating, meta.rating);
+        assert_eq!(loaded_meta.flag, meta.flag);
+        assert_eq!(loaded_meta.recipe, meta.recipe);
+        assert_eq!(loaded_meta.revision, meta.revision + 1);
         assert_eq!(loaded_recipe, meta.recipe);
     }
 
@@ -1571,6 +2306,7 @@ mod tests {
                 in_white: 0.85,
                 out_black: 0.02,
                 out_white: 0.96,
+                ..LevelsParams::default()
             },
             ..DevelopRecipe::default()
         }
@@ -1585,6 +2321,7 @@ mod tests {
             in_white: 0.10,
             out_black: f32::INFINITY,
             out_white: f32::NEG_INFINITY,
+            ..LevelsParams::default()
         };
         let clean = bad.sanitized();
         assert!(clean.in_white - clean.in_black >= 0.01 - 1e-6);
@@ -1732,6 +2469,7 @@ mod tests {
             flip_v: false,
             aspect_preset: CropAspect::Free,
             grid: CompositionGrid::GoldenRatio,
+            ..GeometryParams::default()
         };
         let c = geo.sanitized_crop();
         assert!(c[0] + c[2] <= 1.0 + 1e-6 && c[2] >= 0.01);
@@ -1766,5 +2504,670 @@ mod tests {
         // Non-finite ColorWheel::clamped sanitizes cleanly to 0.0
         let bad_wheel = ColorWheel::new(f32::NAN, f32::INFINITY, f32::NEG_INFINITY).clamped();
         assert!(bad_wheel.is_neutral());
+    }
+
+    #[test]
+    fn save_sidecar_in_place_advances_revision_and_checks_conflicts() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rune_core_rev_test_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let photo = dir.join("frame.dng");
+        std::fs::write(&photo, b"").expect("create dummy photo");
+
+        let mut meta = PhotoMeta::default();
+        assert_eq!(meta.revision, 0);
+
+        meta.rating = 4;
+        let sc_path = meta
+            .save_sidecar_in_place(&photo)
+            .expect("first save_sidecar_in_place");
+        assert_eq!(meta.revision, 1);
+
+        let disk1 = PhotoMeta::load_sidecar(&photo)
+            .expect("load disk1")
+            .expect("sidecar exists");
+        assert_eq!(disk1.revision, 1);
+        assert_eq!(disk1.rating, 4);
+
+        // Optimistic concurrency check succeeds on matching revision and advances to 2.
+        meta.flag = CullFlag::Pick;
+        meta.save_sidecar_checked_in_place(&photo, Some(1))
+            .expect("checked save with expected=1");
+        assert_eq!(meta.revision, 2);
+
+        // Stale expected_revision fails with SidecarConflict and does NOT mutate in-memory revision.
+        let conflict = meta.save_sidecar_checked_in_place(&photo, Some(1));
+        assert!(matches!(
+            conflict,
+            Err(CoreError::SidecarConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(meta.revision, 2);
+
+        // SessionCatalog::save_entry_sidecar_mut advances catalog entry revision in place.
+        let mut catalog = SessionCatalog::from_paths(Some(dir.clone()), vec![photo.clone()]);
+        assert_eq!(catalog.entries[0].meta.revision, 2);
+        catalog.set_rating(0, 5);
+        catalog
+            .save_entry_sidecar_mut(0)
+            .expect("save_entry_sidecar_mut")
+            .expect("entry existed");
+        assert_eq!(catalog.entries[0].meta.revision, 3);
+        let disk3 = PhotoMeta::load_sidecar(&photo)
+            .expect("load disk3")
+            .expect("sidecar exists");
+        assert_eq!(disk3.revision, 3);
+        assert_eq!(disk3.rating, 5);
+
+        let _ = std::fs::remove_file(&sc_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linear_to_srgb_lut_matches_exact_iec_transfer_and_compiled_bypass() {
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert_eq!(linear_to_srgb(-0.5), 0.0);
+        assert_eq!(linear_to_srgb(f32::NAN), 0.0);
+        assert_eq!(linear_to_srgb(1.0), 1.0);
+        assert_eq!(linear_to_srgb(2.0), 1.0);
+
+        let mut prev = -1.0_f32;
+        let mut max_err = 0.0_f32;
+        for i in 0..=2000 {
+            let x = i as f32 / 2000.0;
+            let fast = linear_to_srgb(x);
+            let exact = if x <= 0.0031308 {
+                12.92 * x
+            } else {
+                1.055 * x.powf(1.0 / 2.4) - 0.055
+            };
+            assert!(
+                fast >= prev - 1e-7,
+                "LUT must be monotonic at {x}: {fast} < {prev}"
+            );
+            prev = fast;
+            max_err = max_err.max((fast - exact).abs());
+        }
+        assert!(
+            max_err < 5e-5,
+            "4096-entry linear_to_srgb LUT max error {max_err} exceeded 5e-5"
+        );
+
+        let neutral = DevelopRecipe::default().compile();
+        assert!(!neutral.tones_active);
+        assert!(!neutral.contrast_active);
+        assert!(!neutral.sat_active);
+        assert_eq!(
+            neutral.evaluate_pixel_scene_linear([0.18, 0.36, 0.72]),
+            [0.18, 0.36, 0.72]
+        );
+
+        let active = DevelopRecipe {
+            shadows: 0.2,
+            contrast: 0.15,
+            vibrance: 0.1,
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        assert!(active.tones_active);
+        assert!(active.contrast_active);
+        assert!(active.sat_active);
+    }
+
+    #[test]
+    fn film_curve_modes_monotonic_and_distinct() {
+        let shadow = [0.04, 0.04, 0.04];
+        let mid = [0.18, 0.18, 0.18];
+        let hdr = [1.8, 1.8, 1.8];
+
+        // FilmStandard matches legacy filmic_tonemap bit-for-bit.
+        for px in [shadow, mid, hdr] {
+            assert_eq!(
+                filmic_tonemap_with_curve(px, FilmCurve::FilmStandard),
+                filmic_tonemap(px)
+            );
+        }
+
+        // FilmExtraShadow lifts shadows cleanly while keeping 0 -> 0.
+        assert_eq!(
+            filmic_tonemap_with_curve([0.0, 0.0, 0.0], FilmCurve::FilmExtraShadow),
+            [0.0, 0.0, 0.0]
+        );
+        let std_sh = filmic_tonemap_with_curve(shadow, FilmCurve::FilmStandard)[0];
+        let ext_sh = filmic_tonemap_with_curve(shadow, FilmCurve::FilmExtraShadow)[0];
+        let hc_sh = filmic_tonemap_with_curve(shadow, FilmCurve::FilmHighContrast)[0];
+        assert!(ext_sh > std_sh * 1.25, "ExtraShadow should lift shadows");
+        assert!(hc_sh < std_sh * 0.85, "HighContrast should deepen shadows");
+
+        // LinearResponse preserves 0..=1 linearly and hard-clamps >1.
+        assert_eq!(
+            filmic_tonemap_with_curve([0.85, 0.5, 1.8], FilmCurve::LinearResponse),
+            [0.85, 0.5, 1.0]
+        );
+
+        // Monotonicity & finiteness across all curves from 0..4.0.
+        for curve in FilmCurve::ALL {
+            let mut prev = -1.0_f32;
+            for i in 0..=400 {
+                let x = i as f32 * 0.01;
+                let y = filmic_tonemap_with_curve([x, x, x], curve)[0];
+                assert!(y.is_finite() && (0.0..=1.0).contains(&y));
+                assert!(
+                    y + 1e-6 >= prev,
+                    "{curve:?} non-monotonic at {x}: {y} < {prev}"
+                );
+                prev = y;
+            }
+        }
+    }
+
+    #[test]
+    fn wb_kelvin_roundtrip_and_presets() {
+        assert_eq!(temperature_to_kelvin(-1.0), 2000);
+        assert_eq!(temperature_to_kelvin(0.0), 5500);
+        assert_eq!(temperature_to_kelvin(1.0), 14000);
+        assert_eq!(temperature_to_kelvin(f32::NAN), 5500);
+        assert!((kelvin_to_temperature(5500) - 0.0).abs() < 1e-6);
+        assert!((kelvin_to_temperature(2000) + 1.0).abs() < 1e-5);
+        assert!((kelvin_to_temperature(14000) - 1.0).abs() < 1e-5);
+
+        for k in [2000u32, 2800, 3200, 4200, 5500, 6500, 8000, 11000, 14000] {
+            let t = kelvin_to_temperature(k);
+            let k2 = temperature_to_kelvin(t);
+            assert!(
+                k.abs_diff(k2) <= 1,
+                "Kelvin roundtrip drift for {k}: t={t} -> {k2}"
+            );
+        }
+
+        assert_eq!(wb_preset_values(WbPreset::AsShot), Some((0.0, 0.0)));
+        assert_eq!(wb_preset_values(WbPreset::Custom), None);
+        let (tung_t, _) = wb_preset_values(WbPreset::Tungsten).expect("tungsten");
+        let (shade_t, _) = wb_preset_values(WbPreset::Shade).expect("shade");
+        assert!(tung_t < 0.0 && shade_t > 0.0);
+
+        let mut recipe = DevelopRecipe::default();
+        recipe.apply_wb_preset(WbPreset::Fluorescent);
+        assert_eq!(recipe.wb_preset, WbPreset::Fluorescent);
+        assert!(recipe.tint > 0.15, "Fluorescent should add magenta tint");
+    }
+
+    #[test]
+    fn rgb_combined_curve_bakes_into_lut_and_preserves_luma() {
+        let curves = ToneCurves {
+            rgb: vec![[0.0, 0.05], [0.5, 0.65], [1.0, 0.95]],
+            red: vec![[0.0, 0.0], [0.5, 0.40], [1.0, 1.0]],
+            luma: vec![[0.0, 0.0], [0.5, 0.52], [1.0, 1.0]],
+            ..ToneCurves::default()
+        };
+        assert!(!curves.is_identity());
+        let lut = curves.bake_curve_lut_f32();
+        let mid = sample_curve_lut(&lut, 0.5);
+        let expected_r = ToneCurves::evaluate_channel(
+            &curves.rgb,
+            ToneCurves::evaluate_channel(&curves.red, 0.5),
+        );
+        let expected_g = ToneCurves::evaluate_channel(&curves.rgb, 0.5);
+        let expected_l = ToneCurves::evaluate_channel(&curves.luma, 0.5);
+        assert!((mid[0] - expected_r).abs() < 2e-3);
+        assert!((mid[1] - expected_g).abs() < 2e-3);
+        assert!((mid[2] - expected_g).abs() < 2e-3);
+        assert!((mid[3] - expected_l).abs() < 2e-3);
+    }
+
+    #[test]
+    fn per_channel_levels_master_wheel_and_bw_split_tones() {
+        // Per-channel Red levels lifts Red without altering Green or Blue.
+        let r_lvl = DevelopRecipe {
+            levels: LevelsParams {
+                red: ChannelLevels {
+                    in_mid: 0.45,
+                    ..ChannelLevels::default()
+                },
+                ..LevelsParams::default()
+            },
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        let px = [0.18, 0.18, 0.18];
+        let out = r_lvl.evaluate_pixel_scene_linear(px);
+        assert!(out[0] > 0.25, "Red channel levels should lift R: {out:?}");
+        assert!((out[1] - 0.18).abs() < 1e-6);
+        assert!((out[2] - 0.18).abs() < 1e-6);
+
+        // Master color balance wheel shifts shadows, midtones, and highlights uniformly.
+        let master = DevelopRecipe {
+            master_wheel: ColorWheel::new(0.5, 0.0, 0.25),
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        for tone in [0.03_f32, 0.18, 0.65] {
+            let m = master.evaluate_pixel_scene_linear([tone, tone, tone]);
+            assert!(
+                m[0] > m[2] * 1.15 && m[1] > tone * 1.05,
+                "master wheel should warm and lift tone {tone}: {m:?}"
+            );
+        }
+
+        // B&W Split Toning tints shadows cool blue (220 deg) and highlights warm amber (35 deg)
+        // while preserving luminance and pure black.
+        let split_bw = DevelopRecipe {
+            bw: BlackAndWhiteParams {
+                enabled: true,
+                split_shadow_hue: 220.0,
+                split_shadow_sat: 0.6,
+                split_highlight_hue: 35.0,
+                split_highlight_sat: 0.6,
+                ..BlackAndWhiteParams::default()
+            },
+            ..DevelopRecipe::default()
+        }
+        .compile();
+        assert_eq!(
+            split_bw.evaluate_pixel_scene_linear([0.0, 0.0, 0.0]),
+            [0.0, 0.0, 0.0]
+        );
+        let sh = split_bw.evaluate_pixel_scene_linear([0.04, 0.04, 0.04]);
+        let hi = split_bw.evaluate_pixel_scene_linear([0.65, 0.65, 0.65]);
+        assert!(sh[2] > sh[0], "B&W shadows should be cool blue: {sh:?}");
+        assert!(hi[0] > hi[2], "B&W highlights should be warm amber: {hi:?}");
+        let sh_y = 0.2126 * sh[0] + 0.7152 * sh[1] + 0.0722 * sh[2];
+        assert!((sh_y - 0.04).abs() < 1e-4, "split toning preserves luma");
+    }
+
+    #[test]
+    fn phase2_advanced_color_skin_tone_lens_and_keystone_math() {
+        // 1. Advanced Color Editor uniformity pulls off-target hue toward target hue without touching other hues.
+        let mut recipe = DevelopRecipe::default();
+        let warm_orange = [0.45, 0.22, 0.05];
+        let blue_sky = [0.04, 0.14, 0.55];
+        let (h, s, v) = recipe
+            .pick_color_slice_from_rgb(0, warm_orange)
+            .expect("slice 0");
+        assert!(h > 10.0 && h < 50.0 && s > 0.3 && v > 0.3);
+        recipe.advanced_color[0].uniformity = 0.8;
+        recipe.advanced_color[0].lightness = 0.5;
+        let comp = recipe.compile();
+        let orange_out = comp.evaluate_pixel_scene_linear(warm_orange);
+        let blue_out = comp.evaluate_pixel_scene_linear(blue_sky);
+        assert!(orange_out[0] > warm_orange[0] * 1.15);
+        for ch in 0..3 {
+            assert!((blue_out[ch] - blue_sky[ch]).abs() < 1e-5);
+        }
+
+        // 2. Skin Tone Uniformity pulls nearby reddish skin toward target skin hue without touching blue.
+        let mut skin_rec = DevelopRecipe::default();
+        skin_rec.pick_skin_tone_from_rgb([0.48, 0.28, 0.18]);
+        skin_rec.skin_tone.uniformity_hue = 0.9;
+        skin_rec.skin_tone.uniformity_sat = 0.7;
+        let skin_comp = skin_rec.compile();
+        let reddish_skin = [0.50, 0.22, 0.18];
+        let (h_before, _, _) = sample_color_slice_from_rgb(reddish_skin);
+        let (h_after, _, _) =
+            sample_color_slice_from_rgb(skin_comp.evaluate_pixel_scene_linear(reddish_skin));
+        assert!(
+            (h_after - skin_rec.skin_tone.target_hue).abs()
+                < (h_before - skin_rec.skin_tone.target_hue).abs(),
+            "skin hue uniformity should move hue closer to target: {h_before} -> {h_after} (target {})",
+            skin_rec.skin_tone.target_hue
+        );
+        let blue_skin = skin_comp.evaluate_pixel_scene_linear(blue_sky);
+        for ch in 0..3 {
+            assert!((blue_skin[ch] - blue_sky[ch]).abs() < 1e-5);
+        }
+
+        // 3. Keystone homography stays inside [0, 1]^2 across all corners & is identity when zero.
+        let id_geo = GeometryParams::default();
+        assert!(id_geo.is_keystone_identity());
+        assert_eq!(id_geo.apply_keystone_uv(0.25, 0.75), [0.25, 0.75]);
+
+        let ks_geo = GeometryParams {
+            keystone_vertical: 0.8,
+            keystone_horizontal: -0.6,
+            keystone_aspect: 0.4,
+            keystone_amount: 1.0,
+            ..GeometryParams::default()
+        };
+        assert!(!ks_geo.is_identity());
+        for ou in [0.0_f32, 0.5, 1.0] {
+            for ov in [0.0_f32, 0.5, 1.0] {
+                let [ku, kv] = ks_geo.apply_keystone_uv(ou, ov);
+                assert!(
+                    (0.0..=1.0).contains(&ku) && (0.0..=1.0).contains(&kv),
+                    "keystone corner ({ou},{ov}) escaped [0,1]: ({ku},{kv})"
+                );
+            }
+        }
+
+        // 4. Radial lens distortion identity + symmetry.
+        assert_eq!(
+            apply_lens_distortion_uv([0.2, 0.8], 0.0, 1600, 1000),
+            [0.2, 0.8]
+        );
+        let [du, dv] = apply_lens_distortion_uv([0.5, 0.5], 0.8, 1600, 1000);
+        assert!((du - 0.5).abs() < 1e-6 && (dv - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn phase3_color_tags_virtual_variants_v2_compat_and_clipboard_autoselect() {
+        // 1. ColorTag enum roundtrip & swatches.
+        assert_eq!(ColorTag::ALL.len(), 8);
+        for tag in ColorTag::ALL {
+            assert_eq!(ColorTag::from_cli_str(tag.cli_slug()), Some(tag));
+            assert!(!tag.label().is_empty());
+            let rgb = tag.srgb_u8();
+            assert!(rgb.iter().any(|&c| c > 0));
+        }
+
+        // 2. Faceted SessionCatalog filters (CullFilter + ColorTag + case-insensitive search_query).
+        let paths = vec![
+            PathBuf::from("/tmp/rune_p3_sunset.dng"),
+            PathBuf::from("/tmp/rune_p3_portrait.raf"),
+            PathBuf::from("/tmp/rune_p3_studio.cr3"),
+        ];
+        let mut catalog = SessionCatalog::from_paths(Some(PathBuf::from("/tmp")), paths);
+        catalog.set_color_tag(0, ColorTag::Orange);
+        catalog.set_color_tag(1, ColorTag::Green);
+        catalog.set_color_tag(2, ColorTag::Orange);
+        catalog.set_entry_exif_labels(
+            0,
+            Some("Leica Q3".to_owned()),
+            Some("28mm f/1.7".to_owned()),
+        );
+        catalog.set_entry_exif_labels(
+            1,
+            Some("Fujifilm GFX100".to_owned()),
+            Some("80mm f/1.7".to_owned()),
+        );
+        catalog.entries[2].meta.recipe.preset_name = Some("Editorial B&W".to_owned());
+
+        catalog.set_color_tag_filter(Some(ColorTag::Orange));
+        assert_eq!(catalog.filtered_indices(), vec![0, 2]);
+        catalog.set_search_query("leica");
+        assert_eq!(catalog.filtered_indices(), vec![0]);
+        catalog.set_search_query("editorial");
+        assert_eq!(catalog.filtered_indices(), vec![2]);
+        catalog.set_color_tag_filter(None);
+        catalog.set_search_query("80mm");
+        assert_eq!(catalog.filtered_indices(), vec![1]);
+
+        // 3. Virtual Variants lifecycle + v2 -> v3 sidecar backward compatibility.
+        let v2_sidecar_json = r#"{
+            "meta_version": 2,
+            "revision": 3,
+            "rating": 4,
+            "flag": "Pick",
+            "recipe": {
+                "schema_version": 1,
+                "exposure": 0.75,
+                "contrast": 0.2,
+                "highlights": 0.0,
+                "shadows": 0.0,
+                "whites": 0.0,
+                "blacks": 0.0,
+                "temperature": 0.0,
+                "tint": 0.0,
+                "vibrance": 0.0,
+                "saturation": 0.0,
+                "vignette": 0.0,
+                "grain": 0.0,
+                "preset_name": null
+            }
+        }"#;
+        let mut meta = PhotoMeta::from_sidecar_json(v2_sidecar_json)
+            .expect("v2 sidecar must load cleanly into v3 PhotoMeta");
+        assert_eq!(meta.color_tag, ColorTag::None);
+        assert_eq!(meta.variant_count(), 1);
+        assert_eq!(meta.active_variant_index, 0);
+        assert!((meta.recipe.exposure - 0.75).abs() < 1e-6);
+
+        // Cannot delete the sole variant.
+        assert!(!meta.delete_variant(0));
+        assert_eq!(meta.variant_count(), 1);
+
+        // Clone active variant -> inherits exposure 0.75 & rating 4.
+        let v2_idx = meta.clone_variant(Some("Warm Print".to_owned()));
+        assert_eq!(v2_idx, 1);
+        assert_eq!(meta.variant_count(), 2);
+        assert!((meta.recipe.exposure - 0.75).abs() < 1e-6);
+        meta.recipe.temperature = 0.35;
+        meta.color_tag = ColorTag::Orange;
+
+        // New variant -> fresh Neutral recipe & clears tag/rating on new slot without losing v1/v2.
+        let v3_idx = meta.new_variant(Some("B&W Study".to_owned()));
+        assert_eq!(v3_idx, 2);
+        assert_eq!(meta.variant_count(), 3);
+        assert!(meta.recipe.is_neutral());
+        meta.recipe.bw.enabled = true;
+
+        // Select back to v2 and confirm edits were preserved.
+        assert!(meta.select_variant(1));
+        assert!((meta.recipe.temperature - 0.35).abs() < 1e-6);
+        assert_eq!(meta.color_tag, ColorTag::Orange);
+
+        // Disk roundtrip via save_sidecar_in_place syncs active edits to variants & writes v3.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let photo = std::env::temp_dir().join(format!(
+            "rune_core_variants_test_{}_{nanos}.dng",
+            std::process::id()
+        ));
+        meta.recipe.exposure = 1.1;
+        let sc_path = meta.save_sidecar_in_place(&photo).expect("save v3 sidecar");
+        let loaded = PhotoMeta::load_sidecar(&photo)
+            .expect("load v3 sidecar")
+            .expect("sidecar present");
+        let _ = std::fs::remove_file(&sc_path);
+        assert_eq!(loaded.meta_version, META_SCHEMA_VERSION);
+        assert_eq!(loaded.variant_count(), 3);
+        assert_eq!(loaded.active_variant_index, 1);
+        assert!((loaded.recipe.exposure - 1.1).abs() < 1e-6);
+        assert!((loaded.variants[1].recipe.exposure - 1.1).abs() < 1e-6);
+        assert!(loaded.variants[2].recipe.bw.enabled);
+
+        // Delete middle variant cleanly updates active index.
+        let mut del_meta = loaded;
+        assert!(del_meta.delete_variant(1));
+        assert_eq!(del_meta.variant_count(), 2);
+        assert_eq!(del_meta.active_variant_index, 1);
+        assert!(del_meta.recipe.bw.enabled);
+
+        // 4. Selective Adjustments Clipboard (ALL_CLIPBOARD_GROUPS + Autoselect Adjusted).
+        assert_eq!(ALL_CLIPBOARD_GROUPS.len(), 14);
+        assert!(modified_recipe_groups(&DevelopRecipe::default()).is_empty());
+
+        let mut graded = DevelopRecipe {
+            temperature: 0.2,
+            exposure: 0.5,
+            clarity: 0.25,
+            vignette: -0.3,
+            ..DevelopRecipe::default()
+        };
+        graded.lens.distortion = -0.2;
+        graded.skin_tone.enabled = true;
+        graded.geometry.straighten_deg = 2.0;
+        let adjusted = modified_recipe_groups(&graded);
+        assert_eq!(
+            adjusted,
+            vec![
+                "wb",
+                "tone",
+                "skin_tone",
+                "detail",
+                "effects",
+                "lens",
+                "geometry"
+            ]
+        );
+
+        // Every clipboard group copies cleanly via copy_recipe_groups.
+        let all_ids: Vec<String> = ALL_CLIPBOARD_GROUPS
+            .iter()
+            .map(|(id, _)| (*id).to_owned())
+            .collect();
+        let mut dst = DevelopRecipe::default();
+        copy_recipe_groups(&mut dst, &graded, &all_ids).expect("copy all 12 clipboard groups");
+        assert_eq!(dst.temperature, graded.temperature);
+        assert_eq!(dst.exposure, graded.exposure);
+        assert_eq!(dst.skin_tone, graded.skin_tone);
+        assert_eq!(dst.lens, graded.lens);
+        assert_eq!(dst.geometry, graded.geometry);
+    }
+
+    #[test]
+    fn phase4_layers_registry_patch_and_legacy_sidecar_compat() {
+        let mut r = DevelopRecipe::default();
+        assert!(r.is_neutral());
+
+        let mut layer = AdjustmentLayer::new_with_mask(
+            "l1",
+            "Sky Gradient",
+            MaskShape::LinearGradient {
+                start: [0.5, 0.0],
+                end: [0.5, 0.6],
+                feather: 0.35,
+            },
+        );
+        layer.adjustments.exposure = -0.8;
+        layer.adjustments.clarity = 0.25;
+        r.layers.push(layer);
+        r.heal_spots.push(HealSpot {
+            id: "h1".to_owned(),
+            target: [0.3, 0.4],
+            source: [0.4, 0.4],
+            radius: 0.03,
+            feather: 0.4,
+            opacity: 1.0,
+            mode: HealMode::Heal,
+        });
+        assert!(!r.is_neutral());
+        assert!(modified_recipe_groups(&r).contains(&"layers"));
+
+        // Sparse patch roundtrip preserves layers & heal_spots.
+        let patch = recipe_to_sparse_patch(&r);
+        let mut patched = DevelopRecipe::default();
+        let diffs = patch
+            .apply_to(&mut patched, None)
+            .expect("apply layer patch");
+        assert!(diffs.iter().any(|d| d.field == "layers"));
+        assert!(diffs.iter().any(|d| d.field == "heal_spots"));
+        assert_eq!(patched.layers, r.layers);
+        assert_eq!(patched.heal_spots, r.heal_spots);
+
+        // Group copy/reset symmetry for layers & heal.
+        for grp in ["layers", "heal"] {
+            let mut dst = DevelopRecipe::default();
+            copy_recipe_groups(&mut dst, &r, &[grp.to_owned()]).unwrap();
+            reset_recipe_group(&mut dst, grp).unwrap();
+            assert!(
+                dst.is_neutral(),
+                "Phase 4 group '{grp}' failed copy/reset symmetry"
+            );
+        }
+    }
+
+    #[test]
+    fn phase5_film_negative_session_folders_and_move_safety() {
+        // 1. Film Negative optical inversion: orange C-41 mask neutralizes to clean black/gray, monotonic response.
+        let p = FilmNegativeParams::default();
+        let rebate = [p.base_r, p.base_g, p.base_b];
+        let inv_rebate = invert_film_negative_linear(rebate, &p);
+        assert_eq!(
+            inv_rebate,
+            [0.0, 0.0, 0.0],
+            "clear film rebate must invert to pure black"
+        );
+
+        let mid_neg = [p.base_r * 0.25, p.base_g * 0.25, p.base_b * 0.25];
+        let inv_mid = invert_film_negative_linear(mid_neg, &p);
+        assert!(
+            (inv_mid[0] - inv_mid[1]).abs() < 1e-5 && (inv_mid[1] - inv_mid[2]).abs() < 1e-5,
+            "neutral negative under orange mask must invert to neutral gray: {inv_mid:?}"
+        );
+        let dense_neg = [p.base_r * 0.04, p.base_g * 0.04, p.base_b * 0.04];
+        let inv_hi = invert_film_negative_linear(dense_neg, &p);
+        assert!(
+            inv_hi[0] > inv_mid[0] && inv_mid[0] > inv_rebate[0],
+            "denser negative must produce brighter positive: hi={inv_hi:?} mid={inv_mid:?}"
+        );
+
+        // Adversarial zero/NaN base safety (never divides by zero or produces NaN).
+        let bad_p = FilmNegativeParams {
+            base_r: 0.0,
+            base_g: f32::NAN,
+            base_b: -1.0,
+            density: 0.2,
+            contrast: 0.15,
+            black_clip: 0.4,
+            white_clip: 0.3,
+        };
+        let safe_out = invert_film_negative_linear([0.5, 0.3, 0.2], &bad_p);
+        assert!(safe_out.iter().all(|v| v.is_finite() && *v >= 0.0));
+
+        // Base picker + dot-path + patch + copy/reset symmetry.
+        let mut r = DevelopRecipe::default();
+        let picked = r.convert_film_negative_from_base([0.88, 0.52, 0.31]);
+        assert_eq!(r.processing_mode, ProcessingMode::FilmNegative);
+        assert!((picked[0] - 0.88).abs() < 1e-6);
+        set_param_by_str(&mut r, "film_negative.density", "0.35", false, None).unwrap();
+        set_param_by_str(&mut r, "film_negative.contrast", "0.2", false, None).unwrap();
+        assert!((get_scalar_by_path(&r, "film_negative.density").unwrap() - 0.35).abs() < 1e-6);
+        assert!(modified_recipe_groups(&r).contains(&"film_negative"));
+
+        let patch = recipe_to_sparse_patch(&r);
+        let mut patched = DevelopRecipe::default();
+        patch.apply_to(&mut patched, None).unwrap();
+        assert_eq!(patched.processing_mode, ProcessingMode::FilmNegative);
+        assert_eq!(patched.film_negative, r.film_negative);
+
+        let mut dst = DevelopRecipe::default();
+        copy_recipe_groups(&mut dst, &r, &["film_negative".to_owned()]).unwrap();
+        assert_eq!(dst.processing_mode, ProcessingMode::FilmNegative);
+        reset_recipe_group(&mut dst, "film_negative").unwrap();
+        assert!(dst.is_neutral());
+
+        // 2. 4-Folder Capture One Session + move_photo_with_sidecar non-clobber safety.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rune_core_session_p5_{}_{nanos}",
+            std::process::id()
+        ));
+        let layout = create_capture_one_session(&root).expect("create 4-folder session");
+        assert!(layout.capture.is_dir());
+        assert!(layout.selects.is_dir());
+        assert!(layout.output.is_dir());
+        assert!(layout.trash.is_dir());
+
+        let photo = layout.capture.join("roll01_001.dng");
+        std::fs::write(&photo, b"raw-bytes").unwrap();
+        r.save_sidecar(&photo).unwrap();
+        let src_sc = DevelopRecipe::sidecar_path_for(&photo);
+        assert!(src_sc.is_file());
+
+        let moved = move_photo_with_sidecar(&photo, &layout.selects).expect("move to Selects");
+        assert_eq!(moved, layout.selects.join("roll01_001.dng"));
+        assert!(moved.is_file());
+        assert!(!photo.exists());
+        assert!(!src_sc.exists());
+        assert!(DevelopRecipe::sidecar_path_for(&moved).is_file());
+
+        // Non-clobber safety: moving another file with the same name into Selects must FAIL.
+        let dup = layout.capture.join("roll01_001.dng");
+        std::fs::write(&dup, b"new-bytes").unwrap();
+        assert!(move_photo_with_sidecar(&dup, &layout.selects).is_err());
+        assert_eq!(std::fs::read(&moved).unwrap(), b"raw-bytes");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

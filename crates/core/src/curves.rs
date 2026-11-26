@@ -12,11 +12,13 @@ pub fn default_curve_points() -> Vec<[f32; 2]> {
     vec![[0.0, 0.0], [1.0, 1.0]]
 }
 
-/// Non-destructive RGB & Master Luma tone curves.
+/// Non-destructive RGB Combined, Master Luma, and per-channel R/G/B tone curves.
 ///
 /// Control points are `[x, y]` pairs in `[0.0, 1.0]` perceptual tone space.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToneCurves {
+    #[serde(default = "default_curve_points")]
+    pub rgb: Vec<[f32; 2]>,
     #[serde(default = "default_curve_points")]
     pub luma: Vec<[f32; 2]>,
     #[serde(default = "default_curve_points")]
@@ -30,6 +32,7 @@ pub struct ToneCurves {
 impl Default for ToneCurves {
     fn default() -> Self {
         Self {
+            rgb: default_curve_points(),
             luma: default_curve_points(),
             red: default_curve_points(),
             green: default_curve_points(),
@@ -39,9 +42,10 @@ impl Default for ToneCurves {
 }
 
 impl ToneCurves {
-    /// Returns `true` when all four channels represent an identity tone curve.
+    /// Returns `true` when all five channels represent an identity tone curve.
     pub fn is_identity(&self) -> bool {
-        channel_is_identity(&self.luma)
+        channel_is_identity(&self.rgb)
+            && channel_is_identity(&self.luma)
             && channel_is_identity(&self.red)
             && channel_is_identity(&self.green)
             && channel_is_identity(&self.blue)
@@ -54,9 +58,10 @@ impl ToneCurves {
         spline.eval(x)
     }
 
-    /// Bakes all 4 tone curves into a 256-entry `f32` RGBA LUT where each entry is
-    /// `[red, green, blue, luma]`.
+    /// Bakes all 5 tone curves into a 256-entry `f32` RGBA LUT where each entry is
+    /// `[rgb(red(x)), rgb(green(x)), rgb(blue(x)), luma(x)]`.
     pub fn bake_curve_lut_f32(&self) -> [[f32; 4]; CURVE_LUT_SIZE] {
+        let rgb_spline = MonotonicSpline::from_points(&self.rgb);
         let r_spline = MonotonicSpline::from_points(&self.red);
         let g_spline = MonotonicSpline::from_points(&self.green);
         let b_spline = MonotonicSpline::from_points(&self.blue);
@@ -67,9 +72,9 @@ impl ToneCurves {
         for (i, entry) in lut.iter_mut().enumerate() {
             let x = i as f32 / denom;
             *entry = [
-                r_spline.eval(x),
-                g_spline.eval(x),
-                b_spline.eval(x),
+                rgb_spline.eval(r_spline.eval(x)),
+                rgb_spline.eval(g_spline.eval(x)),
+                rgb_spline.eval(b_spline.eval(x)),
                 l_spline.eval(x),
             ];
         }
