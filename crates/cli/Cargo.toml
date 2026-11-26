@@ -1,0 +1,21 @@
+[package]
+name = "rune-editor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent-first, non-destructive RAW & photo editing CLI (`rd`) for Rune Darkroom."
+
+[[bin]]
+name = "rd"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+rayon = "1"
+rune-editor-core.workspace = true
+rune-editor-decode.workspace = true
+rune-editor-mcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true

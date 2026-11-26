@@ -4,7 +4,9 @@ members = [
     "crates/core",
     "crates/decode",
     "crates/engine",
+    "crates/mcp",
     "crates/app",
+    "crates/cli",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ categories = ["multimedia::images", "gui"]
 rune-editor-core = { path = "crates/core" }
 rune-editor-decode = { path = "crates/decode" }
 rune-editor-engine = { path = "crates/engine" }
+rune-editor-mcp = { path = "crates/mcp" }
 
 # Rune by Anomaly (pinned dev revision)
 rune = { git = "https://github.com/anomalyco/rune", rev = "0d2cad27f83747120156c8406f6ecfd2a018bd39", features = ["native-file-dialog", "tooling"] }
