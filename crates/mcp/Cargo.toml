@@ -1,0 +1,14 @@
+[package]
+name = "rune-editor-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local MCP 2025-11-25 (Streamable HTTP + stdio) server for Rune Darkroom."
+
+[dependencies]
+image.workspace = true
+rune-editor-core.workspace = true
+rune-editor-decode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
