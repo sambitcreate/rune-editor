@@ -12,9 +12,20 @@ use std::path::Path;
 
 use half::f16;
 use rayon::prelude::*;
-use rune_editor_core::srgb_to_linear;
+use rune_editor_core::{CameraCalibration, srgb_to_linear};
 
 use crate::{DecodeError, LinearImage, build_histogram_proxy};
+
+/// Controls how Apple `CIRAWFilter` renders camera RAW files on macOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RawDecodeMode {
+    /// True scene-referred linear RAW decode (`boostAmount = 0.0`, `localToneMapAmount = 0.0`,
+    /// `contrastAmount = 0.0`) so Rune's `FilmCurve` and 3D camera profile LUT are never double-applied.
+    #[default]
+    Linear,
+    /// Apple Native RAW rendering preserving `CIRAWFilter`'s default photographic tone boost (`apple_raw`).
+    AppleNativeBoost,
+}
 
 /// Camera RAW & high-efficiency container extensions handled by the RAW / native OS decoder tier.
 pub const RAW_EXTENSIONS: &[&str] = &[
@@ -131,11 +142,24 @@ fn probe_rawler_dimensions(path: &Path) -> Result<[u32; 2], DecodeError> {
 
 /// Decodes a photo file from disk into scene-referred linear `Rgba16Float`,
 /// optionally scaling the longest edge to `max_edge` for fast interactive editing proxies.
+///
+/// Uses true linear RAW decoding ([`RawDecodeMode::Linear`]) so Rune's `FilmCurve` and
+/// 3D camera profile LUT do not double-apply an OS tone curve.
 pub fn load_file_proxy(path: &Path, max_edge: Option<u32>) -> Result<LinearImage, DecodeError> {
+    load_file_proxy_with_mode(path, max_edge, RawDecodeMode::Linear)
+}
+
+/// Decodes a photo file from disk into scene-referred linear `Rgba16Float` with an explicit
+/// [`RawDecodeMode`] (`Linear` default, or `AppleNativeBoost` for Apple Native RAW rendering).
+pub fn load_file_proxy_with_mode(
+    path: &Path,
+    max_edge: Option<u32>,
+    mode: RawDecodeMode,
+) -> Result<LinearImage, DecodeError> {
     let max_edge = max_edge.map(|m| m.max(1));
 
     if is_raw_extension(path) {
-        return decode_raw_or_heif(path, max_edge);
+        return decode_raw_or_heif(path, max_edge, mode);
     }
 
     match decode_raster_image(path, max_edge) {
@@ -144,7 +168,9 @@ pub fn load_file_proxy(path: &Path, max_edge: Option<u32>) -> Result<LinearImage
             // Gracefully handle misnamed HEIC/RAW files on macOS via CoreImage before failing.
             #[cfg(target_os = "macos")]
             {
-                if let Ok(img) = macos::decode_coreimage_linear(path, max_edge, false) {
+                if let Ok(img) =
+                    macos::decode_coreimage_linear_with_mode(path, max_edge, false, mode)
+                {
                     return Ok(img);
                 }
             }
@@ -153,13 +179,17 @@ pub fn load_file_proxy(path: &Path, max_edge: Option<u32>) -> Result<LinearImage
     }
 }
 
-fn decode_raw_or_heif(path: &Path, max_edge: Option<u32>) -> Result<LinearImage, DecodeError> {
+fn decode_raw_or_heif(
+    path: &Path,
+    max_edge: Option<u32>,
+    mode: RawDecodeMode,
+) -> Result<LinearImage, DecodeError> {
     let is_heif = is_heif_extension(path);
 
     // Tier 1: Apple native CoreImage (CIRAWFilter for RAW/ProRAW, CIImage for HEIC/HEIF).
     #[cfg(target_os = "macos")]
     {
-        match macos::decode_coreimage_linear(path, max_edge, !is_heif) {
+        match macos::decode_coreimage_linear_with_mode(path, max_edge, !is_heif, mode) {
             Ok(img) => Ok(img),
             Err(macos_err) => {
                 if is_heif {
@@ -179,6 +209,7 @@ fn decode_raw_or_heif(path: &Path, max_edge: Option<u32>) -> Result<LinearImage,
     // Tier 2: Pure-Rust rawler fallback on non-macOS platforms.
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = mode;
         if is_heif {
             return Err(DecodeError::Raw {
                 path: path.to_path_buf(),
@@ -240,7 +271,130 @@ fn decode_raster_image(path: &Path, max_edge: Option<u32>) -> Result<LinearImage
         source_path: Some(path.to_path_buf()),
         format_label: format!("{ext} • 16-bit Linear FP16"),
         exif,
+        camera_calibration: None,
     })
+}
+
+/// Extracts dual-illuminant [`CameraCalibration`] metadata (`make`, `model`, `D65` & `StdA`
+/// color matrices, and normalized `as_shot_wb`) from a `rawler::RawImage`.
+pub(crate) fn extract_camera_calibration_from_rawler(
+    raw_img: &rawler::RawImage,
+) -> Option<CameraCalibration> {
+    use rawler::imgop::xyz::Illuminant;
+
+    let make = if !raw_img.clean_make.trim().is_empty() {
+        raw_img.clean_make.trim().to_owned()
+    } else {
+        raw_img.make.trim().to_owned()
+    };
+    let model = if !raw_img.clean_model.trim().is_empty() {
+        raw_img.clean_model.trim().to_owned()
+    } else {
+        raw_img.model.trim().to_owned()
+    };
+
+    let to_mat9 = |flat: &[f32]| -> Option<[f32; 9]> {
+        if flat.len() < 9 {
+            return None;
+        }
+        let mut m = [0.0_f32; 9];
+        m.copy_from_slice(&flat[..9]);
+        if m.iter().all(|v| v.is_finite()) && m.iter().any(|v| v.abs() > 1e-6) {
+            Some(m)
+        } else {
+            None
+        }
+    };
+
+    let matrix_d65 = raw_img
+        .color_matrix
+        .get(&Illuminant::D65)
+        .and_then(|v| to_mat9(v))
+        .or_else(|| {
+            raw_img
+                .color_matrix
+                .get(&Illuminant::D50)
+                .and_then(|v| to_mat9(v))
+        })
+        .or_else(|| {
+            raw_img
+                .color_matrix
+                .get(&Illuminant::Daylight)
+                .and_then(|v| to_mat9(v))
+        })
+        .or_else(|| {
+            let m = [
+                raw_img.xyz_to_cam[0][0],
+                raw_img.xyz_to_cam[0][1],
+                raw_img.xyz_to_cam[0][2],
+                raw_img.xyz_to_cam[1][0],
+                raw_img.xyz_to_cam[1][1],
+                raw_img.xyz_to_cam[1][2],
+                raw_img.xyz_to_cam[2][0],
+                raw_img.xyz_to_cam[2][1],
+                raw_img.xyz_to_cam[2][2],
+            ];
+            to_mat9(&m)
+        });
+
+    let matrix_std_a = raw_img
+        .color_matrix
+        .get(&Illuminant::A)
+        .and_then(|v| to_mat9(v))
+        .or_else(|| {
+            raw_img
+                .color_matrix
+                .get(&Illuminant::Tungsten)
+                .and_then(|v| to_mat9(v))
+        });
+
+    let as_shot_wb = if raw_img.wb_coeffs[0].is_finite()
+        && raw_img.wb_coeffs[1].is_finite()
+        && raw_img.wb_coeffs[2].is_finite()
+        && raw_img.wb_coeffs[0] > 0.0
+        && raw_img.wb_coeffs[1] > 0.0
+        && raw_img.wb_coeffs[2] > 0.0
+    {
+        let g = raw_img.wb_coeffs[1];
+        Some([raw_img.wb_coeffs[0] / g, 1.0, raw_img.wb_coeffs[2] / g])
+    } else {
+        None
+    };
+
+    if make.is_empty()
+        && model.is_empty()
+        && matrix_d65.is_none()
+        && matrix_std_a.is_none()
+        && as_shot_wb.is_none()
+    {
+        return None;
+    }
+
+    Some(CameraCalibration {
+        make,
+        model,
+        matrix_d65,
+        matrix_std_a,
+        as_shot_wb,
+    })
+}
+
+/// Fast header-only RAW camera calibration probe via `rawler` dummy decode.
+///
+/// Returns `None` cleanly for non-RAW files or unrecognized containers.
+pub fn extract_raw_camera_calibration(path: &Path) -> Option<CameraCalibration> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::rawsource::RawSource;
+
+    if !is_raw_extension(path) || is_heif_extension(path) {
+        return None;
+    }
+    let raw_source = RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&raw_source).ok()?;
+    let raw_img = decoder
+        .raw_image(&raw_source, &RawDecodeParams::default(), true)
+        .ok()?;
+    extract_camera_calibration_from_rawler(&raw_img)
 }
 
 /// Tier 2 cross-platform RAW decoder built on pure-Rust `rawler`.
@@ -347,6 +501,7 @@ pub(crate) fn decode_rawler_linear(
     let display_name = file_display_name(path);
     let ext = file_ext_upper(path);
     let exif = crate::exif::extract_exif_from_path(path);
+    let camera_calibration = extract_camera_calibration_from_rawler(&raw_img);
 
     Ok(LinearImage {
         width,
@@ -357,6 +512,7 @@ pub(crate) fn decode_rawler_linear(
         source_path: Some(path.to_path_buf()),
         format_label: format!("{ext} • RAW Linear FP16"),
         exif,
+        camera_calibration,
     })
 }
 
@@ -628,6 +784,7 @@ pub(crate) mod macos {
     use half::f16;
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::AnyObject;
+    use objc2::sel;
     use objc2_core_foundation::{
         CFDictionary, CFNumber, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
     };
@@ -635,13 +792,16 @@ pub(crate) mod macos {
     use objc2_core_image::{
         CIContext, CIImage, CIRAWFilter, kCIFormatRGBAh, kCIImageApplyOrientationProperty,
     };
-    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
+    use objc2_foundation::{NSDictionary, NSNumber, NSObjectProtocol, NSString, NSURL};
     use objc2_image_io::{
         CGImageSource, kCGImagePropertyOrientation, kCGImagePropertyPixelHeight,
         kCGImagePropertyPixelWidth, kCGImagePropertyTIFFDictionary,
     };
 
-    use super::{file_display_name, file_ext_upper, sanitize_linear};
+    use super::{
+        RawDecodeMode, extract_raw_camera_calibration, file_display_name, file_ext_upper,
+        sanitize_linear,
+    };
     use crate::{DecodeError, LinearImage, build_histogram_proxy};
 
     /// Maximum single-axis dimension accepted from CoreImage to prevent runaway allocations.
@@ -733,11 +893,23 @@ pub(crate) mod macos {
     }
 
     /// Decodes a RAW, ProRAW, HEIC, or raster file into scene-referred linear `Rgba16Float`
-    /// using Apple's native `CIRAWFilter` / `CoreImage` pipeline.
+    /// using Apple's native `CIRAWFilter` / `CoreImage` pipeline in true linear mode.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn decode_coreimage_linear(
         path: &Path,
         max_edge: Option<u32>,
         try_raw_filter: bool,
+    ) -> Result<LinearImage, DecodeError> {
+        decode_coreimage_linear_with_mode(path, max_edge, try_raw_filter, RawDecodeMode::Linear)
+    }
+
+    /// Decodes a RAW, ProRAW, HEIC, or raster file into scene-referred linear `Rgba16Float`
+    /// using Apple's native `CIRAWFilter` / `CoreImage` pipeline with explicit [`RawDecodeMode`].
+    pub(crate) fn decode_coreimage_linear_with_mode(
+        path: &Path,
+        max_edge: Option<u32>,
+        try_raw_filter: bool,
+        mode: RawDecodeMode,
     ) -> Result<LinearImage, DecodeError> {
         let abs_path = if path.is_absolute() {
             path.to_path_buf()
@@ -759,10 +931,27 @@ pub(crate) mod macos {
             let (ci_image, used_raw_filter): (Retained<CIImage>, bool) = if try_raw_filter {
                 if let Some(raw_filter) = unsafe { CIRAWFilter::filterWithImageURL(&ns_url) } {
                     unsafe {
-                        // Preserve highlight headroom and enable Apple highlight recovery when supported.
+                        // Preserve highlight headroom and enable Apple highlight recovery when supported
+                        // (runtime selector guard required because highlightRecovery APIs are macOS 26+).
                         raw_filter.setExtendedDynamicRangeAmount(1.0);
-                        if raw_filter.isHighlightRecoverySupported() {
+                        if raw_filter.respondsToSelector(sel!(isHighlightRecoverySupported))
+                            && raw_filter.respondsToSelector(sel!(setHighlightRecoveryEnabled:))
+                            && raw_filter.isHighlightRecoverySupported()
+                        {
                             raw_filter.setHighlightRecoveryEnabled(true);
+                        }
+                        if mode == RawDecodeMode::Linear {
+                            // Disable Apple's baked tone boost, local tone mapping, and contrast so
+                            // Rune's linear Base Characteristics FilmCurve and 3D profile LUT never
+                            // double-apply a tone curve on macOS RAW files.
+                            raw_filter.setBoostAmount(0.0);
+                            raw_filter.setBoostShadowAmount(0.0);
+                            if raw_filter.isLocalToneMapSupported() {
+                                raw_filter.setLocalToneMapAmount(0.0);
+                            }
+                            if raw_filter.isContrastSupported() {
+                                raw_filter.setContrastAmount(0.0);
+                            }
                         }
                         if let Some(limit) = max_edge {
                             let native = raw_filter.nativeSize();
@@ -894,6 +1083,11 @@ pub(crate) mod macos {
                 "CoreImage Linear FP16"
             };
             let exif = crate::exif::extract_exif_from_path(path);
+            let camera_calibration = if used_raw_filter {
+                extract_raw_camera_calibration(path)
+            } else {
+                None
+            };
 
             Ok(LinearImage {
                 width: w32,
@@ -904,6 +1098,7 @@ pub(crate) mod macos {
                 source_path: Some(path.to_path_buf()),
                 format_label: format!("{ext} • {tier}"),
                 exif,
+                camera_calibration,
             })
         })
     }

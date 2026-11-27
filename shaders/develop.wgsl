@@ -84,6 +84,8 @@ struct DevelopUniforms {
     film_neg_a: vec4<f32>,
     // Film Negative Conversion: [density, contrast, black_clip, white_clip]
     film_neg_b: vec4<f32>,
+    // Camera Profile / Film Simulation 3D LUT: [profile_active (0/1), profile_strength (0..1), 0.0, 0.0]
+    profile_params: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -100,6 +102,9 @@ var curve_lut_tex: texture_2d<f32>;
 
 @group(0) @binding(4)
 var layer_mask_atlas: texture_2d<f32>;
+
+@group(0) @binding(5)
+var profile_lut_3d: texture_3d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -140,6 +145,38 @@ fn sample_photo(uv: vec2<f32>) -> vec3<f32> {
 fn sample_curve_lut(x: f32) -> vec4<f32> {
     let uv_x = (0.5 + clamp(x, 0.0, 1.0) * 255.0) / 256.0;
     return textureSampleLevel(curve_lut_tex, photo_sampler, vec2<f32>(uv_x, 0.5), 0.0);
+}
+
+const LUT_SHAPER_MAX_LINEAR: f32 = 64.0;
+const LUT_SHAPER_KNEE: f32 = 0.005;
+const LUT_SHAPER_LOG_DENOM: f32 = 13.643969;
+
+fn lut_shaper_forward(x: f32) -> f32 {
+    let v = max(x, 0.0);
+    return clamp(log2(1.0 + v / LUT_SHAPER_KNEE) / LUT_SHAPER_LOG_DENOM, 0.0, 1.0);
+}
+
+fn lut_shaper_inverse(s: f32) -> f32 {
+    let sc = clamp(s, 0.0, 1.0);
+    return max(LUT_SHAPER_KNEE * (exp2(sc * LUT_SHAPER_LOG_DENOM) - 1.0), 0.0);
+}
+
+fn apply_profile_lut(rgb: vec3<f32>, strength: f32) -> vec3<f32> {
+    let c = max(rgb, vec3<f32>(0.0));
+    let s = vec3<f32>(
+        lut_shaper_forward(c.r),
+        lut_shaper_forward(c.g),
+        lut_shaper_forward(c.b),
+    );
+    let uv = (vec3<f32>(0.5) + s * 32.0) / 33.0;
+    let sampled = textureSampleLevel(profile_lut_3d, photo_sampler, uv, 0.0).rgb;
+    let hdr_excess = max(c - vec3<f32>(LUT_SHAPER_MAX_LINEAR), vec3<f32>(0.0));
+    let mapped = vec3<f32>(
+        lut_shaper_inverse(sampled.r),
+        lut_shaper_inverse(sampled.g),
+        lut_shaper_inverse(sampled.b),
+    ) + hdr_excess;
+    return max(mix(c, mapped, clamp(strength, 0.0, 1.0)), vec3<f32>(0.0));
 }
 
 fn map_level_perceptual(
@@ -1315,6 +1352,11 @@ fn apply_develop(
     // 0.5. Optional Film Negative optical inversion (zero cost in Photography mode)
     if u.film_neg_a.w > 0.5 {
         rgb = invert_film_negative(rgb);
+    }
+
+    // 0.75. Optional Camera Profile / Film Simulation 33^3 3D LUT (zero cost when inactive)
+    if u.profile_params.x > 0.5 && u.profile_params.y > 1e-5 {
+        rgb = apply_profile_lut(rgb, u.profile_params.y);
     }
 
     // 1. White balance + Exposure (linear stops)

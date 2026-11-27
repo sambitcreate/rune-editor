@@ -14,6 +14,7 @@ pub mod vision;
 use std::path::{Path, PathBuf};
 
 use half::f16;
+use rune_editor_core::CameraCalibration;
 use thiserror::Error;
 
 pub use exif::{PhotoExif, extract_exif_from_bytes, extract_exif_from_path, format_shutter_speed};
@@ -29,8 +30,9 @@ pub use folder::{
     generate_demo_thumbnail, load_thumbnail, scan_photo_folder, scan_photo_folder_with_options,
 };
 pub use raw::{
-    RASTER_EXTENSIONS, RAW_EXTENSIONS, SUPPORTED_EXTENSIONS, is_raw_extension, is_supported_photo,
-    load_file_proxy, probe_image_dimensions,
+    RASTER_EXTENSIONS, RAW_EXTENSIONS, RawDecodeMode, SUPPORTED_EXTENSIONS,
+    extract_raw_camera_calibration, is_raw_extension, is_supported_photo, load_file_proxy,
+    load_file_proxy_with_mode, probe_image_dimensions,
 };
 pub use vision::generate_subject_mask;
 
@@ -48,6 +50,8 @@ pub struct LinearImage {
     pub format_label: String,
     /// Extracted camera EXIF metadata (`None` if unavailable or stripped).
     pub exif: Option<PhotoExif>,
+    /// Extracted RAW camera dual-illuminant calibration matrices & as-shot WB (`None` for rasters/samples).
+    pub camera_calibration: Option<CameraCalibration>,
 }
 
 impl LinearImage {
@@ -130,6 +134,7 @@ pub fn load_from_memory(
         source_path: None,
         format_label: format_label.to_owned(),
         exif,
+        camera_calibration: None,
     })
 }
 
@@ -248,6 +253,7 @@ pub fn generate_demo_hdr_scene(width: u32, height: u32) -> LinearImage {
             iso: Some(100),
             date_taken: Some("2026:10:18 18:42:10".to_owned()),
         }),
+        camera_calibration: None,
     }
 }
 
@@ -484,6 +490,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         let neutral = DevelopRecipe::default();
@@ -582,6 +589,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         let recipe = DevelopRecipe {
@@ -620,6 +628,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let grain_path = dir.join("mid_grain.png");
         export_image(&mid, &recipe, &grain_path, ExportFormat::Png16).expect("export grain png16");
@@ -818,6 +827,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let recipe = DevelopRecipe::default();
 
@@ -922,6 +932,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         // 1. Crop to Top-Right quadrant (Green): [0.5, 0.0, 0.5, 0.5] -> 40x20
@@ -1062,6 +1073,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         let export_rgb16 = |name: &str, recipe: &DevelopRecipe| {
@@ -1393,6 +1405,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let (_, _, c_base) = export::render_developed_srgb_f32(
             &chroma_img,
@@ -1484,6 +1497,7 @@ mod tests {
             source_path: None,
             format_label: "Test".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         let crop = GeometryParams {
@@ -1626,6 +1640,7 @@ mod tests {
             source_path: None,
             format_label: "RAW".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let (_, _, srgb_plain) = export::render_developed_srgb_f32(
             &img,
@@ -1771,6 +1786,7 @@ mod tests {
             source_path: None,
             format_label: "RAW".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let tiny_out = dir.join("tiny_wm.png");
         let tiny_opts = ExportOptions {
@@ -1871,6 +1887,7 @@ mod tests {
             source_path: None,
             format_label: "RAW".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
 
         let subj_mask = generate_subject_mask(&img, false);
@@ -1916,6 +1933,7 @@ mod tests {
             source_path: None,
             format_label: "RAW".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let clone_recipe = DevelopRecipe {
             heal_spots: vec![HealSpot {
@@ -2075,6 +2093,7 @@ mod tests {
             source_path: None,
             format_label: "RAW".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         let mut neg_recipe = DevelopRecipe::default();
         neg_recipe.convert_film_negative_from_base([0.90, 0.54, 0.32]);

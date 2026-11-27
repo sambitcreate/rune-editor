@@ -781,6 +781,17 @@ pub fn render_developed_srgb_f32(
     recipe: &DevelopRecipe,
     options: &ExportOptions,
 ) -> Result<(u32, u32, Vec<[f32; 3]>), DecodeError> {
+    render_developed_srgb_f32_with_profiles_dir(image, recipe, options, None)
+}
+
+/// Variant of [`render_developed_srgb_f32`] resolving `"user:<slug>"` camera profiles from an
+/// explicit `profiles_dir` (or `~/.config/rune-darkroom/profiles` when `None`).
+pub fn render_developed_srgb_f32_with_profiles_dir(
+    image: &LinearImage,
+    recipe: &DevelopRecipe,
+    options: &ExportOptions,
+    profiles_dir: Option<&Path>,
+) -> Result<(u32, u32, Vec<[f32; 3]>), DecodeError> {
     validate_linear_image(image)?;
     let prep = prepare_linear_source(image, recipe, options);
     let src = match prep.owned.as_deref() {
@@ -800,6 +811,7 @@ pub fn render_developed_srgb_f32(
         prep.frame_meta,
         recipe,
         options.color_space,
+        profiles_dir,
         |row, x, px| {
             row[x] = px;
         },
@@ -1945,6 +1957,7 @@ fn render_export_quantized<T: Copy + Default + Send + Sync>(
             frame_meta,
             recipe,
             color_space,
+            None,
             |row, x, px| {
                 row[x] = px;
             },
@@ -1985,6 +1998,7 @@ fn render_export_quantized<T: Copy + Default + Send + Sync>(
         frame_meta,
         recipe,
         color_space,
+        None,
         |row, x, px| {
             let didx = x * 3;
             row[didx] = quantize(px[0]);
@@ -2006,9 +2020,10 @@ fn render_rows_par<T: Send>(
     frame_meta: ExportFrameMeta,
     recipe: &DevelopRecipe,
     color_space: ExportColorSpace,
+    profiles_dir: Option<&Path>,
     write_px: impl Fn(&mut [T], usize, [f32; 3]) + Sync,
 ) {
-    let compiled = recipe.compile();
+    let compiled = recipe.compile_with_profiles_dir(profiles_dir);
     let spatial = SpatialDetailParams::from_recipe(recipe);
     let sanitized_layers: Vec<AdjustmentLayer> = recipe
         .layers

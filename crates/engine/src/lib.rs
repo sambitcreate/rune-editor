@@ -4,12 +4,15 @@
 //! on macOS `objc2-metal` (via Rune's custom Metal backend) as well as DX12/Vulkan.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use rune_editor_core::{
     ADVANCED_COLOR_SLICE_COUNT, CURVE_LUT_SIZE, DevelopRecipe, HSL_BAND_COUNT,
     LAYER_MASK_ATLAS_HEIGHT, LAYER_MASK_ATLAS_WIDTH, LayerMaskAtlas, LayerMaskItem,
-    MAX_ADJUSTMENT_LAYERS, MAX_HEAL_SPOTS, ToneCurves, ViewportCamera, bake_layer_mask_atlas,
+    MAX_ADJUSTMENT_LAYERS, MAX_HEAL_SPOTS, PROFILE_LUT_SIZE, ProfileLut3D, ToneCurves,
+    ViewportCamera, bake_layer_mask_atlas, canonical_profile_id, resolve_profile_lut,
 };
 use rune_editor_decode::LinearImage;
 
@@ -101,6 +104,8 @@ pub struct DevelopUniforms {
     pub film_neg_a: [f32; 4],
     /// Film Negative Conversion `[density, contrast, black_clip, white_clip]`.
     pub film_neg_b: [f32; 4],
+    /// Camera Profile / Film Simulation 3D LUT `[profile_active (0/1), profile_strength (0..1), 0.0, 0.0]`.
+    pub profile_params: [f32; 4],
 }
 
 impl DevelopUniforms {
@@ -111,6 +116,26 @@ impl DevelopUniforms {
         camera: &ViewportCamera,
         recipe: &DevelopRecipe,
         srgb_blend: bool,
+    ) -> Self {
+        Self::build_with_profiles_dir(
+            slot_rect,
+            target_size,
+            image_size,
+            camera,
+            recipe,
+            srgb_blend,
+            None,
+        )
+    }
+
+    pub fn build_with_profiles_dir(
+        slot_rect: [f32; 4],
+        target_size: [u32; 2],
+        image_size: [u32; 2],
+        camera: &ViewportCamera,
+        recipe: &DevelopRecipe,
+        srgb_blend: bool,
+        profiles_dir: Option<&Path>,
     ) -> Self {
         let mut hsl = [[0.0_f32; 4]; HSL_BAND_COUNT];
         for (dst, band) in hsl.iter_mut().zip(recipe.hsl.iter()) {
@@ -208,6 +233,15 @@ impl DevelopUniforms {
             heal_spots[i * 2 + 1] = packed[1];
         }
         let (film_neg_a, film_neg_b) = recipe.film_negative.to_uniforms(recipe.processing_mode);
+        let profile_strength = clamp_pos(recipe.profile_strength, 1.0, 0.0, 1.0);
+        let profile_active = if profile_strength > 1e-5
+            && resolve_profile_lut(&recipe.camera_profile, profiles_dir).is_some()
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let profile_params = [profile_active, profile_strength, 0.0, 0.0];
 
         Self {
             slot_rect,
@@ -353,6 +387,7 @@ impl DevelopUniforms {
             heal_spots,
             film_neg_a,
             film_neg_b,
+            profile_params,
         }
     }
 }
@@ -371,6 +406,9 @@ pub struct DevelopGpuResources {
     layer_mask_atlas_texture: wgpu::Texture,
     layer_mask_atlas_view: wgpu::TextureView,
     uploaded_layer_masks: Option<Vec<Vec<LayerMaskItem>>>,
+    profile_lut_texture: wgpu::Texture,
+    profile_lut_view: wgpu::TextureView,
+    uploaded_profile_lut: Option<(String, Option<Arc<ProfileLut3D>>)>,
     photo_texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     uploaded_generation: u64,
@@ -429,6 +467,16 @@ impl DevelopGpuResources {
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
                     count: None,
@@ -493,6 +541,23 @@ impl DevelopGpuResources {
         let layer_mask_atlas_view =
             layer_mask_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let profile_lut_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rune-editor profile lut 33x33x33 rgba16f"),
+            size: wgpu::Extent3d {
+                width: PROFILE_LUT_SIZE as u32,
+                height: PROFILE_LUT_SIZE as u32,
+                depth_or_array_layers: PROFILE_LUT_SIZE as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let profile_lut_view =
+            profile_lut_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             shader,
             bind_group_layout,
@@ -506,6 +571,9 @@ impl DevelopGpuResources {
             layer_mask_atlas_texture,
             layer_mask_atlas_view,
             uploaded_layer_masks: None,
+            profile_lut_texture,
+            profile_lut_view,
+            uploaded_profile_lut: None,
             photo_texture: None,
             bind_group: None,
             uploaded_generation: 0,
@@ -591,8 +659,72 @@ impl DevelopGpuResources {
         self.uploaded_layer_masks = Some(slice.iter().map(|l| l.masks.clone()).collect());
     }
 
+    fn write_profile_lut_3d(&self, queue: &wgpu::Queue, lut: &ProfileLut3D) {
+        let size = PROFILE_LUT_SIZE as u32;
+        let rgba16f = lut.to_rgba16f();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.profile_lut_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&rgba16f),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8), // 33 * 4 * 2 bytes per row
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: size,
+            },
+        );
+    }
+
+    /// Uploads the `33×33×33` `Rgba16Float` camera profile / film simulation 3D LUT texture
+    /// ONLY when `recipe.camera_profile` or its resolved user profile LUT instance changes
+    /// (zero re-bake or upload on 120Hz slider drags).
+    pub fn ensure_profile_lut_uploaded(&mut self, queue: &wgpu::Queue, recipe: &DevelopRecipe) {
+        self.ensure_profile_lut_uploaded_with_dir(queue, recipe, None);
+    }
+
+    /// Variant of [`Self::ensure_profile_lut_uploaded`] resolving `"user:<slug>"` camera profiles
+    /// from an explicit `profiles_dir` (or `~/.config/rune-darkroom/profiles` when `None`).
+    pub fn ensure_profile_lut_uploaded_with_dir(
+        &mut self,
+        queue: &wgpu::Queue,
+        recipe: &DevelopRecipe,
+        profiles_dir: Option<&Path>,
+    ) {
+        let canonical = canonical_profile_id(&recipe.camera_profile);
+        let lut = resolve_profile_lut(&canonical, profiles_dir);
+        let unchanged =
+            self.uploaded_profile_lut
+                .as_ref()
+                .is_some_and(|(cached_id, cached_lut)| {
+                    cached_id == &canonical
+                        && match (cached_lut, &lut) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                            _ => false,
+                        }
+                });
+        if unchanged {
+            return;
+        }
+        if let Some(lut_ref) = lut.as_deref() {
+            self.write_profile_lut_3d(queue, lut_ref);
+        } else {
+            let identity = ProfileLut3D::identity(PROFILE_LUT_SIZE);
+            self.write_profile_lut_3d(queue, &identity);
+        }
+        self.uploaded_profile_lut = Some((canonical, lut));
+    }
+
     /// Uploads the scene-referred `Rgba16Float` image texture only when `generation` changes.
-    /// Also initializes the tone curve LUT and layer mask atlas on first upload if not yet uploaded.
+    /// Also initializes the tone curve LUT, layer mask atlas, and 3D profile LUT on first upload.
     pub fn ensure_image_uploaded(
         &mut self,
         device: &wgpu::Device,
@@ -609,6 +741,11 @@ impl DevelopGpuResources {
             let empty = LayerMaskAtlas::empty();
             self.write_layer_mask_atlas(queue, &empty);
             self.uploaded_layer_masks = Some(Vec::new());
+        }
+        if self.uploaded_profile_lut.is_none() {
+            let identity = ProfileLut3D::identity(PROFILE_LUT_SIZE);
+            self.write_profile_lut_3d(queue, &identity);
+            self.uploaded_profile_lut = Some(("auto".to_owned(), None));
         }
 
         if self.uploaded_generation == generation && self.bind_group.is_some() {
@@ -674,6 +811,10 @@ impl DevelopGpuResources {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&self.layer_mask_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.profile_lut_view),
                 },
             ],
         });
@@ -748,10 +889,12 @@ mod tests {
     #[test]
     fn develop_uniforms_alignment_and_packing() {
         let size = std::mem::size_of::<DevelopUniforms>();
-        assert_eq!(size, 2192);
+        assert_eq!(size, 2208);
         assert_eq!(size % 16, 0);
 
         let mut recipe = DevelopRecipe {
+            camera_profile: "pro_standard".to_owned(),
+            profile_strength: 0.75,
             film_curve: FilmCurve::FilmExtraShadow,
             shadows_wheel: ColorWheel::new(-0.2, -0.3, -0.1),
             midtones_wheel: ColorWheel::new(0.1, 0.05, 0.02),
@@ -854,6 +997,7 @@ mod tests {
         assert!((u.geo_xform[0] - 5.0_f32.to_radians()).abs() < 1e-6);
         assert_eq!(u.geo_xform[1..4], [1.0, 1.0, 0.0]);
         assert_eq!(u.overlay_flags, [1.0, 1.0, 1.0, 2.0]);
+        assert_eq!(u.profile_params, [1.0, 0.75, 0.0, 0.0]);
 
         // Out-of-disk / NaN wheels must be clamped safely in DevelopUniforms::build.
         let wild = DevelopRecipe {
@@ -900,8 +1044,25 @@ mod tests {
         target_w: u32,
         target_h: u32,
     ) -> Vec<[f32; 4]> {
+        render_offscreen_rgba32f_with_profiles_dir(
+            device, queue, gpu, camera, recipe, target_w, target_h, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_offscreen_rgba32f_with_profiles_dir(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        gpu: &mut DevelopGpuResources,
+        camera: &ViewportCamera,
+        recipe: &DevelopRecipe,
+        target_w: u32,
+        target_h: u32,
+        profiles_dir: Option<&Path>,
+    ) -> Vec<[f32; 4]> {
         gpu.ensure_curve_lut_uploaded(queue, recipe);
         gpu.ensure_layer_masks_uploaded(queue, recipe);
+        gpu.ensure_profile_lut_uploaded_with_dir(queue, recipe, profiles_dir);
         let target_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("parity target"),
             size: wgpu::Extent3d {
@@ -918,13 +1079,14 @@ mod tests {
         });
         let target_view = target_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let uniforms = DevelopUniforms::build(
+        let uniforms = DevelopUniforms::build_with_profiles_dir(
             [0.0, 0.0, target_w as f32, target_h as f32],
             [target_w, target_h],
             gpu.image_size(),
             camera,
             recipe,
             false,
+            profiles_dir,
         );
         queue.write_buffer(gpu.uniform_buffer(), 0, bytemuck::bytes_of(&uniforms));
 
@@ -1032,6 +1194,7 @@ mod tests {
             source_path: None,
             format_label: "TEST".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         gpu.ensure_image_uploaded(&device, &queue, 1, &img);
 
@@ -1256,6 +1419,7 @@ mod tests {
             source_path: None,
             format_label: "TEST".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         gpu.ensure_image_uploaded(&device, &queue, 2, &quad_img);
 
@@ -1324,6 +1488,7 @@ mod tests {
             source_path: None,
             format_label: "TEST".to_owned(),
             exif: None,
+            camera_calibration: None,
         };
         gpu.ensure_image_uploaded(&device, &queue, 3, &tex_img);
 
@@ -1939,5 +2104,395 @@ mod tests {
             bot_gray[0] < 0.05 && (bot_gray[0] - bot_gray[2]).abs() < 1e-3,
             "Grayscale mask overlay should render unmasked bottom pure black: {bot_gray:?}"
         );
+
+        // Phase 1 Camera Profile 33^3 3D LUT GPU <-> CPU < 2e-3 parity across key profiles at 1.0 and 0.5 strength.
+        for profile_id in [
+            "pro_standard",
+            "classic_chrome",
+            "vivid_velvia",
+            "acros_mono",
+        ] {
+            for strength in [1.0_f32, 0.5_f32] {
+                let prof_recipe = DevelopRecipe {
+                    camera_profile: profile_id.to_owned(),
+                    profile_strength: strength,
+                    exposure: 0.15,
+                    ..DevelopRecipe::default()
+                };
+                let gpu_prof = render_offscreen_rgba32f(
+                    &device,
+                    &queue,
+                    &mut gpu,
+                    &ViewportCamera::default(),
+                    &prof_recipe,
+                    96,
+                    96,
+                );
+                let (cw, ch, cpu_prof) = rune_editor_decode::export::render_developed_srgb_f32(
+                    &tex_img,
+                    &prof_recipe,
+                    &rune_editor_decode::ExportOptions::default(),
+                )
+                .expect("render cpu profile parity");
+                assert_eq!((cw, ch), (40, 40));
+
+                let mut max_diff = 0.0_f32;
+                let mut worst = (0u32, 0u32, 0usize, 0.0_f32, 0.0_f32);
+                for y in 2..38u32 {
+                    for x in 2..38u32 {
+                        let gp = gpu_prof[((28 + y) * 96 + (28 + x)) as usize];
+                        let cp = cpu_prof[(y * cw + x) as usize];
+                        for ch in 0..3 {
+                            let gpu_srgb = rune_editor_core::linear_to_srgb(gp[ch]);
+                            let diff = (gpu_srgb - cp[ch]).abs();
+                            if diff > max_diff {
+                                max_diff = diff;
+                                worst = (x, y, ch, gpu_srgb, cp[ch]);
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    max_diff < 2e-3,
+                    "Camera profile GPU vs CPU parity drift for '{profile_id}' (strength={strength}): max={max_diff:.6} at ({},{}) ch={} gpu={} cpu={}",
+                    worst.0,
+                    worst.1,
+                    worst.2,
+                    worst.3,
+                    worst.4
+                );
+            }
+        }
+
+        // Phase 2 External User Camera Profiles (.dcp, .cube, .icc matrix-shaper, .icc A2B0 mft2)
+        // GPU <-> CPU < 2e-3 parity + on-disk overwrite cache invalidation test.
+        use rune_editor_core::{
+            import_user_profile_in_dir, import_user_profile_in_dir_with_overwrite,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "rune_engine_user_profiles_{}_{nanos}",
+            std::process::id()
+        ));
+        let src_dir = std::env::temp_dir().join(format!(
+            "rune_engine_user_profiles_src_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&store_dir).expect("mkdir store");
+        std::fs::create_dir_all(&src_dir).expect("mkdir src");
+
+        // 1) Synthetic .cube (17^3, non-default domain)
+        let build_cube = |title: &str, warm_r: f32, cool_b: f32| -> Vec<u8> {
+            let mut s = format!(
+                "# GPU parity .cube\nTITLE \"{title}\"\nLUT_3D_SIZE 17\nDOMAIN_MIN 0.02 0.02 0.02\nDOMAIN_MAX 0.98 0.98 0.98\n"
+            );
+            for b in 0..17 {
+                let fb = b as f32 / 16.0;
+                for g in 0..17 {
+                    let fg = g as f32 / 16.0;
+                    for r in 0..17 {
+                        let fr = r as f32 / 16.0;
+                        s.push_str(&format!(
+                            "{:.6} {:.6} {:.6}\n",
+                            fr.powf(warm_r),
+                            fg,
+                            fb.powf(cool_b)
+                        ));
+                    }
+                }
+            }
+            s.into_bytes()
+        };
+        let cube_path = src_dir.join("cinema.cube");
+        std::fs::write(&cube_path, build_cube("Cinema Warm", 0.82, 1.18)).unwrap();
+        let cube_desc = import_user_profile_in_dir(&store_dir, &cube_path, None).unwrap();
+
+        // 2) Synthetic .dcp (LE with HueSatMap + LookTable + ProfileToneCurve)
+        let dcp_bytes = {
+            let mut buf = b"II".to_vec();
+            buf.extend_from_slice(&0x4352u16.to_le_bytes());
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            let model = b"SONY ILCE-7RM5\0";
+            let name = b"Engine Test DCP\0";
+            let hsm_dims = [6u32, 2, 2];
+            let mut hsm_data = Vec::new();
+            for _v in 0..2 {
+                for h in 0..6 {
+                    for s in 0..2 {
+                        hsm_data.extend_from_slice(&[
+                            if h == 0 && s == 1 { 7.0_f32 } else { 0.0 },
+                            if s == 1 { 1.14_f32 } else { 1.0 },
+                            1.0_f32,
+                        ]);
+                    }
+                }
+            }
+            let curve: [f32; 8] = [0.0, 0.0, 0.25, 0.21, 0.75, 0.81, 1.0, 1.0];
+            let entry_count = 5u16;
+            let data_start = 8u32 + 2 + (entry_count as u32) * 12 + 4;
+            let mut pay = Vec::new();
+            let mut add = |src: &[u8]| -> u32 {
+                let off = data_start + pay.len() as u32;
+                pay.extend_from_slice(src);
+                while !pay.len().is_multiple_of(4) {
+                    pay.push(0);
+                }
+                off
+            };
+            let m_off = add(model);
+            let n_off = add(name);
+            let hd_off = add(bytemuck::cast_slice(&hsm_dims));
+            let h_off = add(bytemuck::cast_slice(&hsm_data));
+            let c_off = add(bytemuck::cast_slice(&curve));
+            buf.extend_from_slice(&entry_count.to_le_bytes());
+            for (tag, typ, cnt, off) in [
+                (50708u16, 2u16, model.len() as u32, m_off),
+                (50936, 2, name.len() as u32, n_off),
+                (50937, 4, 3, hd_off),
+                (50938, 11, hsm_data.len() as u32, h_off),
+                (50940, 11, curve.len() as u32, c_off),
+            ] {
+                buf.extend_from_slice(&tag.to_le_bytes());
+                buf.extend_from_slice(&typ.to_le_bytes());
+                buf.extend_from_slice(&cnt.to_le_bytes());
+                buf.extend_from_slice(&off.to_le_bytes());
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&pay);
+            buf
+        };
+        let dcp_path = src_dir.join("sony_test.dcp");
+        std::fs::write(&dcp_path, &dcp_bytes).unwrap();
+        let dcp_desc = import_user_profile_in_dir(&store_dir, &dcp_path, None).unwrap();
+
+        // 3) Synthetic .icc matrix-shaper (rXYZ/gXYZ/bXYZ + para gamma 1.18)
+        let assemble_icc = |tags: &[([u8; 4], Vec<u8>)]| -> Vec<u8> {
+            let mut hdr = vec![0u8; 128];
+            hdr[12..16].copy_from_slice(b"scnr");
+            hdr[16..20].copy_from_slice(b"RGB ");
+            hdr[20..24].copy_from_slice(b"XYZ ");
+            hdr[36..40].copy_from_slice(b"acsp");
+            let mut tbl = (tags.len() as u32).to_be_bytes().to_vec();
+            let start = 128 + 4 + tags.len() * 12;
+            let mut pay = Vec::new();
+            for (sig, data) in tags {
+                tbl.extend_from_slice(sig);
+                tbl.extend_from_slice(&((start + pay.len()) as u32).to_be_bytes());
+                tbl.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                pay.extend_from_slice(data);
+                while !pay.len().is_multiple_of(4) {
+                    pay.push(0);
+                }
+            }
+            let total = (128 + tbl.len() + pay.len()) as u32;
+            hdr[0..4].copy_from_slice(&total.to_be_bytes());
+            hdr.extend_from_slice(&tbl);
+            hdr.extend_from_slice(&pay);
+            hdr
+        };
+        let make_xyz = |v: [f32; 3]| -> Vec<u8> {
+            let mut p = b"XYZ \0\0\0\0".to_vec();
+            for c in v {
+                p.extend_from_slice(&((c * 65536.0).round() as i32).to_be_bytes());
+            }
+            p
+        };
+        let mut para = b"para\0\0\0\0".to_vec();
+        para.extend_from_slice(&0u16.to_be_bytes());
+        para.extend_from_slice(&0u16.to_be_bytes());
+        para.extend_from_slice(&((1.18_f32 * 65536.0).round() as i32).to_be_bytes());
+        let icc_ms_bytes = assemble_icc(&[
+            (*b"rXYZ", make_xyz([0.436_075, 0.222_505, 0.013_932])),
+            (*b"gXYZ", make_xyz([0.385_065, 0.716_879, 0.097_105])),
+            (*b"bXYZ", make_xyz([0.143_080, 0.060_617, 0.714_173])),
+            (*b"rTRC", para.clone()),
+            (*b"gTRC", para.clone()),
+            (*b"bTRC", para),
+        ]);
+        let icc_ms_path = src_dir.join("matrix_shaper.icc");
+        std::fs::write(&icc_ms_path, &icc_ms_bytes).unwrap();
+        let icc_ms_desc =
+            import_user_profile_in_dir(&store_dir, &icc_ms_path, Some("ICC Matrix Shaper"))
+                .unwrap();
+
+        // 4) Synthetic .icc A2B0 mft2 16-bit 3D CLUT
+        let icc_mft2_bytes = {
+            let grid = 7usize;
+            let mut mft = b"mft2\0\0\0\0".to_vec();
+            mft.extend_from_slice(&[3, 3, grid as u8, 0]);
+            for v in [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
+                mft.extend_from_slice(&((v * 65536.0).round() as i32).to_be_bytes());
+            }
+            mft.extend_from_slice(&2u16.to_be_bytes());
+            mft.extend_from_slice(&2u16.to_be_bytes());
+            for _ in 0..3 {
+                mft.extend_from_slice(&0u16.to_be_bytes());
+                mft.extend_from_slice(&65535u16.to_be_bytes());
+            }
+            let srgb_d50 = [
+                0.436_075_f32,
+                0.385_065,
+                0.143_080,
+                0.222_505,
+                0.716_879,
+                0.060_617,
+                0.013_932,
+                0.097_105,
+                0.714_173,
+            ];
+            for r in 0..grid {
+                let fr = (r as f32 / (grid - 1) as f32).powf(0.90);
+                for g in 0..grid {
+                    let fg = g as f32 / (grid - 1) as f32;
+                    for b in 0..grid {
+                        let fb = (b as f32 / (grid - 1) as f32).powf(1.08);
+                        let x = srgb_d50[0] * fr + srgb_d50[1] * fg + srgb_d50[2] * fb;
+                        let y = srgb_d50[3] * fr + srgb_d50[4] * fg + srgb_d50[5] * fb;
+                        let z = srgb_d50[6] * fr + srgb_d50[7] * fg + srgb_d50[8] * fb;
+                        for c in [x, y, z] {
+                            let u = (c * 32768.0).round().clamp(0.0, 65535.0) as u16;
+                            mft.extend_from_slice(&u.to_be_bytes());
+                        }
+                    }
+                }
+            }
+            for _ in 0..3 {
+                mft.extend_from_slice(&0u16.to_be_bytes());
+                mft.extend_from_slice(&65535u16.to_be_bytes());
+            }
+            assemble_icc(&[(*b"A2B0", mft)])
+        };
+        let icc_mft_path = src_dir.join("clut_mft2.icm");
+        std::fs::write(&icc_mft_path, &icc_mft2_bytes).unwrap();
+        let icc_mft_desc =
+            import_user_profile_in_dir(&store_dir, &icc_mft_path, Some("ICC MFT2 CLUT")).unwrap();
+
+        for profile_id in [
+            cube_desc.id.as_str(),
+            dcp_desc.id.as_str(),
+            icc_ms_desc.id.as_str(),
+            icc_mft_desc.id.as_str(),
+        ] {
+            for strength in [1.0_f32, 0.5_f32] {
+                let prof_recipe = DevelopRecipe {
+                    camera_profile: profile_id.to_owned(),
+                    profile_strength: strength,
+                    exposure: 0.1,
+                    ..DevelopRecipe::default()
+                };
+                let gpu_prof = render_offscreen_rgba32f_with_profiles_dir(
+                    &device,
+                    &queue,
+                    &mut gpu,
+                    &ViewportCamera::default(),
+                    &prof_recipe,
+                    96,
+                    96,
+                    Some(&store_dir),
+                );
+                let (cw, ch, cpu_prof) =
+                    rune_editor_decode::export::render_developed_srgb_f32_with_profiles_dir(
+                        &tex_img,
+                        &prof_recipe,
+                        &rune_editor_decode::ExportOptions::default(),
+                        Some(&store_dir),
+                    )
+                    .expect("render cpu user profile parity");
+                assert_eq!((cw, ch), (40, 40));
+
+                let mut max_diff = 0.0_f32;
+                let mut worst = (0u32, 0u32, 0usize, 0.0_f32, 0.0_f32);
+                for y in 2..38u32 {
+                    for x in 2..38u32 {
+                        let gp = gpu_prof[((28 + y) * 96 + (28 + x)) as usize];
+                        let cp = cpu_prof[(y * cw + x) as usize];
+                        for ch in 0..3 {
+                            let gpu_srgb = rune_editor_core::linear_to_srgb(gp[ch]);
+                            let diff = (gpu_srgb - cp[ch]).abs();
+                            if diff > max_diff {
+                                max_diff = diff;
+                                worst = (x, y, ch, gpu_srgb, cp[ch]);
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    max_diff < 2e-3,
+                    "External user profile GPU vs CPU parity drift for '{profile_id}' (strength={strength}): max={max_diff:.6} at ({},{}) ch={} gpu={} cpu={}",
+                    worst.0,
+                    worst.1,
+                    worst.2,
+                    worst.3,
+                    worst.4
+                );
+            }
+        }
+
+        // Verify GPU re-uploads when an existing user profile is overwritten on disk!
+        let cube_recipe = DevelopRecipe {
+            camera_profile: cube_desc.id.clone(),
+            profile_strength: 1.0,
+            ..DevelopRecipe::default()
+        };
+        let gpu_before = render_offscreen_rgba32f_with_profiles_dir(
+            &device,
+            &queue,
+            &mut gpu,
+            &ViewportCamera::default(),
+            &cube_recipe,
+            96,
+            96,
+            Some(&store_dir),
+        );
+        std::fs::write(&cube_path, build_cube("Cinema Cool", 1.25, 0.78)).unwrap();
+        import_user_profile_in_dir_with_overwrite(
+            &store_dir,
+            &cube_path,
+            Some("Cinema Warm"),
+            true,
+        )
+        .unwrap();
+        let gpu_after = render_offscreen_rgba32f_with_profiles_dir(
+            &device,
+            &queue,
+            &mut gpu,
+            &ViewportCamera::default(),
+            &cube_recipe,
+            96,
+            96,
+            Some(&store_dir),
+        );
+        let (_, _, cpu_after) =
+            rune_editor_decode::export::render_developed_srgb_f32_with_profiles_dir(
+                &tex_img,
+                &cube_recipe,
+                &rune_editor_decode::ExportOptions::default(),
+                Some(&store_dir),
+            )
+            .unwrap();
+        let center_before = gpu_before[48 * 96 + 48];
+        let center_after = gpu_after[48 * 96 + 48];
+        assert!(
+            (center_before[0] - center_after[0]).abs() > 0.03
+                && (center_before[2] - center_after[2]).abs() > 0.03,
+            "GPU must re-upload overwritten user profile: before={center_before:?} after={center_after:?}"
+        );
+        for ch in 0..3 {
+            let d = (rune_editor_core::linear_to_srgb(center_after[ch])
+                - cpu_after[20 * 40 + 20][ch])
+                .abs();
+            assert!(
+                d < 2e-3,
+                "Overwritten user profile GPU vs CPU drift on ch {ch}: {d}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&src_dir);
     }
 }
