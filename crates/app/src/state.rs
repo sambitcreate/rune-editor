@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rune::{AppHandle, LiveRegion, Mods, Pixels, TextEdit, Tx};
@@ -24,8 +24,8 @@ use rune_editor_core::{
     find_builtin_profile, find_scalar_param, import_user_profile, is_valid_camera_profile_id,
     linear_to_srgb, list_all_camera_profiles, list_user_styles, load_ai_model_config,
     models_root_dir, modified_recipe_groups, move_photo_with_sidecar, pick_white_balance,
-    recipe_to_sparse_patch, rgb_to_hsl_and_lab, save_ai_model_config, save_user_style,
-    stack_style_onto_recipe, temperature_to_kelvin,
+    recipe_to_sparse_patch, rgb_to_hsl_and_lab, save_user_style, stack_style_onto_recipe,
+    temperature_to_kelvin, update_ai_model_config, update_ai_model_config_at,
 };
 use rune_editor_decode::{
     ActiveEngineSummary, ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec,
@@ -1451,6 +1451,10 @@ pub struct AppState {
     pub ai_license_toggles: HashMap<ModelId, bool>,
     pub ai_download_jobs: ModelDownloadRegistry,
     pub ai_download_revision: u64,
+    /// Non-`None` while a background AI segmentation job is running off the UI thread.
+    pub ai_segmenting_label: Option<String>,
+    /// Monotonic token used to discard superseded background AI segmentation results.
+    pub ai_seg_request_seq: Arc<AtomicU64>,
 }
 
 fn image_camera_make_model(image: &LinearImage) -> (Option<&str>, Option<&str>) {
@@ -1700,6 +1704,8 @@ impl Default for AppState {
             ai_license_toggles,
             ai_download_jobs: ModelDownloadRegistry::default(),
             ai_download_revision: 0,
+            ai_segmenting_label: None,
+            ai_seg_request_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1894,10 +1900,14 @@ impl AppState {
         self.sync_window_state(tx);
     }
 
-    /// Selects and atomically persists the active segmentation engine (`ai_models.json`).
+    /// Selects and atomically persists the active segmentation engine (`ai_models.json`),
+    /// merging against on-disk config under a lock so CLI/MCP changes are never clobbered.
     pub fn set_ai_engine(&mut self, engine: SegmentationEngine) -> Result<(), String> {
-        self.ai_model_config.active_engine = engine;
-        save_ai_model_config(&self.ai_model_config).map_err(|e| e.to_string())?;
+        let updated = update_ai_model_config(|cfg| {
+            cfg.active_engine = engine;
+        })
+        .map_err(|e| e.to_string())?;
+        self.ai_model_config = updated;
         self.ai_model_statuses = list_model_statuses();
         self.ai_engine_summary = active_engine_summary();
         self.status_message = Some(format!(
@@ -2070,17 +2080,17 @@ impl AppState {
         Ok(())
     }
 
-    /// Reloads `ai_models.json` from disk first (preserving any `accepted_licenses` written by
-    /// `download_model` / `setup_model_from_local_dir`), updates `preferred_sam3_variant`, and saves.
+    /// Reloads `ai_models.json` from disk under a lock (preserving any `accepted_licenses` written
+    /// by `download_model` / `setup_model_from_local_dir`), updates `preferred_sam3_variant`, and saves.
     fn persist_preferred_sam3_variant_at(&mut self, config_path: &Path, id: ModelId) {
         if !id.is_sam3() {
             return;
         }
-        let mut fresh = rune_editor_core::load_ai_model_config_from(config_path)
-            .unwrap_or_else(|_| self.ai_model_config.clone());
-        fresh.preferred_sam3_variant = id;
-        let _ = rune_editor_core::save_ai_model_config_to(config_path, &fresh);
-        self.ai_model_config = fresh;
+        if let Ok(fresh) = update_ai_model_config_at(config_path, |cfg| {
+            cfg.preferred_sam3_variant = id;
+        }) {
+            self.ai_model_config = fresh;
+        }
     }
 
     fn persist_preferred_sam3_variant(&mut self, id: ModelId) {
@@ -2157,6 +2167,65 @@ impl AppState {
     }
 
     pub fn import_model_from_local_dir_tx(&mut self, id: ModelId, dir: PathBuf, tx: &mut Tx) {
+        if let Some(handle) = self.app_handle.clone() {
+            let spec = id.spec();
+            let accepted = self.is_ai_license_checked(id);
+            if spec.requires_license_acceptance && !accepted {
+                let _ = self.import_model_from_local_dir(id, &dir);
+                self.sync_window_state(tx);
+                return;
+            }
+            let job = Arc::new(Mutex::new(ModelDownloadJob::with_phase(
+                ModelDownloadPhase::Downloading {
+                    fraction: 0.25,
+                    file_index: 0,
+                    total_files: spec.files.len(),
+                    file_name: "Copying local weights…".to_owned(),
+                    bytes_downloaded: 0,
+                    total_bytes: spec.approx_bytes,
+                    status: format!("Importing {}…", spec.display_name),
+                },
+            )));
+            if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+                map.insert(id, job.clone());
+            }
+            self.status_message = Some(format!("Importing {}…", spec.display_name));
+            self.sync_window_state(tx);
+
+            std::thread::spawn(move || {
+                let result = setup_model_from_local_dir(id, &dir, accepted);
+                handle.update_if(move |s, tx| {
+                    s.ai_download_revision = s.ai_download_revision.saturating_add(1);
+                    match result {
+                        Ok(_) => {
+                            if let Ok(mut map) = s.ai_download_jobs.jobs.lock() {
+                                map.remove(&id);
+                            }
+                            if id.is_sam3() {
+                                s.persist_preferred_sam3_variant(id);
+                            } else {
+                                s.refresh_ai_models();
+                            }
+                            s.status_message = Some(format!(
+                                "Imported {} from {}",
+                                id.display_name(),
+                                dir.display()
+                            ));
+                        }
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if let Ok(mut guard) = job.lock() {
+                                guard.phase = ModelDownloadPhase::Error(msg.clone());
+                            }
+                            s.status_message = Some(format!("Import failed: {msg}"));
+                        }
+                    }
+                    s.sync_window_state(tx);
+                    true
+                });
+            });
+            return;
+        }
         let _ = self.import_model_from_local_dir(id, &dir);
         self.sync_window_state(tx);
     }
@@ -2306,6 +2375,18 @@ impl AppState {
     }
 
     pub fn recompute_histogram(&mut self) {
+        if self
+            .active_layer_index
+            .is_some_and(|i| i >= self.recipe.layers.len())
+        {
+            self.active_layer_index = self.recipe.layers.len().checked_sub(1);
+        }
+        if self
+            .ai_select_target_layer
+            .is_some_and(|i| i >= self.recipe.layers.len())
+        {
+            self.ai_select_target_layer = None;
+        }
         self.sync_active_layer_camera();
         self.compiled_recipe = CompiledRecipe::from_recipe(&self.recipe);
         self.histogram =
@@ -3752,16 +3833,32 @@ impl AppState {
         self.sync_window_state(tx);
     }
 
+    fn apply_ai_subject_result(
+        &mut self,
+        background: bool,
+        mask: MaskShape,
+        status: AiMaskStatus,
+    ) -> Option<usize> {
+        let name = if background {
+            "AI Background".to_owned()
+        } else {
+            "AI Subject".to_owned()
+        };
+        let idx = self.add_layer_with_shape(name.clone(), Some(mask))?;
+        let mut msg = format!("{name} · {}", status.compact_badge());
+        if let Some(note) = &status.fallback_note {
+            msg.push_str(&format!(" ({note})"));
+        }
+        self.last_ai_mask_status = Some(status);
+        self.status_message = Some(msg);
+        Some(idx)
+    }
+
     pub fn add_ai_subject_layer(&mut self, background: bool) -> Option<usize> {
         let prompt = if background {
             SmartMaskPrompt::AutoBackground
         } else {
             SmartMaskPrompt::AutoSubject
-        };
-        let name = if background {
-            "AI Background".to_owned()
-        } else {
-            "AI Subject".to_owned()
         };
 
         let (mask, status) = match generate_smart_mask(&self.image, &prompt, None) {
@@ -3783,35 +3880,75 @@ impl AppState {
             }
         };
 
-        let idx = self.add_layer_with_shape(name.clone(), Some(mask))?;
-        let mut msg = format!("{name} · {}", status.compact_badge());
-        if let Some(note) = &status.fallback_note {
-            msg.push_str(&format!(" ({note})"));
-        }
-        self.last_ai_mask_status = Some(status);
-        self.status_message = Some(msg);
-        Some(idx)
+        self.apply_ai_subject_result(background, mask, status)
     }
 
     pub fn add_ai_subject_layer_tx(&mut self, background: bool, tx: &mut Tx) {
+        if let Some(handle) = self.app_handle.clone() {
+            let prompt = if background {
+                SmartMaskPrompt::AutoBackground
+            } else {
+                SmartMaskPrompt::AutoSubject
+            };
+            let label = if background {
+                "Segmenting background…".to_owned()
+            } else {
+                "Segmenting subject…".to_owned()
+            };
+            let req_id = self.ai_seg_request_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            let image = self.image.clone();
+            let expected_src = self.image.source_path.clone();
+            self.ai_segmenting_label = Some(label.clone());
+            self.status_message = Some(label);
+            self.sync_window_state(tx);
+
+            std::thread::spawn(move || {
+                let (mask, status) = match generate_smart_mask(&image, &prompt, None) {
+                    Ok(res) => {
+                        let status = AiMaskStatus::from_result(&res);
+                        (res.mask, status)
+                    }
+                    Err(err) => {
+                        let mask = generate_heuristic_mask(&image, background);
+                        let status = AiMaskStatus {
+                            engine: SegmentationEngine::Heuristic,
+                            backend_label: "Heuristic Fallback".to_owned(),
+                            elapsed_ms: 0,
+                            iou_score: None,
+                            instance_count: None,
+                            fallback_note: Some(err.to_string()),
+                        };
+                        (mask, status)
+                    }
+                };
+                handle.update_if(move |s, tx| {
+                    if s.ai_seg_request_seq.load(Ordering::Acquire) != req_id {
+                        return false;
+                    }
+                    s.ai_segmenting_label = None;
+                    if s.image.source_path == expected_src
+                        && s.apply_ai_subject_result(background, mask, status)
+                            .is_some()
+                    {
+                        s.set_mask_overlay_mode(1);
+                    }
+                    s.sync_window_state(tx);
+                    true
+                });
+            });
+            return;
+        }
         if self.add_ai_subject_layer(background).is_some() {
             self.set_mask_overlay_mode(1);
         }
         self.sync_window_state(tx);
     }
 
-    /// Runs interactive `AI Select` segmentation for current `ai_select_points` + `ai_select_bbox`,
-    /// creating or updating the active layer's `RasterMask` and turning on Rubylith overlay.
-    pub fn run_ai_select_segmentation(&mut self) -> bool {
-        if self.ai_select_points.is_empty() && self.ai_select_bbox.is_none() {
-            return false;
-        }
-        let prompt = SmartMaskPrompt::Interactive {
-            points: self.ai_select_points.clone(),
-            bbox: self.ai_select_bbox,
-            invert: self.ai_select_invert,
-        };
-        match generate_smart_mask(&self.image, &prompt, None) {
+    fn apply_ai_select_result(
+        &mut self,
+        result: Result<SmartMaskResult, rune_editor_decode::VisionError>,
+    ) -> bool {
+        match result {
             Ok(res) => {
                 let status = AiMaskStatus::from_result(&res);
                 let mut next = self.recipe.clone();
@@ -3821,6 +3958,8 @@ impl AppState {
                     .filter(|&i| i < next.layers.len());
 
                 let layer_idx = if let Some(idx) = target_idx {
+                    // Inversion is already baked into the prompt's RasterMask bytes; avoid double-invert.
+                    next.layers[idx].inverted = false;
                     if let Some(mi) = next.layers[idx]
                         .masks
                         .iter()
@@ -3869,6 +4008,45 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// Runs interactive `AI Select` segmentation for current `ai_select_points` + `ai_select_bbox`,
+    /// offloading inference to a worker thread when a live `AppHandle` is attached so the 120Hz UI
+    /// thread never stalls during ONNX model loading or encoding.
+    pub fn run_ai_select_segmentation(&mut self) -> bool {
+        if self.ai_select_points.is_empty() && self.ai_select_bbox.is_none() {
+            return false;
+        }
+        let prompt = SmartMaskPrompt::Interactive {
+            points: self.ai_select_points.clone(),
+            bbox: self.ai_select_bbox,
+            invert: self.ai_select_invert,
+        };
+        if let Some(handle) = self.app_handle.clone() {
+            let req_id = self.ai_seg_request_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            let image = self.image.clone();
+            let expected_src = self.image.source_path.clone();
+            self.ai_segmenting_label = Some("Segmenting selection…".to_owned());
+            self.status_message = self.ai_segmenting_label.clone();
+
+            std::thread::spawn(move || {
+                let result = generate_smart_mask(&image, &prompt, None);
+                handle.update_if(move |s, tx| {
+                    if s.ai_seg_request_seq.load(Ordering::Acquire) != req_id {
+                        return false;
+                    }
+                    s.ai_segmenting_label = None;
+                    if s.image.source_path == expected_src {
+                        s.apply_ai_select_result(result);
+                    }
+                    s.sync_window_state(tx);
+                    true
+                });
+            });
+            return true;
+        }
+        let result = generate_smart_mask(&self.image, &prompt, None);
+        self.apply_ai_select_result(result)
     }
 
     /// Appends a normalized `[0, 1]` prompt point (`+ Include` or `− Exclude`) and segments immediately.
@@ -5814,6 +5992,19 @@ impl AppState {
     }
 
     pub fn export_to_path_tx(&mut self, dest: PathBuf, tx: &mut Tx) {
+        if is_raw_extension(&dest) {
+            self.status_message = Some(format!(
+                "Export blocked: refusing to write to RAW/camera file '{}'",
+                dest.display()
+            ));
+            return;
+        }
+        if let Some(src) = self.image.source_path.as_deref()
+            && let Err(err) = guard_not_source(src, &dest)
+        {
+            self.status_message = Some(format!("Export blocked: {err}"));
+            return;
+        }
         let ext = dest
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())

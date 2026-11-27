@@ -259,7 +259,7 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
                 .radius(k.radius.xs)
                 .hover(k.c.hover)
                 .child(
-                    text("AI Models…")
+                    text(s.ai_segmenting_label.as_deref().unwrap_or("AI Models…"))
                         .font(ty::mono_micro(k))
                         .color(k.c.text_accent),
                 )

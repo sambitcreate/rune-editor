@@ -27,6 +27,10 @@ impl McpHostBridge for GuiMcpBridge {
         self.shared_canvas.lock().ok().map(|g| g.clone())
     }
 
+    fn allows_live_edits(&self) -> bool {
+        self.allow_live_edits.load(Ordering::Relaxed)
+    }
+
     fn apply_live_recipe(
         &self,
         target_path: Option<&Path>,
