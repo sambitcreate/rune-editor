@@ -7,17 +7,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rune_editor_core::{
-    ADVANCED_COLOR_SLICE_COUNT, AdjustmentLayer, BrushDab, ColorTag, CullFlag, DevelopRecipe,
-    EditActor, FilmCurve, HealMode, HealSpot, LayerMaskItem, LocalAdjustments,
-    MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK, MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER,
-    MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode, RecipePatch, UserStyle, VignetteMethod,
-    WbPreset, all_param_descriptors, analyze_linear_proxy, apply_style_to_recipe,
-    auto_exposure_and_tone, auto_levels, auto_white_balance, blend_recipes, builtin_presets,
-    compute_histogram, copy_recipe_groups, create_capture_one_session, default_styles_dir,
-    delete_user_style_in_dir, diff_recipes, list_user_styles_in_dir, load_user_style_in_dir,
-    modified_recipe_groups, pick_white_balance, recipe_field_diffs, recipe_non_default_map,
-    recipe_schema_json, reset_recipe_group, resolve_builtin_preset, sanitize_style_slug,
-    save_user_style_in_dir, set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
+    ADVANCED_COLOR_SLICE_COUNT, AdjustmentLayer, BUILTIN_CAMERA_PROFILES, BrushDab, ColorTag,
+    CullFlag, DevelopRecipe, EditActor, FilmCurve, HealMode, HealSpot, LayerMaskItem,
+    LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK, MAX_HEAL_SPOTS,
+    MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode, ProfileCategory,
+    RecipePatch, UserStyle, VignetteMethod, WbPreset, all_param_descriptors, analyze_linear_proxy,
+    apply_style_to_recipe, auto_exposure_and_tone, auto_levels, auto_white_balance, blend_recipes,
+    builtin_presets, canonical_profile_id, compute_histogram, copy_recipe_groups,
+    create_capture_one_session, default_profiles_dir, default_styles_dir, delete_user_style_in_dir,
+    diff_recipes, is_valid_camera_profile_id, list_all_camera_profiles, list_user_styles_in_dir,
+    load_user_style_in_dir, modified_recipe_groups, pick_white_balance, recipe_field_diffs,
+    recipe_non_default_map, recipe_schema_json, reset_recipe_group, resolve_builtin_preset,
+    sanitize_style_slug, save_user_style_in_dir, set_param_by_str, stack_style_onto_recipe,
+    temperature_to_kelvin,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, LinearImage, NamingContext,
@@ -133,6 +135,7 @@ pub struct McpService {
     request_count: AtomicU64,
     last_tool: Mutex<Option<String>>,
     styles_dir_override: Option<PathBuf>,
+    profiles_dir_override: Option<PathBuf>,
 }
 
 impl McpService {
@@ -143,6 +146,7 @@ impl McpService {
             request_count: AtomicU64::new(0),
             last_tool: Mutex::new(None),
             styles_dir_override: None,
+            profiles_dir_override: None,
         }
     }
 
@@ -150,6 +154,13 @@ impl McpService {
     /// exposed to untrusted MCP JSON-RPC arguments).
     pub fn with_styles_dir(mut self, dir: PathBuf) -> Self {
         self.styles_dir_override = Some(dir);
+        self
+    }
+
+    /// Configures a custom Camera Profiles directory (Rust-only API for hermetic tests; never
+    /// exposed to untrusted MCP JSON-RPC arguments).
+    pub fn with_profiles_dir(mut self, dir: PathBuf) -> Self {
+        self.profiles_dir_override = Some(dir);
         self
     }
 
@@ -334,6 +345,8 @@ impl McpService {
                 "color_tag": snap.color_tag,
                 "wb_kelvin": temperature_to_kelvin(snap.recipe.temperature),
                 "wb_preset": snap.recipe.wb_preset,
+                "camera_profile": snap.recipe.camera_profile,
+                "profile_strength": snap.recipe.profile_strength,
                 "film_curve": snap.recipe.film_curve,
                 "processing_mode": snap.recipe.processing_mode,
                 "recipe_overrides": recipe_non_default_map(&snap.recipe),
@@ -452,6 +465,8 @@ impl McpService {
                 "exif": exif,
                 "wb_kelvin": temperature_to_kelvin(meta.recipe.temperature),
                 "wb_preset": meta.recipe.wb_preset,
+                "camera_profile": meta.recipe.camera_profile,
+                "profile_strength": meta.recipe.profile_strength,
                 "film_curve": meta.recipe.film_curve,
                 "processing_mode": meta.recipe.processing_mode,
                 "recipe_overrides": recipe_non_default_map(&meta.recipe),
@@ -496,6 +511,8 @@ impl McpService {
                 "exif": snap.image.exif,
                 "wb_kelvin": temperature_to_kelvin(snap.recipe.temperature),
                 "wb_preset": snap.recipe.wb_preset,
+                "camera_profile": snap.recipe.camera_profile,
+                "profile_strength": snap.recipe.profile_strength,
                 "film_curve": snap.recipe.film_curve,
                 "processing_mode": snap.recipe.processing_mode,
                 "recipe_overrides": recipe_non_default_map(&snap.recipe),
@@ -559,6 +576,8 @@ impl McpService {
                 "preset",
                 "mix",
                 "auto",
+                "camera_profile",
+                "profile_strength",
                 "wb_pick",
                 "wb_preset",
                 "film_curve",
@@ -579,12 +598,67 @@ impl McpService {
                         "UNKNOWN_ARGUMENT",
                         format!("Unknown top-level argument '{key}' on rune_edit_photo."),
                         Some(
-                            "Place develop parameters inside `patch` (e.g. `{\"patch\":{\"lens\":{\"distortion\":-0.15}}}`) or `set` (e.g. `{\"set\":{\"lens.distortion\":-0.15}}`). Top-level shortcuts: `preset`, `wb_preset`, `film_curve`, `processing_mode`, `film_base_pick`, `vignette_method`, `wb_pick`, `skin_pick`, `color_slice_pick`, `auto`, `reset`.",
+                            "Place develop parameters inside `patch` (e.g. `{\"patch\":{\"lens\":{\"distortion\":-0.15}}}`) or `set` (e.g. `{\"set\":{\"lens.distortion\":-0.15}}`). Top-level shortcuts: `preset`, `camera_profile`, `profile_strength`, `wb_preset`, `film_curve`, `processing_mode`, `film_base_pick`, `vignette_method`, `wb_pick`, `skin_pick`, `color_slice_pick`, `auto`, `reset`.",
                         ),
                     );
                 }
             }
         }
+
+        let camera_profile_arg = match args.get("camera_profile") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(s) => {
+                    if !is_valid_camera_profile_id(s) {
+                        let valid = BUILTIN_CAMERA_PROFILES
+                            .iter()
+                            .map(|p| p.id)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return tool_err(
+                            "VALIDATION_ERROR",
+                            format!("Invalid `camera_profile` '{s}'."),
+                            Some(&format!(
+                                "Pass a bundled profile ID ({valid}) or `user:<slug>`. Call `rune_manage_workflow` with `action: \"profile_list\"` to inspect installed profiles."
+                            )),
+                        );
+                    }
+                    Some(canonical_profile_id(s))
+                }
+                None => {
+                    return tool_err(
+                        "VALIDATION_ERROR",
+                        "`camera_profile` must be a string.",
+                        Some(
+                            "Call `rune_manage_workflow` with `action: \"profile_list\"` to inspect available profile IDs.",
+                        ),
+                    );
+                }
+            },
+        };
+        let profile_strength_arg = match args.get("profile_strength") {
+            None => None,
+            Some(v) => match v.as_f64() {
+                Some(n) => {
+                    let f = n as f32;
+                    if !f.is_finite() || !(0.0..=1.0).contains(&f) {
+                        return tool_err(
+                            "VALIDATION_ERROR",
+                            format!("`profile_strength` must be within 0.0..=1.0 (got {f})."),
+                            None,
+                        );
+                    }
+                    Some(f)
+                }
+                None => {
+                    return tool_err(
+                        "VALIDATION_ERROR",
+                        "`profile_strength` must be a number within 0.0..=1.0.",
+                        None,
+                    );
+                }
+            },
+        };
 
         let wb_pick_xy = match parse_norm_xy(args.get("wb_pick"), "wb_pick") {
             Ok(xy) => xy,
@@ -811,6 +885,16 @@ impl McpService {
             meta.recipe.preset_name = None;
         }
 
+        if let Some(profile_id) = camera_profile_arg {
+            meta.recipe.camera_profile = profile_id;
+            meta.recipe.preset_name = None;
+        }
+
+        if let Some(strength) = profile_strength_arg {
+            meta.recipe.profile_strength = strength;
+            meta.recipe.preset_name = None;
+        }
+
         if let Some(fc) = film_curve_arg {
             meta.recipe.film_curve = fc;
             meta.recipe.preset_name = None;
@@ -895,6 +979,8 @@ impl McpService {
             "path": path_opt,
             "live_gui_updated": live_updated,
             "wb_kelvin": temperature_to_kelvin(meta.recipe.temperature),
+            "camera_profile": meta.recipe.camera_profile,
+            "profile_strength": meta.recipe.profile_strength,
             "processing_mode": meta.recipe.processing_mode,
             "changed": diffs,
             "telemetry": {
@@ -1442,6 +1528,8 @@ impl McpService {
                 "autoselect_adjusted",
                 "stack",
                 "strength",
+                "camera_make",
+                "camera_model",
             ];
             for key in obj.keys() {
                 if !ALLOWED.contains(&key.as_str()) {
@@ -1459,7 +1547,7 @@ impl McpService {
                 "VALIDATION_ERROR",
                 "Missing required `action` on rune_manage_workflow.",
                 Some(
-                    "Valid: variant_list, variant_new, variant_clone, variant_select, variant_delete, style_list, style_save, style_apply, style_delete, copy_selective_groups, session_init",
+                    "Valid: variant_list, variant_new, variant_clone, variant_select, variant_delete, style_list, style_save, style_apply, style_delete, copy_selective_groups, session_init, profile_list",
                 ),
             );
         };
@@ -1470,11 +1558,24 @@ impl McpService {
                 None,
             );
         }
+        if action != "profile_list"
+            && (args.get("camera_make").is_some() || args.get("camera_model").is_some())
+        {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "`camera_make` and `camera_model` are only accepted with `action: \"profile_list\"`.",
+                None,
+            );
+        }
 
         let styles_dir = self
             .styles_dir_override
             .clone()
             .unwrap_or_else(default_styles_dir);
+        let profiles_dir = self
+            .profiles_dir_override
+            .clone()
+            .unwrap_or_else(default_profiles_dir);
 
         let resolve_photo_path = |field: &str| -> Result<PathBuf, Value> {
             if let Some(p_str) = args
@@ -2034,11 +2135,102 @@ impl McpService {
                     Err(e) => tool_err("IO_ERROR", e.to_string(), None),
                 }
             }
+            "profile_list" => {
+                let camera_make = match args.get("camera_make") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_str() {
+                        Some(s) => {
+                            let t = s.trim();
+                            (!t.is_empty()).then_some(t)
+                        }
+                        None => {
+                            return tool_err(
+                                "VALIDATION_ERROR",
+                                "`camera_make` must be a string.",
+                                None,
+                            );
+                        }
+                    },
+                };
+                let camera_model = match args.get("camera_model") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_str() {
+                        Some(s) => {
+                            let t = s.trim();
+                            (!t.is_empty()).then_some(t)
+                        }
+                        None => {
+                            return tool_err(
+                                "VALIDATION_ERROR",
+                                "`camera_model` must be a string.",
+                                None,
+                            );
+                        }
+                    },
+                };
+                let profiles = list_all_camera_profiles(
+                    camera_make,
+                    camera_model,
+                    Some(profiles_dir.as_path()),
+                );
+                let first_builtin_idx = profiles
+                    .iter()
+                    .position(|p| p.category != ProfileCategory::User)
+                    .unwrap_or(profiles.len());
+                let has_filter = camera_make.is_some() || camera_model.is_some();
+                let list: Vec<Value> = profiles
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        let exif_matched = if !has_filter {
+                            false
+                        } else if p.category == ProfileCategory::User {
+                            idx < first_builtin_idx
+                        } else if let Some(cm) = p.camera_match.as_deref()
+                            && cm != "*"
+                        {
+                            let needle = cm.trim().to_ascii_lowercase();
+                            let make_hit = camera_make
+                                .map(str::to_ascii_lowercase)
+                                .is_some_and(|m| m.contains(&needle));
+                            let model_hit =
+                                camera_model.map(str::to_ascii_lowercase).is_some_and(|m| {
+                                    m.contains(&needle)
+                                        || (needle == "apple" && m.contains("iphone"))
+                                });
+                            make_hit || model_hit
+                        } else {
+                            false
+                        };
+                        json!({
+                            "id": p.id,
+                            "name": p.name,
+                            "category": p.category,
+                            "category_label": p.category.label(),
+                            "description": p.description,
+                            "camera_match": p.camera_match,
+                            "exif_matched": exif_matched,
+                        })
+                    })
+                    .collect();
+                tool_ok(
+                    json!({
+                        "ok": true,
+                        "action": action,
+                        "camera_make": camera_make,
+                        "camera_model": camera_model,
+                        "count": list.len(),
+                        "profiles": list,
+                    }),
+                    None,
+                    None,
+                )
+            }
             other => tool_err(
                 "VALIDATION_ERROR",
                 format!("Unknown workflow action '{other}'."),
                 Some(
-                    "Valid: variant_list, variant_new, variant_clone, variant_select, variant_delete, style_list, style_save, style_apply, style_delete, copy_selective_groups, session_init",
+                    "Valid: variant_list, variant_new, variant_clone, variant_select, variant_delete, style_list, style_save, style_apply, style_delete, copy_selective_groups, session_init, profile_list",
                 ),
             ),
         }
@@ -3458,7 +3650,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "rune_inspect_photo",
             title: "Inspect Photo Metadata & Sidecar",
-            description: "Fast read-only inspection of camera EXIF metadata, Kelvin white balance readout (`wb_kelvin`, `wb_preset`), `film_curve`, `processing_mode` (plus `film_negative` when active), rating, cull flag, `color_tag`, virtual variant summary, layer/heal counts, and non-default recipe overrides. Omit `path` to inspect the photo currently open in Rune Darkroom.",
+            description: "Fast read-only inspection of camera EXIF metadata, `camera_profile` & `profile_strength`, Kelvin white balance readout (`wb_kelvin`, `wb_preset`), `film_curve`, `processing_mode` (plus `film_negative` when active), rating, cull flag, `color_tag`, virtual variant summary, layer/heal counts, and non-default recipe overrides. Omit `path` to inspect the photo currently open in Rune Darkroom.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -3496,7 +3688,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "rune_edit_photo",
             title: "Edit Photo Non-Destructively",
-            description: "Non-destructively edits a photo's `.rune-edit.json` sidecar (and live-updates the open Rune Darkroom viewport with Cmd+Z undo support). Supports built-in presets with blend `mix`, `auto` (`wb`/`tone`/`levels`/`all`), `wb_pick` (`[x, y]` eyedropper), `wb_preset`, `film_curve`, `processing_mode` (`photography`/`film_negative`), `film_base_pick` (`[x, y]` raw film border eyedropper), `vignette_method`, `skin_pick` (`[x, y]`), `color_slice_pick` (`{index, x, y}`), typed sparse `patch`, dot-path `set` map, and `reset`.",
+            description: "Non-destructively edits a photo's `.rune-edit.json` sidecar (and live-updates the open Rune Darkroom viewport with Cmd+Z undo support). Supports built-in presets with blend `mix`, `auto` (`wb`/`tone`/`levels`/`all`), `camera_profile` & `profile_strength` (applied before `patch`/`set`), `wb_pick` (`[x, y]` eyedropper), `wb_preset`, `film_curve`, `processing_mode` (`photography`/`film_negative`), `film_base_pick` (`[x, y]` raw film border eyedropper), `vignette_method`, `skin_pick` (`[x, y]`), `color_slice_pick` (`{index, x, y}`), typed sparse `patch`, dot-path `set` map, and `reset`.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -3504,6 +3696,17 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "preset": { "type": "string", "enum": presets },
                     "mix": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0 },
                     "auto": { "type": "array", "items": { "type": "string", "enum": ["wb", "tone", "levels", "all"] } },
+                    "camera_profile": {
+                        "type": "string",
+                        "description": "Camera calibration or film simulation profile ID (`auto`, `pro_standard`, `camera_generic`, `apple_raw`, `linear_scientific`, `portrait_natural`, `landscape_crisp`, `editorial_neutral`, `classic_chrome`, `vivid_velvia`, `soft_astia`, `acros_mono`, `warm_portra`, `tungsten_cine`, or `user:<slug>`). Applied before `patch` and `set`."
+                    },
+                    "profile_strength": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 1.0,
+                        "description": "Blend strength for the active camera profile (`0.0..=1.0`, default `1.0`). Applied before `patch` and `set`."
+                    },
                     "wb_pick": {
                         "type": "array",
                         "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
@@ -3558,11 +3761,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     },
                     "patch": {
                         "type": "object",
-                        "description": "Typed sparse RecipePatch supporting scalars (bare number or `\"+0.25\"` relative string), `processing_mode`, `film_negative` (`base_r`/`base_g`/`base_b`/`density`/`contrast`/`black_clip`/`white_clip`), `film_curve`, `wb_preset`, `clarity_method`, `vignette_method`, `sharpen_radius`/`sharpen_threshold`/`sharpen_halo`, `nr_color`, `grain_type`, `grain_size`, `shadows_wheel`/`midtones_wheel`/`highlights_wheel`/`master_wheel` (or grouped `wheels:{shadows,midtones,highlights,master}`), `hsl:{red..magenta}`, `advanced_color:{\"0\"..\"3\":{...}}`, `skin_tone`, `levels` (master + `red`/`green`/`blue`), `curves:{rgb,luma,red,green,blue}` (bare `[[x,y],...]`, flat array, keyed map, or `\"reset\"`), `bw` (incl. `split_*`), `lens` (`distortion`, `chromatic_aberration`, `purple_fringing`, `light_falloff`), and `geometry` (incl. `keystone_vertical`, `keystone_horizontal`, `keystone_aspect`, `keystone_amount`)."
+                        "description": "Typed sparse RecipePatch supporting scalars (bare number or `\"+0.25\"` relative string), `camera_profile` (`auto`, `pro_standard`, `classic_chrome`, `user:<slug>`, etc.), `profile_strength` (`0..=1`), `processing_mode`, `film_negative` (`base_r`/`base_g`/`base_b`/`density`/`contrast`/`black_clip`/`white_clip`), `film_curve`, `wb_preset`, `clarity_method`, `vignette_method`, `sharpen_radius`/`sharpen_threshold`/`sharpen_halo`, `nr_color`, `grain_type`, `grain_size`, `shadows_wheel`/`midtones_wheel`/`highlights_wheel`/`master_wheel` (or grouped `wheels:{shadows,midtones,highlights,master}`), `hsl:{red..magenta}`, `advanced_color:{\"0\"..\"3\":{...}}`, `skin_tone`, `levels` (master + `red`/`green`/`blue`), `curves:{rgb,luma,red,green,blue}` (bare `[[x,y],...]`, flat array, keyed map, or `\"reset\"`), `bw` (incl. `split_*`), `lens` (`distortion`, `chromatic_aberration`, `purple_fringing`, `light_falloff`), and `geometry` (incl. `keystone_vertical`, `keystone_horizontal`, `keystone_aspect`, `keystone_amount`)."
                     },
                     "set": {
                         "type": "object",
-                        "description": "Dot-path or nested parameter assignments e.g. `{\"processing_mode\":\"film_negative\", \"film_negative.density\":0.2, \"film_curve\":\"film_extra_shadow\", \"wb_preset\":\"daylight\", \"vignette_method\":\"circular_on_crop\", \"advanced_color.0.uniformity\":0.5, \"skin_tone.uniformity_hue\":0.6, \"lens.distortion\":-0.15, \"geometry.keystone_vertical\":0.2, \"levels.red.in_black\":0.04, \"wheels.master_wheel.hue_x\":0.1, \"curves.rgb\":[[0,0],[0.5,0.54],[1,1]], \"exposure\":\"+=0.2\"}`."
+                        "description": "Dot-path or nested parameter assignments e.g. `{\"camera_profile\":\"classic_chrome\", \"profile_strength\":0.8, \"processing_mode\":\"film_negative\", \"film_negative.density\":0.2, \"film_curve\":\"film_extra_shadow\", \"wb_preset\":\"daylight\", \"vignette_method\":\"circular_on_crop\", \"advanced_color.0.uniformity\":0.5, \"skin_tone.uniformity_hue\":0.6, \"lens.distortion\":-0.15, \"geometry.keystone_vertical\":0.2, \"levels.red.in_black\":0.04, \"wheels.master_wheel.hue_x\":0.1, \"curves.rgb\":[[0,0],[0.5,0.54],[1,1]], \"exposure\":\"+=0.2\"}`."
                     },
                     "reset": { "type": "string", "description": "Optional tool group to reset before applying edits (`all`, `tone`, `film_negative`, `wb`, `color`, `wheels`, `hsl`, `advanced_color`, `skin_tone`, `levels`, `curves`, `detail`, `bw`, `effects`, `lens`, `geometry`, `layers`)." },
                     "agent": { "type": "string", "default": "mcp-agent" },
@@ -3677,8 +3880,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "rune_manage_workflow",
-            title: "Manage Virtual Variants, User Styles & Selective Clipboard",
-            description: "Capture One Pro workflow operations: create/clone/select/delete non-destructive Virtual Variants (`variant_*`), save/list/apply/stack/delete reusable User Styles (`style_*`), and copy selective or auto-detected adjusted tool groups across photos (`copy_selective_groups`).",
+            title: "Manage Virtual Variants, User Styles, Camera Profiles & Selective Clipboard",
+            description: "Capture One Pro workflow operations: create/clone/select/delete non-destructive Virtual Variants (`variant_*`), save/list/apply/stack/delete reusable User Styles (`style_*`), copy selective or auto-detected adjusted tool groups across photos (`copy_selective_groups`), initialize 4-folder sessions (`session_init`), and list bundled + imported Camera Profiles (`profile_list` with optional EXIF `camera_make`/`camera_model` matching).",
             input_schema: json!({
                 "type": "object",
                 "required": ["action"],
@@ -3696,7 +3899,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                             "style_apply",
                             "style_delete",
                             "copy_selective_groups",
-                            "session_init"
+                            "session_init",
+                            "profile_list"
                         ]
                     },
                     "path": { "type": "string", "description": "Target photo path (optional when connected to a disk photo in the live GUI)." },
@@ -3710,7 +3914,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "groups": { "type": "array", "items": { "type": "string" }, "description": "Selective tool groups (`wb`, `tone`, `film_negative`, `levels`, `curves`, `wheels`, `color`, `skin_tone`, `bw`, `detail`, `effects`, `lens`, `geometry`, `layers`, `heal`)." },
                     "autoselect_adjusted": { "type": "boolean", "default": false, "description": "Automatically select only tool groups modified from defaults." },
                     "stack": { "type": "boolean", "default": false, "description": "Additively stack User Style onto existing adjustments instead of replacing." },
-                    "strength": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0 }
+                    "strength": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0 },
+                    "camera_make": { "type": "string", "description": "Optional EXIF camera make for `profile_list` (e.g. `Sony`, `Fujifilm`, `Apple`) to highlight camera-matched profiles." },
+                    "camera_model": { "type": "string", "description": "Optional EXIF camera model for `profile_list` (e.g. `ILCE-7RM5`, `X-T5`, `iPhone 16 Pro`) to sort camera-matched user profiles first." }
                 }
             }),
             output_schema: json!({ "type": "object" }),

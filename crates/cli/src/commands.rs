@@ -9,17 +9,22 @@ use std::time::Instant;
 use clap::CommandFactory;
 use rayon::prelude::*;
 use rune_editor_core::{
-    ADVANCED_COLOR_SLICE_COUNT, AdjustmentLayer, BatchJob, ColorTag, CullFlag, DevelopRecipe,
-    EditActor, EditOp, HealMode, HealSpot, LayerMaskItem, LocalAdjustments, MAX_ADJUSTMENT_LAYERS,
-    MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode,
-    RecipePatch, UserStyle, WbPreset, analyze_linear_proxy, apply_style_to_recipe,
-    auto_exposure_and_tone, auto_levels, auto_white_balance, blend_recipes, builtin_presets,
+    ADVANCED_COLOR_SLICE_COUNT, ALLOWED_PROFILE_EXTENSIONS, AdjustmentLayer, BatchJob,
+    CameraProfileDescriptor, ColorTag, CullFlag, DevelopRecipe, EditActor, EditOp, HealMode,
+    HealSpot, LayerMaskItem, LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_HEAL_SPOTS,
+    MAX_MASKS_PER_LAYER, MAX_PROFILE_FILE_BYTES, MaskCombineOp, MaskShape, PhotoMeta,
+    ProcessingMode, ProfileCategory, RecipePatch, USER_PROFILE_PREFIX, UserStyle, WbPreset,
+    analyze_linear_proxy, apply_style_to_recipe, auto_exposure_and_tone, auto_levels,
+    auto_white_balance, blend_recipes, builtin_camera_profiles, builtin_presets,
     canonical_param_key, compute_histogram, copy_recipe_groups, create_capture_one_session,
-    default_styles_dir, delete_user_style_in_dir, diff_recipes, filmic_tonemap_with_curve,
-    linear_to_srgb, list_user_styles_in_dir, load_user_style_in_dir, modified_recipe_groups,
-    pick_white_balance, recipe_field_diffs, recipe_non_default_map, recipe_schema_json,
-    reset_recipe_group, resolve_builtin_preset, rgb_to_hsl_and_lab, save_user_style_in_dir,
-    search_params, set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
+    default_profiles_dir, default_styles_dir, delete_user_profile, delete_user_profile_in_dir,
+    delete_user_style_in_dir, diff_recipes, filmic_tonemap_with_curve, import_user_profile,
+    import_user_profile_in_dir_with_overwrite, linear_to_srgb, list_all_camera_profiles,
+    list_user_styles_in_dir, load_user_style_in_dir, modified_recipe_groups, parse_cube_lut,
+    parse_dcp_profile, parse_icc_profile, pick_white_balance, recipe_field_diffs,
+    recipe_non_default_map, recipe_schema_json, reset_recipe_group, resolve_builtin_preset,
+    rgb_to_hsl_and_lab, sanitize_profile_slug, save_user_style_in_dir, search_params,
+    set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher,
@@ -34,8 +39,9 @@ use serde_json::{Value, json};
 
 use crate::{
     AnalyzeArgs, BatchCmd, Cli, CliError, CliSearchCmd, Command, CopyLookArgs, CullArgs, DiffArgs,
-    EditArgs, ExportArgs, HealCmd, InspectArgs, LayerCmd, PresetCmd, PreviewArgs, ResolvedFormat,
-    RuntimeOpts, SessionCmd, StyleCmd, VariantCmd, emit_ndjson_line, emit_ok, exit_code,
+    EditArgs, ExportArgs, HealCmd, InspectArgs, LayerCmd, PresetCmd, PreviewArgs, ProfileCmd,
+    ResolvedFormat, RuntimeOpts, SessionCmd, StyleCmd, VariantCmd, emit_ndjson_line, emit_ok,
+    exit_code,
 };
 
 pub fn dispatch(command: Command, opts: &RuntimeOpts) -> Result<u8, CliError> {
@@ -76,6 +82,7 @@ pub fn dispatch(command: Command, opts: &RuntimeOpts) -> Result<u8, CliError> {
             } => cmd_session_watch(&dir, style.as_deref(), once, interval_ms, opts),
         },
         Command::Preset { sub } => cmd_preset(sub, opts),
+        Command::Profile { sub } => cmd_profile(sub, opts),
         Command::Preview(args) => cmd_preview(args, opts),
         Command::Diff(args) => cmd_diff(args, opts),
         Command::Export(args) => cmd_export(args, opts),
@@ -99,7 +106,7 @@ fn cmd_schema(target: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         { "command": "rd cli search <query>", "summary": "Find matching commands, recipe parameters, and presets" },
         { "command": "rd inspect <photo>", "summary": "Fast metadata, EXIF, and sidecar inspection" },
         { "command": "rd analyze <paths...>", "summary": "Quantitative tonal, color cast, skin, palette, sharpness, and auto suggestions" },
-        { "command": "rd edit <paths...>", "summary": "Non-destructively update `.rune-edit.json` sidecars (`--set`, `--preset`, `--wb-preset`, `--film-curve`, `--processing-mode`, `--pick-film-base`, `--vignette-method`, `--pick-skin`, `--pick-color-slice`, `--auto`, `--patch`, `--reset`)" },
+        { "command": "rd edit <paths...>", "summary": "Non-destructively update `.rune-edit.json` sidecars (`--set`, `--preset`, `--profile`, `--profile-strength`, `--wb-preset`, `--film-curve`, `--processing-mode`, `--pick-film-base`, `--vignette-method`, `--pick-skin`, `--pick-color-slice`, `--auto`, `--patch`, `--reset`)" },
         { "command": "rd cull <paths...>", "summary": "Batch-set star ratings, Pick/Reject flags, and 7 Color Tags (`--color-tag`)" },
         { "command": "rd variant list|new|clone|select|delete <photo>", "summary": "Manage non-destructive Virtual Variants inside `.rune-edit.json`" },
         { "command": "rd style list|save|apply|delete", "summary": "Save, apply, or stack reusable User Styles (`--autoselect-adjusted`, `--stack`, `--strength`)" },
@@ -110,6 +117,7 @@ fn cmd_schema(target: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         { "command": "rd session init <dir>", "summary": "Initialize a Capture One 4-folder session (`Capture/`, `Selects/`, `Output/`, `Trash/`)" },
         { "command": "rd session watch <dir>", "summary": "Watch a hot folder for incoming photos (`--style`, `--once`, `--interval-ms`)" },
         { "command": "rd preset list|show|apply|save", "summary": "Manage built-in and custom style presets" },
+        { "command": "rd profile list|import|delete", "summary": "List bundled Calibration/Film Simulation & user profiles (`--camera`, `--make`), import `.dcp`/`.icc`/`.icm`/`.cube` (`--name`, `--overwrite`), or delete user profiles" },
         { "command": "rd preview <photo> -o <out.jpg>", "summary": "Render fast vision-agent preview (default 1280px JPEG q=85)" },
         { "command": "rd diff <photo> [baseline]", "summary": "Compute CIEDE2000, EV shift, clipping delta, and `--assert` guardrails" },
         { "command": "rd export <paths...> -o <dest>", "summary": "Full-res, resized, watermarked, Display P3, or simultaneous Multi-Recipe export (`--recipes`, `--naming-template`, `--watermark`, `--color-space`)" },
@@ -118,8 +126,10 @@ fn cmd_schema(target: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
     ]);
 
     let patch_meta = json!({
-        "description": "Typed sparse patch (`deny_unknown_fields`). Scalars accept bare number `0.35`, relative string `\"+0.25\"` / `\"-0.15\"`, or `{\"add\": 0.25}` / `{\"scale\": 1.1}`. Supports `processing_mode`, `film_negative` (`base_r`/`base_g`/`base_b`/`density`/`contrast`/`black_clip`/`white_clip`), `film_curve`, `wb_preset`, `clarity_method`, `grain_type`, `vignette_method`, `sharpen_radius`/`threshold`/`halo`, `nr_color`, `grain_size`, `wheels` (incl. `master`), `curves` (`rgb`/`luma`/`red`/`green`/`blue`), `levels` (master + `red`/`green`/`blue`), `hsl`, `advanced_color` (`0`..`3`), `skin_tone`, `bw` (incl. `split_*`), `lens`, and `geometry` (incl. `keystone_*`).",
+        "description": "Typed sparse patch (`deny_unknown_fields`). Scalars accept bare number `0.35`, relative string `\"+0.25\"` / `\"-0.15\"`, or `{\"add\": 0.25}` / `{\"scale\": 1.1}`. Supports `camera_profile` (`auto`, `pro_standard`, `classic_chrome`, `user:<slug>`, etc.), `profile_strength` (`0..=1`), `processing_mode`, `film_negative` (`base_r`/`base_g`/`base_b`/`density`/`contrast`/`black_clip`/`white_clip`), `film_curve`, `wb_preset`, `clarity_method`, `grain_type`, `vignette_method`, `sharpen_radius`/`threshold`/`halo`, `nr_color`, `grain_size`, `wheels` (incl. `master`), `curves` (`rgb`/`luma`/`red`/`green`/`blue`), `levels` (master + `red`/`green`/`blue`), `hsl`, `advanced_color` (`0`..`3`), `skin_tone`, `bw` (incl. `split_*`), `lens`, and `geometry` (incl. `keystone_*`).",
         "example": {
+            "camera_profile": "pro_standard",
+            "profile_strength": 0.85,
             "film_curve": "film_extra_shadow",
             "wb_preset": "daylight",
             "exposure": "+0.30",
@@ -179,6 +189,10 @@ fn cmd_schema(target: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
 
 fn cmd_capabilities(opts: &RuntimeOpts) -> Result<u8, CliError> {
     let presets: Vec<&str> = builtin_presets().iter().map(|p| p.id).collect();
+    let profiles: Vec<String> = builtin_camera_profiles()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
     let decode_tier = if cfg!(target_os = "macos") {
         "CIRAWFilter+ImageIO (macOS native) + rawler fallback"
     } else {
@@ -194,15 +208,19 @@ fn cmd_capabilities(opts: &RuntimeOpts) -> Result<u8, CliError> {
         "raster_extensions": RASTER_EXTENSIONS,
         "export_formats": ["jpeg", "png8", "png16", "tiff16", "webp"],
         "builtin_presets": presets,
+        "builtin_camera_profiles": profiles,
+        "profile_import_extensions": ALLOWED_PROFILE_EXTENSIONS,
         "registered_params_count": rune_editor_core::all_param_descriptors().len(),
     });
     let human = format!(
-        "Rune Darkroom CLI v{} ({}/{})\nDecode: {}\nFormats: jpeg, png8, png16, tiff16, webp\nPresets: {}\nRegistered params: {}",
+        "Rune Darkroom CLI v{} ({}/{})\nDecode: {}\nFormats: jpeg, png8, png16, tiff16, webp\nPresets: {}\nCamera Profiles: {} ({} bundled; import .dcp/.icc/.icm/.cube)\nRegistered params: {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         decode_tier,
         presets.join(", "),
+        profiles.join(", "),
+        profiles.len(),
         rune_editor_core::all_param_descriptors().len(),
     );
     emit_ok(opts, "capabilities", data, &human);
@@ -217,6 +235,24 @@ fn cmd_cli_search(query: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         .filter(|p| q.is_empty() || p.id.contains(&q) || p.name.to_ascii_lowercase().contains(&q))
         .map(|p| json!({ "id": p.id, "name": p.name }))
         .collect();
+    let camera_profiles: Vec<Value> = builtin_camera_profiles()
+        .into_iter()
+        .filter(|p| {
+            q.is_empty()
+                || p.id.contains(&q)
+                || p.name.to_ascii_lowercase().contains(&q)
+                || p.description.to_ascii_lowercase().contains(&q)
+                || p.category.as_str().contains(&q)
+        })
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "category": p.category,
+                "description": p.description,
+            })
+        })
+        .collect();
 
     let all_cmds = [
         (
@@ -229,7 +265,7 @@ fn cmd_cli_search(query: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         ),
         (
             "rd edit <paths...>",
-            "Modify `.rune-edit.json` via --set, --preset, --wb-preset, --film-curve, --processing-mode, --pick-film-base, --vignette-method, --pick-skin, --pick-color-slice, --auto, --patch, --reset",
+            "Modify `.rune-edit.json` via --set, --preset, --profile, --profile-strength, --wb-preset, --film-curve, --processing-mode, --pick-film-base, --vignette-method, --pick-skin, --pick-color-slice, --auto, --patch, --reset",
         ),
         (
             "rd cull <paths...>",
@@ -270,6 +306,10 @@ fn cmd_cli_search(query: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         (
             "rd preset list|show|apply|save",
             "Manage built-in and custom styles",
+        ),
+        (
+            "rd profile list|import|delete",
+            "List Camera Calibration/Film Simulation & user profiles (--camera, --make), import .dcp/.icc/.icm/.cube, or delete user profiles",
         ),
         (
             "rd preview <photo> -o <out.jpg>",
@@ -333,12 +373,24 @@ fn cmd_cli_search(query: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
             ));
         }
     }
+    if !camera_profiles.is_empty() {
+        lines.push("Camera Profiles:".to_owned());
+        for p in &camera_profiles {
+            lines.push(format!(
+                "  {} ({}) — {}",
+                p["id"].as_str().unwrap_or(""),
+                p["name"].as_str().unwrap_or(""),
+                p["description"].as_str().unwrap_or("")
+            ));
+        }
+    }
 
     let data = json!({
         "query": query,
         "commands": commands,
         "parameters": params,
         "presets": presets,
+        "camera_profiles": camera_profiles,
     });
     emit_ok(opts, "cli.search", data, &lines.join("\n"));
     Ok(exit_code::OK)
@@ -390,6 +442,8 @@ fn inspect_photo_payload(
         "exif": exif,
         "wb_kelvin": wb_kelvin,
         "wb_preset": meta.recipe.wb_preset,
+        "camera_profile": meta.recipe.camera_profile,
+        "profile_strength": meta.recipe.profile_strength,
         "film_curve": meta.recipe.film_curve,
         "processing_mode": meta.recipe.processing_mode,
         "film_negative": meta.recipe.film_negative,
@@ -433,7 +487,7 @@ fn inspect_photo_payload(
         String::new()
     };
     let human = format!(
-        "{}\n  Size: {} KB | Sidecar: {} (rev {}) | Rating: {}★ | Flag: {:?} | Tag: {} | Variant: V{}/{}\n  Layers: {} | Heal Spots: {} | Mode: {}{} | WB: {} K ({}) | Curve: {} | EXIF: {}\n  Overrides: {}",
+        "{}\n  Size: {} KB | Sidecar: {} (rev {}) | Rating: {}★ | Flag: {:?} | Tag: {} | Variant: V{}/{}\n  Layers: {} | Heal Spots: {} | Mode: {}{} | Profile: {} ({:.0}%) | WB: {} K ({}) | Curve: {} | EXIF: {}\n  Overrides: {}",
         args.path.display(),
         file_size / 1024,
         if has_sidecar { "yes" } else { "no" },
@@ -447,6 +501,8 @@ fn inspect_photo_payload(
         meta.recipe.heal_spots.len(),
         meta.recipe.processing_mode.label(),
         neg_note,
+        meta.recipe.camera_profile,
+        meta.recipe.profile_strength * 100.0,
         wb_kelvin,
         meta.recipe.wb_preset.label(),
         meta.recipe.film_curve.label(),
@@ -941,6 +997,31 @@ fn edit_single_photo(
         set_param_by_str(&mut meta.recipe, "wb_preset", wb_str, false, src_dims)?;
     }
 
+    if let Some(profile_id) = &args.profile {
+        set_param_by_str(
+            &mut meta.recipe,
+            "camera_profile",
+            profile_id,
+            false,
+            src_dims,
+        )?;
+    }
+
+    if let Some(strength) = args.profile_strength {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(CliError::validation(format!(
+                "--profile-strength must be within 0.0..=1.0 (got {strength})"
+            )));
+        }
+        set_param_by_str(
+            &mut meta.recipe,
+            "profile_strength",
+            &strength.to_string(),
+            false,
+            src_dims,
+        )?;
+    }
+
     if let Some(fc_str) = &args.film_curve {
         set_param_by_str(&mut meta.recipe, "film_curve", fc_str, false, src_dims)?;
     }
@@ -999,6 +1080,8 @@ fn edit_single_photo(
         "sidecar": sidecar_path,
         "revision": meta.revision,
         "wb_kelvin": temperature_to_kelvin(meta.recipe.temperature),
+        "camera_profile": meta.recipe.camera_profile,
+        "profile_strength": meta.recipe.profile_strength,
         "processing_mode": meta.recipe.processing_mode,
         "changed": diffs,
         "recipe_overrides": recipe_non_default_map(&meta.recipe),
@@ -1831,6 +1914,323 @@ fn cmd_session_watch(
     }
 }
 
+fn is_profile_exif_highlighted(
+    desc: &CameraProfileDescriptor,
+    idx: usize,
+    first_builtin_idx: usize,
+    camera_make: Option<&str>,
+    camera_model: Option<&str>,
+) -> bool {
+    let has_filter = camera_make.is_some_and(|s| !s.trim().is_empty())
+        || camera_model.is_some_and(|s| !s.trim().is_empty());
+    if !has_filter {
+        return false;
+    }
+    if desc.category == ProfileCategory::User {
+        return idx < first_builtin_idx;
+    }
+    if let Some(cm) = desc.camera_match.as_deref()
+        && cm != "*"
+    {
+        let needle = cm.trim().to_ascii_lowercase();
+        let make_hit = camera_make
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|m| m.contains(&needle));
+        let model_hit = camera_model
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|m| m.contains(&needle) || (needle == "apple" && m.contains("iphone")));
+        return make_hit || model_hit;
+    }
+    false
+}
+
+fn dry_run_validate_profile_import(
+    file: &Path,
+    name_override: Option<&str>,
+) -> Result<CameraProfileDescriptor, CliError> {
+    let meta = std::fs::symlink_metadata(file).map_err(|e| CliError::io(e.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(CliError::validation(format!(
+            "Refusing symlink profile path '{}'",
+            file.display()
+        )));
+    }
+    if !meta.file_type().is_file() {
+        return Err(CliError::validation(format!(
+            "Profile path '{}' is not a regular file",
+            file.display()
+        )));
+    }
+    if meta.len() > MAX_PROFILE_FILE_BYTES as u64 {
+        return Err(CliError::validation(format!(
+            "Profile file '{}' exceeds {} MiB limit",
+            file.display(),
+            MAX_PROFILE_FILE_BYTES / (1024 * 1024)
+        )));
+    }
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            CliError::validation(format!(
+                "Profile '{}' is missing a valid extension (.dcp, .cube, .icc, .icm)",
+                file.display()
+            ))
+        })?;
+    if !ALLOWED_PROFILE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(CliError::validation(format!(
+            "Disallowed profile extension '.{ext}' (allowed: .dcp, .cube, .icc, .icm)"
+        )));
+    }
+    let bytes = std::fs::read(file).map_err(|e| CliError::io(e.to_string()))?;
+    let (display_name, camera_match, tag) = match ext.as_str() {
+        "cube" => {
+            let c = parse_cube_lut(&bytes)?;
+            (c.title, None, "CUBE")
+        }
+        "dcp" => {
+            let d = parse_dcp_profile(&bytes)?;
+            (d.profile_name, d.unique_camera_model, "DCP")
+        }
+        "icc" | "icm" => {
+            let i = parse_icc_profile(&bytes)?;
+            (i.description.clone(), i.description, "ICC")
+        }
+        _ => unreachable!("checked against ALLOWED_PROFILE_EXTENSIONS"),
+    };
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("profile");
+    let chosen_name = name_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(display_name.as_deref())
+        .unwrap_or(stem)
+        .to_owned();
+    let slug = sanitize_profile_slug(&chosen_name)?;
+    Ok(CameraProfileDescriptor {
+        id: format!("{USER_PROFILE_PREFIX}{slug}"),
+        name: chosen_name,
+        category: ProfileCategory::User,
+        description: format!("Imported {tag} camera profile ({slug}.{ext})"),
+        camera_match,
+    })
+}
+
+fn cmd_profile(sub: ProfileCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
+    match sub {
+        ProfileCmd::List {
+            camera,
+            make,
+            profiles_dir,
+        } => {
+            let dir = profiles_dir.clone().unwrap_or_else(default_profiles_dir);
+            let profiles = list_all_camera_profiles(
+                make.as_deref(),
+                camera.as_deref(),
+                profiles_dir.as_deref(),
+            );
+            let first_builtin_idx = profiles
+                .iter()
+                .position(|p| p.category != ProfileCategory::User)
+                .unwrap_or(profiles.len());
+
+            let items: Vec<Value> = profiles
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let exif_matched = is_profile_exif_highlighted(
+                        p,
+                        idx,
+                        first_builtin_idx,
+                        make.as_deref(),
+                        camera.as_deref(),
+                    );
+                    json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "category": p.category,
+                        "category_label": p.category.label(),
+                        "description": p.description,
+                        "camera_match": p.camera_match,
+                        "exif_matched": exif_matched,
+                    })
+                })
+                .collect();
+
+            let cal_count = profiles
+                .iter()
+                .filter(|p| p.category == ProfileCategory::Calibration)
+                .count();
+            let film_count = profiles
+                .iter()
+                .filter(|p| p.category == ProfileCategory::FilmSimulation)
+                .count();
+            let user_count = profiles
+                .iter()
+                .filter(|p| p.category == ProfileCategory::User)
+                .count();
+
+            let mut lines = Vec::new();
+            let render_group = |lines: &mut Vec<String>, title: &str, cat: ProfileCategory| {
+                let group: Vec<(usize, &CameraProfileDescriptor)> = profiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.category == cat)
+                    .collect();
+                if group.is_empty() {
+                    return;
+                }
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(format!("{title} ({}):", group.len()));
+                for (idx, p) in group {
+                    let matched = is_profile_exif_highlighted(
+                        p,
+                        idx,
+                        first_builtin_idx,
+                        make.as_deref(),
+                        camera.as_deref(),
+                    );
+                    let match_badge = match (matched, p.camera_match.as_deref()) {
+                        (true, Some(cm)) => format!(" ★ MATCH [{cm}]"),
+                        (true, None) => " ★ MATCH".to_owned(),
+                        (false, Some(cm)) => format!(" [{cm}]"),
+                        (false, None) => String::new(),
+                    };
+                    lines.push(format!(
+                        "  {:24} {}{} — {}",
+                        p.id, p.name, match_badge, p.description
+                    ));
+                }
+            };
+            render_group(
+                &mut lines,
+                "Camera Calibration",
+                ProfileCategory::Calibration,
+            );
+            render_group(
+                &mut lines,
+                "Film Simulations",
+                ProfileCategory::FilmSimulation,
+            );
+            render_group(&mut lines, "User Profiles", ProfileCategory::User);
+
+            emit_ok(
+                opts,
+                "profile.list",
+                json!({
+                    "profiles_dir": dir,
+                    "camera_make": make,
+                    "camera_model": camera,
+                    "count": items.len(),
+                    "calibration_count": cal_count,
+                    "film_simulation_count": film_count,
+                    "user_count": user_count,
+                    "profiles": items,
+                }),
+                &lines.join("\n"),
+            );
+            Ok(exit_code::OK)
+        }
+        ProfileCmd::Import {
+            file,
+            name,
+            overwrite,
+            profiles_dir,
+        } => {
+            ensure_exists(&file)?;
+            let dir = profiles_dir.clone().unwrap_or_else(default_profiles_dir);
+            let desc = if opts.dry_run {
+                dry_run_validate_profile_import(&file, name.as_deref())?
+            } else if profiles_dir.is_none() && !overwrite {
+                import_user_profile(&file, name.as_deref())?
+            } else {
+                import_user_profile_in_dir_with_overwrite(&dir, &file, name.as_deref(), overwrite)?
+            };
+            let match_note = desc
+                .camera_match
+                .as_deref()
+                .map(|m| format!(" [camera_match: {m}]"))
+                .unwrap_or_default();
+            let human = format!(
+                "{} profile '{}' ({}){} -> {}",
+                if opts.dry_run {
+                    "[dry-run] Would import"
+                } else {
+                    "Imported"
+                },
+                desc.id,
+                desc.name,
+                match_note,
+                dir.display(),
+            );
+            emit_ok(
+                opts,
+                "profile.import",
+                json!({
+                    "id": desc.id,
+                    "name": desc.name,
+                    "category": desc.category,
+                    "description": desc.description,
+                    "camera_match": desc.camera_match,
+                    "profile": desc,
+                    "profiles_dir": dir,
+                    "overwrite": overwrite,
+                }),
+                &human,
+            );
+            Ok(exit_code::OK)
+        }
+        ProfileCmd::Delete { slug, profiles_dir } => {
+            let dir = profiles_dir.clone().unwrap_or_else(default_profiles_dir);
+            let bare = slug
+                .trim()
+                .strip_prefix(USER_PROFILE_PREFIX)
+                .unwrap_or(slug.trim());
+            let clean_slug = sanitize_profile_slug(bare)?;
+            let deleted = if opts.dry_run {
+                ALLOWED_PROFILE_EXTENSIONS
+                    .iter()
+                    .any(|ext| dir.join(format!("{clean_slug}.{ext}")).exists())
+            } else if profiles_dir.is_none() {
+                delete_user_profile(&slug)?
+            } else {
+                delete_user_profile_in_dir(&dir, &slug)?
+            };
+            if !deleted {
+                return Err(CliError::not_found(format!(
+                    "User profile '{USER_PROFILE_PREFIX}{clean_slug}' not found in {}",
+                    dir.display()
+                )));
+            }
+            let human = format!(
+                "{} user profile '{USER_PROFILE_PREFIX}{clean_slug}'",
+                if opts.dry_run {
+                    "[dry-run] Would delete"
+                } else {
+                    "Deleted"
+                }
+            );
+            emit_ok(
+                opts,
+                "profile.delete",
+                json!({
+                    "slug": clean_slug,
+                    "id": format!("{USER_PROFILE_PREFIX}{clean_slug}"),
+                    "deleted": true,
+                    "profiles_dir": dir,
+                }),
+                &human,
+            );
+            Ok(exit_code::OK)
+        }
+    }
+}
+
 fn cmd_preset(sub: PresetCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
     match sub {
         PresetCmd::List => {
@@ -1881,6 +2281,8 @@ fn cmd_preset(sub: PresetCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                 auto: Vec::new(),
                 wb_pick: None,
                 wb_preset: None,
+                profile: None,
+                profile_strength: None,
                 film_curve: None,
                 processing_mode: None,
                 pick_film_base: None,
@@ -3992,6 +4394,8 @@ mod tests {
             auto: Vec::new(),
             wb_pick: None,
             wb_preset: None,
+            profile: None,
+            profile_strength: None,
             film_curve: None,
             processing_mode: None,
             pick_film_base: None,
@@ -5121,6 +5525,317 @@ mod tests {
             Some("Warm Film")
         );
         assert!(!ingested_meta.history.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase3_cli_camera_profiles_import_list_edit_and_export_end_to_end() {
+        let dir = temp_test_dir("phase3_camera_profiles");
+        let profiles_dir = dir.join("profiles");
+        let photo = dir.join("portrait_raw.png");
+        write_test_png(&photo, 96, 64);
+        let opts = test_runtime_opts();
+
+        // Build a valid synthetic 2x2x2 warm-tinted `.cube` 3D LUT on disk.
+        let cube_path = dir.join("WarmStudio.cube");
+        let cube_text = "\
+TITLE \"Warm Studio LUT\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.02 0.00 0.00
+1.00 0.04 0.00
+0.02 0.96 0.00
+1.00 0.98 0.02
+0.02 0.00 0.90
+1.00 0.05 0.90
+0.02 0.96 0.90
+1.00 0.98 0.92
+";
+        std::fs::write(&cube_path, cube_text).expect("write synthetic .cube");
+
+        // 1. `rd profile import` rejects unsupported extensions & traversal names cleanly.
+        let bad_ext = dir.join("evil.txt");
+        std::fs::write(&bad_ext, b"not a profile").expect("write bad ext");
+        assert!(
+            cmd_profile(
+                ProfileCmd::Import {
+                    file: bad_ext,
+                    name: None,
+                    overwrite: false,
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .is_err(),
+            "non-profile extension MUST be rejected"
+        );
+        assert!(
+            cmd_profile(
+                ProfileCmd::Import {
+                    file: cube_path.clone(),
+                    name: Some("../escape".to_owned()),
+                    overwrite: false,
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .is_err(),
+            "traversal --name MUST be rejected"
+        );
+
+        // 2. Import synthetic `.cube` profile; duplicate without `--overwrite` fails; `--overwrite` succeeds.
+        assert_eq!(
+            cmd_profile(
+                ProfileCmd::Import {
+                    file: cube_path.clone(),
+                    name: Some("warm_studio".to_owned()),
+                    overwrite: false,
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .expect("import .cube profile"),
+            0
+        );
+        assert!(
+            cmd_profile(
+                ProfileCmd::Import {
+                    file: cube_path.clone(),
+                    name: Some("warm_studio".to_owned()),
+                    overwrite: false,
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .is_err(),
+            "duplicate import without --overwrite must fail"
+        );
+        assert_eq!(
+            cmd_profile(
+                ProfileCmd::Import {
+                    file: cube_path,
+                    name: Some("warm_studio".to_owned()),
+                    overwrite: true,
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .expect("import .cube with --overwrite"),
+            0
+        );
+
+        // 3. `rd profile list` returns all 14 bundled MIT profiles + imported user profile.
+        let listed = list_all_camera_profiles(
+            Some("Apple"),
+            Some("iPhone 16 Pro"),
+            Some(profiles_dir.as_path()),
+        );
+        assert_eq!(listed.len(), 15, "14 bundled + 1 imported user profile");
+        assert!(listed.iter().any(|p| p.id == "pro_standard"));
+        assert!(listed.iter().any(|p| p.id == "classic_chrome"));
+        assert!(listed.iter().any(|p| p.id == "user:warm_studio"));
+        // Verify unmatched user profile with overlapping substring camera_match never falsely highlights.
+        let synthetic_user = CameraProfileDescriptor {
+            id: "user:canon_r5".to_owned(),
+            name: "Canon R5".to_owned(),
+            category: ProfileCategory::User,
+            description: "Test".to_owned(),
+            camera_match: Some("Canon EOS R5".to_owned()),
+        };
+        assert!(!is_profile_exif_highlighted(
+            &synthetic_user,
+            14,
+            0,
+            Some("Canon"),
+            Some("Canon EOS R50"),
+        ));
+        assert!(is_profile_exif_highlighted(
+            &synthetic_user,
+            0,
+            1,
+            Some("Canon"),
+            Some("Canon EOS R5"),
+        ));
+        assert_eq!(
+            cmd_profile(
+                ProfileCmd::List {
+                    camera: Some("iPhone 16 Pro".to_owned()),
+                    make: Some("Apple".to_owned()),
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .expect("profile list"),
+            0
+        );
+
+        // 4. `rd edit --profile` and `--profile-strength` validation & precedence (applied BEFORE `--patch`/`--set`).
+        let mut bad_prof = default_edit_args(photo.clone());
+        bad_prof.profile = Some("nonexistent_profile".to_owned());
+        assert!(
+            cmd_edit(bad_prof, &opts).is_err(),
+            "unknown --profile must fail"
+        );
+        let mut bad_str = default_edit_args(photo.clone());
+        bad_str.profile_strength = Some(1.5);
+        assert!(
+            cmd_edit(bad_str, &opts).is_err(),
+            "out-of-range --profile-strength must fail"
+        );
+
+        // Top-level `--profile pro_standard --profile-strength 0.4` overridden by `--patch` + `--set`!
+        let mut edit_prec = default_edit_args(photo.clone());
+        edit_prec.profile = Some("pro_standard".to_owned());
+        edit_prec.profile_strength = Some(0.4);
+        edit_prec.patch = Some(r#"{"camera_profile":"classic_chrome"}"#.to_owned());
+        edit_prec.sets = vec!["profile_strength=0.75".to_owned()];
+        assert_eq!(cmd_edit(edit_prec, &opts).expect("edit precedence"), 0);
+
+        let meta = PhotoMeta::load_sidecar(&photo).unwrap().unwrap();
+        assert_eq!(meta.recipe.camera_profile, "classic_chrome");
+        assert!((meta.recipe.profile_strength - 0.75).abs() < 1e-4);
+
+        // 5. `rd inspect` exposes `camera_profile` and `profile_strength` in JSON & TTY text.
+        let (insp, human) = inspect_photo_payload(
+            &InspectArgs {
+                path: photo.clone(),
+                include: Vec::new(),
+            },
+            &opts,
+        )
+        .expect("inspect profile");
+        assert_eq!(insp["camera_profile"], "classic_chrome");
+        assert!((insp["profile_strength"].as_f64().unwrap() - 0.75).abs() < 1e-4);
+        assert!(
+            human.contains("Profile: classic_chrome (75%)"),
+            "TTY inspect must expose camera_profile and strength, got: {human}"
+        );
+
+        // 6. `rd schema`, `rd cli search`, and `rd batch run` all support camera profiles.
+        assert_eq!(cmd_schema("all", &opts).expect("schema all"), 0);
+        assert_eq!(
+            cmd_cli_search("pro_standard", &opts).expect("cli search"),
+            0
+        );
+        let batch_job: BatchJob = serde_json::from_value(json!({
+            "schema_version": 1,
+            "inputs": { "paths": [photo] },
+            "pipeline": [{
+                "name": "apply_pro_standard",
+                "ops": [{ "op": "patch", "camera_profile": "pro_standard", "profile_strength": 0.9 }]
+            }]
+        }))
+        .expect("valid batch job with camera_profile");
+        run_batch_item(&photo, &batch_job, "batch-test", &opts).expect("batch run profile");
+        let meta_batch = PhotoMeta::load_sidecar(&photo).unwrap().unwrap();
+        assert_eq!(meta_batch.recipe.camera_profile, "pro_standard");
+        assert!((meta_batch.recipe.profile_strength - 0.9).abs() < 1e-4);
+
+        // 7. `rd export` with `classic_chrome` vs `pro_standard` produces valid distinct developed outputs!
+        let out_pro = dir.join("out_pro_standard.png");
+        let out_chrome = dir.join("out_classic_chrome.png");
+        assert_eq!(
+            cmd_export(
+                ExportArgs {
+                    paths: vec![photo.clone()],
+                    out: out_pro.clone(),
+                    to: "png8".to_owned(),
+                    quality: 92,
+                    max_edge: None,
+                    output_sharpen: 0.0,
+                    no_crop: false,
+                    naming: "{stem}.{ext}".to_owned(),
+                    naming_template: None,
+                    watermark: None,
+                    watermark_opacity: 0.45,
+                    watermark_position: "bottom_right".to_owned(),
+                    watermark_scale: 1.0,
+                    strip_metadata: false,
+                    color_space: "srgb".to_owned(),
+                    recipes: None,
+                    recursive: false,
+                    picks: false,
+                    min_rating: None,
+                    skip_existing: false,
+                    overwrite: false,
+                    jobs: 1,
+                },
+                &opts,
+            )
+            .expect("export pro_standard"),
+            0
+        );
+        let mut edit_chrome = default_edit_args(photo.clone());
+        edit_chrome.profile = Some("classic_chrome".to_owned());
+        edit_chrome.profile_strength = Some(1.0);
+        assert_eq!(
+            cmd_edit(edit_chrome, &opts).expect("edit classic_chrome"),
+            0
+        );
+        assert_eq!(
+            cmd_export(
+                ExportArgs {
+                    paths: vec![photo.clone()],
+                    out: out_chrome.clone(),
+                    to: "png8".to_owned(),
+                    quality: 92,
+                    max_edge: None,
+                    output_sharpen: 0.0,
+                    no_crop: false,
+                    naming: "{stem}.{ext}".to_owned(),
+                    naming_template: None,
+                    watermark: None,
+                    watermark_opacity: 0.45,
+                    watermark_position: "bottom_right".to_owned(),
+                    watermark_scale: 1.0,
+                    strip_metadata: false,
+                    color_space: "srgb".to_owned(),
+                    recipes: None,
+                    recursive: false,
+                    picks: false,
+                    min_rating: None,
+                    skip_existing: false,
+                    overwrite: false,
+                    jobs: 1,
+                },
+                &opts,
+            )
+            .expect("export classic_chrome"),
+            0
+        );
+        let bytes_pro = std::fs::read(&out_pro).expect("read pro export");
+        let bytes_chrome = std::fs::read(&out_chrome).expect("read chrome export");
+        assert!(bytes_pro.len() > 100 && bytes_chrome.len() > 100);
+        assert_ne!(
+            bytes_pro, bytes_chrome,
+            "pro_standard and classic_chrome exports must render distinct pixels"
+        );
+
+        // 8. `rd profile delete` removes user profile cleanly and returns NOT_FOUND on second call.
+        assert_eq!(
+            cmd_profile(
+                ProfileCmd::Delete {
+                    slug: "user:warm_studio".to_owned(),
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .expect("delete user profile"),
+            0
+        );
+        assert!(
+            cmd_profile(
+                ProfileCmd::Delete {
+                    slug: "warm_studio".to_owned(),
+                    profiles_dir: Some(profiles_dir.clone()),
+                },
+                &opts,
+            )
+            .is_err(),
+            "deleting already-deleted profile must return error"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

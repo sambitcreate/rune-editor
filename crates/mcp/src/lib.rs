@@ -2337,4 +2337,336 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn mcp_phase3_camera_profiles_end_to_end() {
+        use std::sync::Mutex;
+
+        use rune_editor_core::{ColorTag, CullFlag, DevelopRecipe, import_user_profile_in_dir};
+        use rune_editor_decode::generate_demo_hdr_scene;
+
+        struct LiveProfileHost {
+            snap: Mutex<ActiveCanvasSnapshot>,
+        }
+        impl McpHostBridge for LiveProfileHost {
+            fn active_canvas(&self) -> Option<ActiveCanvasSnapshot> {
+                Some(self.snap.lock().unwrap().clone())
+            }
+            fn apply_live_recipe(
+                &self,
+                _target: Option<&std::path::Path>,
+                new_recipe: DevelopRecipe,
+                _summary: String,
+            ) -> Result<bool, String> {
+                self.snap.lock().unwrap().recipe = new_recipe;
+                Ok(true)
+            }
+        }
+
+        let dir = unique_test_dir("phase3_camera_profiles_mcp");
+        let profiles_dir = dir.join("profiles");
+        let photo = dir.join("studio_frame.jpg");
+        let demo = Arc::new(generate_demo_hdr_scene(96, 64));
+        rune_editor_decode::export_image(
+            &demo,
+            &DevelopRecipe::default(),
+            &photo,
+            rune_editor_decode::ExportFormat::Jpeg { quality: 88 },
+        )
+        .expect("write studio frame");
+
+        // Import a synthetic `.cube` profile into the hermetic temp profiles dir.
+        let cube_src = dir.join("CinemaWarm.cube");
+        std::fs::write(
+            &cube_src,
+            "\
+TITLE \"Cinema Warm\"
+LUT_3D_SIZE 2
+0.02 0.00 0.00
+1.00 0.04 0.00
+0.02 0.96 0.00
+1.00 0.98 0.02
+0.02 0.00 0.92
+1.00 0.04 0.92
+0.02 0.96 0.92
+1.00 0.98 0.94
+",
+        )
+        .expect("write .cube");
+        let imported = import_user_profile_in_dir(&profiles_dir, &cube_src, Some("cinema_warm"))
+            .expect("import synthetic .cube");
+        assert_eq!(imported.id, "user:cinema_warm");
+
+        let host = Arc::new(LiveProfileHost {
+            snap: Mutex::new(ActiveCanvasSnapshot {
+                display_name: "studio_frame.jpg".to_owned(),
+                source_path: Some(photo.clone()),
+                image: demo,
+                recipe: DevelopRecipe::default(),
+                rating: 0,
+                flag: CullFlag::None,
+                color_tag: ColorTag::None,
+                demo_mode: false,
+                folder: Some(dir.clone()),
+                catalog_len: 1,
+            }),
+        });
+        let svc = McpService::new(host.clone()).with_profiles_dir(profiles_dir.clone());
+        let call = |id: u64, name: &str, arguments: Value| {
+            svc.handle_request(&protocol::JsonRpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: Some(json!(id)),
+                method: "tools/call".to_owned(),
+                params: Some(json!({ "name": name, "arguments": arguments })),
+            })
+            .unwrap()
+        };
+
+        // 1. Security: untrusted `profiles_dir` MUST be rejected with UNKNOWN_ARGUMENT!
+        let bad_dir = call(
+            1,
+            "rune_manage_workflow",
+            json!({ "action": "profile_list", "profiles_dir": "/etc" }),
+        );
+        assert_eq!(bad_dir["result"]["isError"], true);
+        assert_eq!(
+            bad_dir["result"]["structuredContent"]["code"],
+            "UNKNOWN_ARGUMENT"
+        );
+
+        // `camera_make` on non-`profile_list` actions MUST be rejected!
+        let bad_scope = call(
+            2,
+            "rune_manage_workflow",
+            json!({ "action": "style_list", "camera_make": "Sony" }),
+        );
+        assert_eq!(bad_scope["result"]["isError"], true);
+        assert_eq!(
+            bad_scope["result"]["structuredContent"]["code"],
+            "VALIDATION_ERROR"
+        );
+
+        // 2. `profile_list` returns all 14 bundled MIT profiles + imported user profile.
+        let listed = call(
+            3,
+            "rune_manage_workflow",
+            json!({
+                "action": "profile_list",
+                "camera_make": "Apple",
+                "camera_model": "iPhone 16 Pro"
+            }),
+        );
+        assert_eq!(listed["result"]["isError"], false, "profile_list: {listed}");
+        let profiles = listed["result"]["structuredContent"]["profiles"]
+            .as_array()
+            .expect("profiles array");
+        assert_eq!(profiles.len(), 15);
+        assert!(profiles.iter().any(|p| p["id"] == "pro_standard"));
+        assert!(profiles.iter().any(|p| p["id"] == "classic_chrome"));
+        assert!(profiles.iter().any(|p| p["id"] == "user:cinema_warm"));
+        let apple_entry = profiles
+            .iter()
+            .find(|p| p["id"] == "apple_raw")
+            .expect("apple_raw entry");
+        assert_eq!(apple_entry["exif_matched"], true);
+
+        // Unmatched user profile with a substring-overlapping camera_match (`"Canon EOS R5"` vs `"Canon EOS R50"`)
+        // MUST report `exif_matched: false` (never fall through to substring matching).
+        let meta_path = profiles_dir.join("cinema_warm.meta.json");
+        std::fs::write(
+            &meta_path,
+            r#"{"name":"Cinema Warm","camera_match":"Canon EOS R5","description":"Test"}"#,
+        )
+        .expect("write user profile meta");
+        let r50_list = call(
+            301,
+            "rune_manage_workflow",
+            json!({
+                "action": "profile_list",
+                "camera_make": "Canon",
+                "camera_model": "Canon EOS R50"
+            }),
+        );
+        let r50_profiles = r50_list["result"]["structuredContent"]["profiles"]
+            .as_array()
+            .expect("r50 profiles");
+        let user_entry = r50_profiles
+            .iter()
+            .find(|p| p["id"] == "user:cinema_warm")
+            .expect("user:cinema_warm entry");
+        assert_eq!(
+            user_entry["exif_matched"], false,
+            "unmatched user profile must not falsely report exif_matched: true"
+        );
+        let r5_list = call(
+            302,
+            "rune_manage_workflow",
+            json!({
+                "action": "profile_list",
+                "camera_make": "Canon",
+                "camera_model": "Canon EOS R5"
+            }),
+        );
+        let r5_profiles = r5_list["result"]["structuredContent"]["profiles"]
+            .as_array()
+            .expect("r5 profiles");
+        assert_eq!(r5_profiles[0]["id"], "user:cinema_warm");
+        assert_eq!(r5_profiles[0]["exif_matched"], true);
+
+        // 3. Invalid `camera_profile` ID and out-of-range `profile_strength` fail loudly.
+        for bad_id in ["", "../escape", "nonexistent_lut", "user:../evil"] {
+            let err = call(4, "rune_edit_photo", json!({ "camera_profile": bad_id }));
+            assert_eq!(
+                err["result"]["isError"], true,
+                "expected invalid camera_profile '{bad_id}' to fail"
+            );
+            assert_eq!(
+                err["result"]["structuredContent"]["code"],
+                "VALIDATION_ERROR"
+            );
+        }
+        for bad_strength in [-0.1, 1.5] {
+            let err = call(
+                5,
+                "rune_edit_photo",
+                json!({ "profile_strength": bad_strength }),
+            );
+            assert_eq!(err["result"]["isError"], true);
+            assert_eq!(
+                err["result"]["structuredContent"]["code"],
+                "VALIDATION_ERROR"
+            );
+        }
+
+        // 4. `rune_edit_photo` top-level `camera_profile` + `profile_strength` applied BEFORE `patch`/`set`.
+        let baseline_prev = call(
+            6,
+            "rune_preview_photo",
+            json!({ "max_edge": 160, "quality": 85 }),
+        );
+        assert_eq!(baseline_prev["result"]["isError"], false);
+        let baseline_b64 = baseline_prev["result"]["content"][1]["data"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let edit_prec = call(
+            7,
+            "rune_edit_photo",
+            json!({
+                "camera_profile": "pro_standard",
+                "profile_strength": 0.3,
+                "patch": { "camera_profile": "classic_chrome" },
+                "set": { "profile_strength": 0.85 }
+            }),
+        );
+        assert_eq!(
+            edit_prec["result"]["isError"], false,
+            "edit_prec: {edit_prec}"
+        );
+        assert_eq!(
+            edit_prec["result"]["structuredContent"]["camera_profile"],
+            "classic_chrome"
+        );
+        assert!(
+            (edit_prec["result"]["structuredContent"]["profile_strength"]
+                .as_f64()
+                .unwrap()
+                - 0.85)
+                .abs()
+                < 1e-4
+        );
+
+        // Top-level-only `camera_profile` + `profile_strength` works directly too!
+        let edit_direct = call(
+            8,
+            "rune_edit_photo",
+            json!({
+                "camera_profile": "classic_chrome",
+                "profile_strength": 0.70
+            }),
+        );
+        assert_eq!(edit_direct["result"]["isError"], false);
+        assert_eq!(
+            host.snap.lock().unwrap().recipe.camera_profile,
+            "classic_chrome"
+        );
+        assert!((host.snap.lock().unwrap().recipe.profile_strength - 0.70).abs() < 1e-4);
+
+        // 5. `rune_inspect_photo` exposes `camera_profile` & `profile_strength` on BOTH live canvas & disk path!
+        let insp_live = call(9, "rune_inspect_photo", json!({}));
+        assert_eq!(insp_live["result"]["isError"], false);
+        assert_eq!(
+            insp_live["result"]["structuredContent"]["camera_profile"],
+            "classic_chrome"
+        );
+        assert!(
+            (insp_live["result"]["structuredContent"]["profile_strength"]
+                .as_f64()
+                .unwrap()
+                - 0.70)
+                .abs()
+                < 1e-4
+        );
+
+        let insp_disk = call(10, "rune_inspect_photo", json!({ "path": photo }));
+        assert_eq!(insp_disk["result"]["isError"], false);
+        assert_eq!(
+            insp_disk["result"]["structuredContent"]["camera_profile"],
+            "classic_chrome"
+        );
+        assert!(
+            (insp_disk["result"]["structuredContent"]["profile_strength"]
+                .as_f64()
+                .unwrap()
+                - 0.70)
+                .abs()
+                < 1e-4
+        );
+
+        // 6. `rune_preview_photo` renders with the active camera profile and differs from neutral `auto`!
+        let graded_prev = call(
+            11,
+            "rune_preview_photo",
+            json!({ "max_edge": 160, "quality": 85 }),
+        );
+        assert_eq!(graded_prev["result"]["isError"], false);
+        let graded_b64 = graded_prev["result"]["content"][1]["data"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(
+            baseline_b64, graded_b64,
+            "classic_chrome preview must visually differ from default auto baseline"
+        );
+
+        // 7. Verify `tool_definitions()` schema advertises `camera_profile`, `profile_strength`, `profile_list`, and NEVER `profiles_dir`!
+        let defs = tools::tool_definitions();
+        let edit_def = defs.iter().find(|t| t.name == "rune_edit_photo").unwrap();
+        assert!(
+            edit_def.input_schema["properties"]
+                .get("camera_profile")
+                .is_some()
+        );
+        assert!(
+            edit_def.input_schema["properties"]
+                .get("profile_strength")
+                .is_some()
+        );
+        let wf_def = defs
+            .iter()
+            .find(|t| t.name == "rune_manage_workflow")
+            .unwrap();
+        let wf_actions = wf_def.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(wf_actions.iter().any(|a| a == "profile_list"));
+        assert!(
+            wf_def.input_schema["properties"]
+                .get("profiles_dir")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

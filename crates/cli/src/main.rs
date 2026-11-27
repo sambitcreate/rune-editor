@@ -270,6 +270,11 @@ pub enum Command {
         #[command(subcommand)]
         sub: PresetCmd,
     },
+    /// List, import (`.dcp`/`.icc`/`.icm`/`.cube`), or delete Camera Profiles and Film Simulations.
+    Profile {
+        #[command(subcommand)]
+        sub: ProfileCmd,
+    },
     /// Render a fast vision-agent-optimized preview JPEG/PNG/WebP (default 1280px q=85).
     Preview(PreviewArgs),
     /// Compute deterministic CIEDE2000, exposure, clipping, and recipe diffs (with `--assert`).
@@ -374,6 +379,12 @@ pub struct EditArgs {
     /// White balance illuminant preset (`as_shot`, `daylight`, `cloudy`, `shade`, `tungsten`, `fluorescent`, `flash`, `custom`).
     #[arg(long)]
     pub wb_preset: Option<String>,
+    /// Camera profile or film simulation ID (`auto`, `pro_standard`, `classic_chrome`, `user:<slug>`, etc.).
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Camera profile blend strength `0.0..=1.0` (default `1.0`).
+    #[arg(long)]
+    pub profile_strength: Option<f32>,
     /// Base Characteristics film curve (`film_standard`, `film_extra_shadow`, `film_high_contrast`, `linear_response`).
     #[arg(long)]
     pub film_curve: Option<String>,
@@ -767,6 +778,44 @@ pub enum PresetCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum ProfileCmd {
+    /// List all bundled Camera Calibration, Film Simulation, and imported User Profiles.
+    List {
+        /// Optional EXIF camera model to highlight camera-matched profiles (e.g. `"ILCE-7RM5"` or `"X-T5"`).
+        #[arg(long)]
+        camera: Option<String>,
+        /// Optional EXIF camera make to pair with `--camera` (e.g. `"Sony"`, `"Fujifilm"`, `"Apple"`).
+        #[arg(long)]
+        make: Option<String>,
+        /// Optional custom user profiles directory (defaults to `~/.config/rune-darkroom/profiles`).
+        #[arg(long)]
+        profiles_dir: Option<PathBuf>,
+    },
+    /// Import an external `.dcp`, `.icc`, `.icm`, or `.cube` camera profile into the user store.
+    Import {
+        /// Path to a `.dcp`, `.icc`, `.icm`, or `.cube` profile file.
+        file: PathBuf,
+        /// Optional profile name / slug override (defaults to embedded profile name or file stem).
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite an existing user profile with the same slug.
+        #[arg(long)]
+        overwrite: bool,
+        /// Optional custom user profiles directory (defaults to `~/.config/rune-darkroom/profiles`).
+        #[arg(long)]
+        profiles_dir: Option<PathBuf>,
+    },
+    /// Delete an imported user camera profile by slug (or `user:<slug>`).
+    Delete {
+        /// User profile slug (or `user:<slug>`).
+        slug: String,
+        /// Optional custom user profiles directory (defaults to `~/.config/rune-darkroom/profiles`).
+        #[arg(long)]
+        profiles_dir: Option<PathBuf>,
+    },
+}
+
 #[derive(Args, Debug)]
 pub struct PreviewArgs {
     /// Photo file to render a preview for.
@@ -976,6 +1025,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Heal { .. } => "heal",
         Command::Session { .. } => "session.scan",
         Command::Preset { .. } => "preset",
+        Command::Profile { .. } => "profile",
         Command::Preview(_) => "preview",
         Command::Diff(_) => "diff",
         Command::Export(_) => "export",
