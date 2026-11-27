@@ -142,6 +142,16 @@ fn sample_photo(uv: vec2<f32>) -> vec3<f32> {
     return textureSampleLevel(photo_tex, photo_sampler, uv, 0.0).rgb;
 }
 
+// Samples a developed pre-detail source pixel with lateral CA correction and spot healing
+// applied (zero extra cost when both CA and heal spots are inactive).
+fn sample_clean_source(uv: vec2<f32>) -> vec3<f32> {
+    var c = sample_photo_lens(uv);
+    if u.mask_overlay.w > 0.5 {
+        c = apply_heal_spots(c, uv);
+    }
+    return c;
+}
+
 fn sample_curve_lut(x: f32) -> vec4<f32> {
     let uv_x = (0.5 + clamp(x, 0.0, 1.0) * 255.0) / 256.0;
     return textureSampleLevel(curve_lut_tex, photo_sampler, vec2<f32>(uv_x, 0.5), 0.0);
@@ -690,19 +700,19 @@ fn apply_spatial_detail(center_rgb: vec3<f32>, img_uv: vec2<f32>) -> vec3<f32> {
         || purple_fringing > 0.001
         || (sharpen > 0.001 && abs(sharpen_radius - 1.0) <= 0.01);
     if need_tight_taps {
-        n_up = max(sample_photo(img_uv + vec2<f32>(0.0, -texel.y)), vec3<f32>(0.0));
-        n_dn = max(sample_photo(img_uv + vec2<f32>(0.0, texel.y)), vec3<f32>(0.0));
-        n_lt = max(sample_photo(img_uv + vec2<f32>(-texel.x, 0.0)), vec3<f32>(0.0));
-        n_rt = max(sample_photo(img_uv + vec2<f32>(texel.x, 0.0)), vec3<f32>(0.0));
+        n_up = max(sample_clean_source(img_uv + vec2<f32>(0.0, -texel.y)), vec3<f32>(0.0));
+        n_dn = max(sample_clean_source(img_uv + vec2<f32>(0.0, texel.y)), vec3<f32>(0.0));
+        n_lt = max(sample_clean_source(img_uv + vec2<f32>(-texel.x, 0.0)), vec3<f32>(0.0));
+        n_rt = max(sample_clean_source(img_uv + vec2<f32>(texel.x, 0.0)), vec3<f32>(0.0));
     }
 
     // 1. Edge-aware bilateral Chroma + Luma Noise Reduction
     if nr > 0.001 || nr_color > 0.001 {
         let diag = texel * 1.25;
-        let d0 = max(sample_photo(img_uv + vec2<f32>(-diag.x, -diag.y)), vec3<f32>(0.0));
-        let d1 = max(sample_photo(img_uv + vec2<f32>(diag.x, -diag.y)), vec3<f32>(0.0));
-        let d2 = max(sample_photo(img_uv + vec2<f32>(-diag.x, diag.y)), vec3<f32>(0.0));
-        let d3 = max(sample_photo(img_uv + vec2<f32>(diag.x, diag.y)), vec3<f32>(0.0));
+        let d0 = max(sample_clean_source(img_uv + vec2<f32>(-diag.x, -diag.y)), vec3<f32>(0.0));
+        let d1 = max(sample_clean_source(img_uv + vec2<f32>(diag.x, -diag.y)), vec3<f32>(0.0));
+        let d2 = max(sample_clean_source(img_uv + vec2<f32>(-diag.x, diag.y)), vec3<f32>(0.0));
+        let d3 = max(sample_clean_source(img_uv + vec2<f32>(diag.x, diag.y)), vec3<f32>(0.0));
 
         let c_p = sqrt(max(luma709(rgb), 0.0));
         let nr_eff = max(nr, nr_color);
@@ -739,14 +749,14 @@ fn apply_spatial_detail(center_rgb: vec3<f32>, img_uv: vec2<f32>) -> vec3<f32> {
     if abs(clarity) > 0.001 {
         let r1 = texel * 3.0;
         let r2 = texel * 7.0;
-        let b1 = sample_photo(img_uv + vec2<f32>(r1.x, 0.0))
-            + sample_photo(img_uv + vec2<f32>(-r1.x, 0.0))
-            + sample_photo(img_uv + vec2<f32>(0.0, r1.y))
-            + sample_photo(img_uv + vec2<f32>(0.0, -r1.y));
-        let b2 = sample_photo(img_uv + vec2<f32>(r2.x, r2.y))
-            + sample_photo(img_uv + vec2<f32>(-r2.x, r2.y))
-            + sample_photo(img_uv + vec2<f32>(r2.x, -r2.y))
-            + sample_photo(img_uv + vec2<f32>(-r2.x, -r2.y));
+        let b1 = sample_clean_source(img_uv + vec2<f32>(r1.x, 0.0))
+            + sample_clean_source(img_uv + vec2<f32>(-r1.x, 0.0))
+            + sample_clean_source(img_uv + vec2<f32>(0.0, r1.y))
+            + sample_clean_source(img_uv + vec2<f32>(0.0, -r1.y));
+        let b2 = sample_clean_source(img_uv + vec2<f32>(r2.x, r2.y))
+            + sample_clean_source(img_uv + vec2<f32>(-r2.x, r2.y))
+            + sample_clean_source(img_uv + vec2<f32>(r2.x, -r2.y))
+            + sample_clean_source(img_uv + vec2<f32>(-r2.x, -r2.y));
 
         let wide_avg = (rgb * 2.0 + b1 + b2 * 0.75) / 9.0;
         let y_c = max(luma709(rgb), 1e-4);
@@ -787,10 +797,10 @@ fn apply_spatial_detail(center_rgb: vec3<f32>, img_uv: vec2<f32>) -> vec3<f32> {
     // 3. Spatial Structure (fine-radius micro-contrast texture enhancement)
     if abs(structure) > 0.001 {
         let rs = texel * 1.65;
-        let s_diag = max(sample_photo(img_uv + vec2<f32>(rs.x, rs.y)), vec3<f32>(0.0))
-            + max(sample_photo(img_uv + vec2<f32>(-rs.x, rs.y)), vec3<f32>(0.0))
-            + max(sample_photo(img_uv + vec2<f32>(rs.x, -rs.y)), vec3<f32>(0.0))
-            + max(sample_photo(img_uv + vec2<f32>(-rs.x, -rs.y)), vec3<f32>(0.0));
+        let s_diag = max(sample_clean_source(img_uv + vec2<f32>(rs.x, rs.y)), vec3<f32>(0.0))
+            + max(sample_clean_source(img_uv + vec2<f32>(-rs.x, rs.y)), vec3<f32>(0.0))
+            + max(sample_clean_source(img_uv + vec2<f32>(rs.x, -rs.y)), vec3<f32>(0.0))
+            + max(sample_clean_source(img_uv + vec2<f32>(-rs.x, -rs.y)), vec3<f32>(0.0));
         let fine_avg = (rgb * 2.0 + (n_up + n_dn + n_lt + n_rt) + s_diag * 0.75) / 9.0;
         let y_c = max(luma709(rgb), 1e-4);
         let y_f = max(luma709(max(fine_avg, vec3<f32>(0.0))), 1e-4);
@@ -805,10 +815,10 @@ fn apply_spatial_detail(center_rgb: vec3<f32>, img_uv: vec2<f32>) -> vec3<f32> {
         var blur_tight = (n_up + n_dn + n_lt + n_rt) * 0.25;
         if abs(sharpen_radius - 1.0) > 0.01 {
             let sr = texel * sharpen_radius;
-            let s_up = max(sample_photo(img_uv + vec2<f32>(0.0, -sr.y)), vec3<f32>(0.0));
-            let s_dn = max(sample_photo(img_uv + vec2<f32>(0.0, sr.y)), vec3<f32>(0.0));
-            let s_lt = max(sample_photo(img_uv + vec2<f32>(-sr.x, 0.0)), vec3<f32>(0.0));
-            let s_rt = max(sample_photo(img_uv + vec2<f32>(sr.x, 0.0)), vec3<f32>(0.0));
+            let s_up = max(sample_clean_source(img_uv + vec2<f32>(0.0, -sr.y)), vec3<f32>(0.0));
+            let s_dn = max(sample_clean_source(img_uv + vec2<f32>(0.0, sr.y)), vec3<f32>(0.0));
+            let s_lt = max(sample_clean_source(img_uv + vec2<f32>(-sr.x, 0.0)), vec3<f32>(0.0));
+            let s_rt = max(sample_clean_source(img_uv + vec2<f32>(sr.x, 0.0)), vec3<f32>(0.0));
             blur_tight = (s_up + s_dn + s_lt + s_rt) * 0.25;
         }
         let y_c = luma709(rgb);
@@ -1453,17 +1463,17 @@ fn apply_develop(
             let texel = vec2<f32>(1.0 / max(u.dims.z, 1.0), 1.0 / max(u.dims.w, 1.0));
             let y_src = max(luma709(src_rgb), 1e-5);
             let y_tight = 0.25 * (
-                luma709(sample_photo(img_uv - vec2<f32>(0.0, texel.y)))
-                + luma709(sample_photo(img_uv + vec2<f32>(0.0, texel.y)))
-                + luma709(sample_photo(img_uv - vec2<f32>(texel.x, 0.0)))
-                + luma709(sample_photo(img_uv + vec2<f32>(texel.x, 0.0)))
+                luma709(sample_clean_source(img_uv - vec2<f32>(0.0, texel.y)))
+                + luma709(sample_clean_source(img_uv + vec2<f32>(0.0, texel.y)))
+                + luma709(sample_clean_source(img_uv - vec2<f32>(texel.x, 0.0)))
+                + luma709(sample_clean_source(img_uv + vec2<f32>(texel.x, 0.0)))
             );
             let d2 = texel * 2.5;
             let y_mid = 0.25 * (
-                luma709(sample_photo(img_uv + vec2<f32>(-d2.x, -d2.y)))
-                + luma709(sample_photo(img_uv + vec2<f32>(d2.x, -d2.y)))
-                + luma709(sample_photo(img_uv + vec2<f32>(-d2.x, d2.y)))
-                + luma709(sample_photo(img_uv + vec2<f32>(d2.x, d2.y)))
+                luma709(sample_clean_source(img_uv + vec2<f32>(-d2.x, -d2.y)))
+                + luma709(sample_clean_source(img_uv + vec2<f32>(d2.x, -d2.y)))
+                + luma709(sample_clean_source(img_uv + vec2<f32>(-d2.x, d2.y)))
+                + luma709(sample_clean_source(img_uv + vec2<f32>(d2.x, d2.y)))
             );
             local_mid_ratio = (y_src + 0.02) / (y_mid + 0.02);
             local_hp_rel = (y_src - y_tight) / max(y_src, 0.02);
@@ -1613,8 +1623,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let crop = vec4<f32>(
         cx,
         cy,
-        clamp(u.geo_crop.z, 0.01, 1.0 - cx),
-        clamp(u.geo_crop.w, 0.01, 1.0 - cy),
+        clamp(u.geo_crop.z, 0.01, max(1.0 - cx, 0.01)),
+        clamp(u.geo_crop.w, 0.01, max(1.0 - cy, 0.01)),
     );
     let crop_mode = u.overlay_flags.z > 0.5;
     let frame_w = select(max(ori_w * crop.z, 1.0), ori_w, crop_mode);

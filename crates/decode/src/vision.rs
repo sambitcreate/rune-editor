@@ -455,7 +455,41 @@ pub fn generate_interactive_heuristic_mask(
     }
 
     if pos_protos.is_empty() {
-        return generate_heuristic_mask(image, invert);
+        if neg_protos.is_empty() {
+            return generate_heuristic_mask(image, invert);
+        }
+        // Negative-only refinement: start from auto saliency foreground and suppress pixels
+        // matching the user's negative click Lab prototypes and local spatial neighborhoods.
+        let mut prob = compute_auto_saliency_prob(&lab_grid, work);
+        for gy in 0..work {
+            let v = (gy as f32 + 0.5) / work as f32;
+            let row = gy * work;
+            for gx in 0..work {
+                let u = (gx as f32 + 0.5) / work as f32;
+                let lab = lab_grid[row + gx];
+                let d_neg = neg_protos
+                    .iter()
+                    .map(|&p| lab_dist(lab, p))
+                    .fold(f32::MAX, f32::min);
+                let spatial_neg = neg_coords
+                    .iter()
+                    .map(|&[nx, ny]| {
+                        let dx = u - nx;
+                        let dy = v - ny;
+                        (-10.0 * (dx * dx + dy * dy)).exp()
+                    })
+                    .fold(0.0_f32, f32::max);
+                let color_suppress = 1.0 - smoothstep(6.0, 26.0, d_neg);
+                let suppress = (spatial_neg * 0.85).max(color_suppress * 0.72);
+                prob[row + gx] = (prob[row + gx] * (1.0 - suppress)).clamp(0.0, 1.0);
+            }
+        }
+        let mut scratch = vec![0.0_f32; work * work];
+        for _ in 0..2 {
+            joint_bilateral_pass(&prob, &lab_grid, work, &mut scratch);
+            std::mem::swap(&mut prob, &mut scratch);
+        }
+        return upsample_prob_to_raster(&prob, work, grid, invert);
     }
 
     if neg_protos.is_empty() {
@@ -1267,5 +1301,28 @@ mod tests {
             assert!(matches!(err, ModelError::InvalidPath(_)));
             let _ = fs::remove_file(&target_dir);
         }
+    }
+
+    #[test]
+    fn negative_only_heuristic_click_suppresses_clicked_region() {
+        let img = crate::generate_demo_hdr_scene(128, 96);
+        let auto = generate_heuristic_mask(&img, false)
+            .decode_raster_u8()
+            .expect("auto raster");
+        let neg_only = generate_interactive_heuristic_mask(
+            &img,
+            &[PromptPoint::new(0.5, 0.5, false)],
+            None,
+            false,
+        )
+        .decode_raster_u8()
+        .expect("neg-only raster");
+        let center = (LAYER_MASK_TILE_SIZE / 2) * LAYER_MASK_TILE_SIZE + (LAYER_MASK_TILE_SIZE / 2);
+        assert!(
+            neg_only.2[center] < auto.2[center] || auto.2[center] == 0,
+            "negative-only click at center should suppress center mask weight (auto={}, neg={})",
+            auto.2[center],
+            neg_only.2[center]
+        );
     }
 }

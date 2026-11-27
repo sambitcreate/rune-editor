@@ -221,10 +221,30 @@ fn decode_raw_or_heif(
 }
 
 fn decode_raster_image(path: &Path, max_edge: Option<u32>) -> Result<LinearImage, DecodeError> {
-    let mut dyn_img = image::open(path).map_err(|source| DecodeError::Image {
+    use image::{DynamicImage, ImageDecoder, ImageReader, metadata::Orientation};
+
+    let reader = ImageReader::open(path)
+        .map_err(|source| DecodeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .with_guessed_format()
+        .map_err(|source| DecodeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut decoder = reader.into_decoder().map_err(|source| DecodeError::Image {
         path: path.to_path_buf(),
         source,
     })?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut dyn_img = DynamicImage::from_decoder(decoder).map_err(|source| DecodeError::Image {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if orientation != Orientation::NoTransforms {
+        dyn_img.apply_orientation(orientation);
+    }
 
     let (orig_w, orig_h) = (dyn_img.width(), dyn_img.height());
     if orig_w == 0 || orig_h == 0 {

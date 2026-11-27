@@ -6,7 +6,7 @@
 //! tonemapping, optional screen output sharpening, and sRGB 8-bit/16-bit encoding.
 
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use rune_editor_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::raw::fit_dimensions;
+use crate::raw::{fit_dimensions, is_raw_extension};
 use crate::{DecodeError, LinearImage};
 
 const fn default_true() -> bool {
@@ -616,12 +616,37 @@ pub fn export_multi_recipe(
     Ok(written)
 }
 
-/// Rejects any export destination that resolves to the same filesystem path as `src`,
-/// even when `dest` does not exist yet or traverses symlinks / relative `..` segments.
+/// Rejects any export destination that resolves to the same filesystem path or file identity
+/// as `src` (even across symlinks, hardlinks, case-insensitive filesystems, or relative `..`
+/// segments), and unconditionally rejects any destination using a camera RAW/HEIF extension.
 pub fn guard_not_source(src: &Path, dest: &Path) -> Result<(), DecodeError> {
+    if is_raw_extension(dest) {
+        return Err(DecodeError::SourceOverwrite(dest.to_path_buf()));
+    }
+
+    // Compare OS file identity `(dev, ino)` when both files exist on Unix — catches hardlinks,
+    // bind mounts, symlinks, and case-insensitive volumes (APFS, exFAT, SMB, ext4 casefold).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(m_src), Ok(m_dest)) = (std::fs::metadata(src), std::fs::metadata(dest))
+            && m_src.dev() == m_dest.dev()
+            && m_src.ino() == m_dest.ino()
+        {
+            return Err(DecodeError::SourceOverwrite(src.to_path_buf()));
+        }
+    }
+
     let c_src = canonicalize_best_effort(src);
     let c_dest = canonicalize_best_effort(dest);
     if c_src == c_dest {
+        return Err(DecodeError::SourceOverwrite(src.to_path_buf()));
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if c_src
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&c_dest.to_string_lossy())
+    {
         return Err(DecodeError::SourceOverwrite(src.to_path_buf()));
     }
     Ok(())
@@ -947,14 +972,40 @@ fn export_image_with_options_dims(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "export.bin".to_owned());
-    let seq = EXPORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+
+    let (tmp_path, file) = {
+        let mut created = None;
+        for _ in 0..16 {
+            let seq = EXPORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => {
+                    created = Some((candidate, f));
+                    break;
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(DecodeError::Io {
+                        path: candidate,
+                        source,
+                    });
+                }
+            }
+        }
+        created.ok_or_else(|| DecodeError::Io {
+            path: dest.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Failed to allocate unique temporary export file",
+            ),
+        })?
+    };
 
     let encode_result = (|| -> Result<(), DecodeError> {
-        let file = File::create(&tmp_path).map_err(|source| DecodeError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
         let mut writer = BufWriter::new(file);
 
         match options.format {
@@ -1102,6 +1153,11 @@ fn export_image_with_options_dims(
             source,
         }
     })?;
+
+    #[cfg(unix)]
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
 
     Ok((out_w, out_h))
 }
@@ -2414,11 +2470,9 @@ fn evaluate_export_pixel_srgb(
     let ori_u = frame_meta.crop[0] + u * frame_meta.crop[2];
     let ori_v = frame_meta.crop[1] + v * frame_meta.crop[3];
 
-    // Stage 10b: Adjustment Layers (matching shaders/develop.wgsl bit-for-bit).
-    if let Some(atlas) = layer_atlas
-        && !layers.is_empty()
-    {
-        let [img_u, img_v] = if frame_meta.geo_or_lens_active {
+    let need_source_uv = (layer_atlas.is_some() && !layers.is_empty()) || recipe.grain > 0.001;
+    let [img_u, img_v] = if need_source_uv {
+        if frame_meta.geo_or_lens_active {
             let [su, sv] = if frame_meta.respect_crop {
                 recipe.geometry.oriented_to_source_uv_unclamped(
                     ori_u,
@@ -2437,8 +2491,15 @@ fn evaluate_export_pixel_srgb(
             )
         } else {
             [ori_u, ori_v]
-        };
+        }
+    } else {
+        [ori_u, ori_v]
+    };
 
+    // Stage 10b: Adjustment Layers (matching shaders/develop.wgsl bit-for-bit).
+    if let Some(atlas) = layer_atlas
+        && !layers.is_empty()
+    {
         for (li, layer) in layers.iter().enumerate() {
             if layer.is_active() {
                 let luma_tone = luma709(rgb).max(0.0).sqrt().clamp(0.0, 1.0);
@@ -2501,14 +2562,25 @@ fn evaluate_export_pixel_srgb(
         rgb[2] *= vig_gain;
     }
 
-    // Photographic film grain pre-tonemap (6 emulsion profiles + Granularity; matches shaders/develop.wgsl).
+    // Photographic film grain pre-tonemap (6 emulsion profiles + Granularity; matches shaders/develop.wgsl
+    // in source-pixel coordinates `floor(img_uv * src_dims)` even when cropped or resized).
     if recipe.grain > 0.001 {
         let grain_size = if recipe.grain_size.is_finite() {
             recipe.grain_size.clamp(0.0, 1.0)
         } else {
             0.35
         };
-        rgb = apply_film_grain_cpu(rgb, px_x, px_y, recipe.grain, recipe.grain_type, grain_size);
+        let _ = (px_x, px_y);
+        let grain_px_x = (img_u * frame_meta.src_size[0] as f32).floor();
+        let grain_px_y = (img_v * frame_meta.src_size[1] as f32).floor();
+        rgb = apply_film_grain_cpu(
+            rgb,
+            grain_px_x,
+            grain_px_y,
+            recipe.grain,
+            recipe.grain_type,
+            grain_size,
+        );
     }
 
     let mapped = filmic_tonemap_with_curve(rgb, compiled.film_curve);

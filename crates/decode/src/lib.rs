@@ -1293,13 +1293,34 @@ mod tests {
             Err(DecodeError::SourceOverwrite(_))
         ));
 
-        // Different file in same dir is allowed.
+        // Different raster file in same dir is allowed.
         let other = real_sub.join("DSC0001.jpg");
         assert!(guard_not_source(&src, &other).is_ok());
+
+        // Any destination with a camera RAW/HEIF extension MUST be blocked even when distinct from src.
+        let other_raw = real_sub.join("other.NEF");
+        assert!(matches!(
+            guard_not_source(&other, &other_raw),
+            Err(DecodeError::SourceOverwrite(_))
+        ));
+        assert!(matches!(
+            guard_not_source(&other, &real_sub.join("other.heic")),
+            Err(DecodeError::SourceOverwrite(_))
+        ));
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
+            // Hardlink to the same source file is blocked by (dev, ino) identity check.
+            let hard_src = real_sub.join("photo.jpg");
+            let hard_alias = real_sub.join("photo_hardlink.jpg");
+            fs::write(&hard_src, b"jpg").expect("write hard src");
+            if fs::hard_link(&hard_src, &hard_alias).is_ok() {
+                assert!(matches!(
+                    guard_not_source(&hard_src, &hard_alias),
+                    Err(DecodeError::SourceOverwrite(_))
+                ));
+            }
             let link_dir = dir.join("alias_dir");
             symlink(&real_sub, &link_dir).expect("create dir symlink");
 
@@ -1317,6 +1338,58 @@ mod tests {
                 Err(DecodeError::SourceOverwrite(_))
             ));
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_raster_applies_exif_orientation_tag() {
+        let dir = unique_temp_dir("exif_orient");
+        fs::create_dir_all(&dir).unwrap();
+        // Build a minimal 16x8 JPEG and inject an APP1 EXIF segment with Orientation = 6 (90° CW).
+        let base_path = dir.join("base.jpg");
+        let img = generate_demo_hdr_scene(16, 8);
+        export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &base_path,
+            ExportFormat::Jpeg { quality: 90 },
+        )
+        .unwrap();
+        let raw_jpg = fs::read(&base_path).unwrap();
+        assert_eq!(&raw_jpg[..2], &[0xFF, 0xD8]);
+
+        // Minimal little-endian TIFF EXIF APP1 payload with 1 IFD0 entry: Orientation (0x0112) = 6.
+        let mut exif_payload: Vec<u8> = Vec::new();
+        exif_payload.extend_from_slice(b"Exif\0\0");
+        exif_payload.extend_from_slice(b"II"); // little-endian
+        exif_payload.extend_from_slice(&42u16.to_le_bytes());
+        exif_payload.extend_from_slice(&8u32.to_le_bytes()); // offset to IFD0
+        exif_payload.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+        exif_payload.extend_from_slice(&0x0112u16.to_le_bytes()); // Tag: Orientation
+        exif_payload.extend_from_slice(&3u16.to_le_bytes()); // Type: SHORT
+        exif_payload.extend_from_slice(&1u32.to_le_bytes()); // Count: 1
+        exif_payload.extend_from_slice(&6u16.to_le_bytes()); // Value: 6 (Rotate 90 CW)
+        exif_payload.extend_from_slice(&0u16.to_le_bytes()); // padding
+        exif_payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD offset
+
+        let seg_len = (exif_payload.len() + 2) as u16;
+        let mut oriented_jpg = Vec::with_capacity(raw_jpg.len() + exif_payload.len() + 4);
+        oriented_jpg.extend_from_slice(&raw_jpg[..2]); // SOI
+        oriented_jpg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        oriented_jpg.extend_from_slice(&seg_len.to_be_bytes());
+        oriented_jpg.extend_from_slice(&exif_payload);
+        oriented_jpg.extend_from_slice(&raw_jpg[2..]);
+
+        let rotated_path = dir.join("rotated.jpg");
+        fs::write(&rotated_path, &oriented_jpg).unwrap();
+
+        let decoded = load_file(&rotated_path).expect("decode rotated jpeg");
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (8, 16),
+            "16x8 JPEG with EXIF Orientation=6 must decode upright as 8x16"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

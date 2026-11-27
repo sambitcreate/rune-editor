@@ -78,18 +78,24 @@ fn ort_environment() -> Result<&'static Environment, String> {
     }
 }
 
+fn lock_session_cache() -> std::sync::MutexGuard<'static, Option<SamSessionCache>> {
+    SESSION_CACHE.lock().unwrap_or_else(|poisoned| {
+        let mut guard = poisoned.into_inner();
+        *guard = None;
+        guard
+    })
+}
+
 /// Evicts any cached ONNX Runtime SAM sessions and feature pyramids (e.g. after model removal).
 pub fn evict_session_cache() {
-    if let Ok(mut guard) = SESSION_CACHE.lock() {
-        *guard = None;
-    }
+    let mut guard = lock_session_cache();
+    *guard = None;
 }
 
 /// Evicts the cached session only if it currently holds `id`.
 pub fn evict_model_from_cache(id: ModelId) {
-    if let Ok(mut guard) = SESSION_CACHE.lock()
-        && guard.as_ref().is_some_and(|c| c.model_id == id)
-    {
+    let mut guard = lock_session_cache();
+    if guard.as_ref().is_some_and(|c| c.model_id == id) {
         *guard = None;
     }
 }
@@ -118,9 +124,7 @@ pub fn segment(
     // optional Apple Vision centroid lookup never blocks the SAM mutex.
     let (points, bbox, invert) = resolve_prompt_for_sam(image, &prompt);
 
-    let mut guard = SESSION_CACHE
-        .lock()
-        .map_err(|_| "SAM session cache mutex poisoned".to_owned())?;
+    let mut guard = lock_session_cache();
 
     // Load or switch model sessions if needed.
     let needs_load = guard
@@ -405,9 +409,10 @@ fn run_mask_decoder(
         })
         .collect();
 
-    let has_dedicated_boxes_input = input_specs
-        .iter()
-        .any(|(name, _, _)| name.to_ascii_lowercase().contains("box"));
+    let has_dedicated_boxes_input = input_specs.iter().any(|(name, _, _)| {
+        let l = name.to_ascii_lowercase();
+        l.contains("box") && !l.contains("embed")
+    });
 
     let scale = spec.input_size as f32;
     let mut coords: Vec<f32> = Vec::new();
@@ -496,7 +501,10 @@ fn run_mask_decoder(
         } else if lower.contains("has_mask") {
             let shape = if rank == 0 { vec![] } else { vec![1] };
             build_float_tensor(shape, &[0.0], *expected_ty)?
-        } else if lower.contains("mask_input") {
+        } else if lower.contains("mask_input")
+            || lower == "input_masks"
+            || (lower.contains("mask") && lower.contains("input"))
+        {
             let ms = spec.mask_size as i64;
             let shape = match rank {
                 4 => vec![1, 1, ms, ms],
