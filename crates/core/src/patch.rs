@@ -1663,6 +1663,9 @@ pub struct ExportTargetSpec {
     pub respect_crop: bool,
     #[serde(default)]
     pub output_sharpen: f32,
+    /// When `false` (default), refuses to overwrite an existing file at the destination path.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_filename_template() -> String {

@@ -393,8 +393,16 @@ impl GeometryParams {
         };
         x = x.clamp(0.0, 0.99);
         y = y.clamp(0.0, 0.99);
-        w = w.clamp(0.01, 1.0 - x);
-        h = h.clamp(0.01, 1.0 - y);
+        let max_w = (1.0 - x).max(0.01);
+        let max_h = (1.0 - y).max(0.01);
+        w = w.clamp(0.01, max_w);
+        h = h.clamp(0.01, max_h);
+        if x + w > 1.0 {
+            x = (1.0 - w).max(0.0);
+        }
+        if y + h > 1.0 {
+            y = (1.0 - h).max(0.0);
+        }
         [x, y, w, h]
     }
 

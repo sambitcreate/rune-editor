@@ -1,6 +1,6 @@
 //! Folder / Session Catalog, Culling, Rating, Copy/Paste Adjustments, and Sidecar Persistence.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -384,19 +384,33 @@ impl PhotoMeta {
         expected_revision: Option<u64>,
     ) -> Result<PathBuf, CoreError> {
         let sidecar = DevelopRecipe::sidecar_path_for(photo_path);
+        let _lock = acquire_path_lock(&sidecar)?;
+
+        let existing = match Self::load_sidecar(photo_path) {
+            Ok(opt) => opt,
+            Err(CoreError::Json(err)) => {
+                return Err(CoreError::CorruptSidecar {
+                    path: sidecar,
+                    message: err.to_string(),
+                });
+            }
+            Err(err) => return Err(err),
+        };
+
         if let Some(expected) = expected_revision
-            && let Some(existing) = Self::load_sidecar(photo_path)?
-            && existing.revision != expected
+            && let Some(ref disk) = existing
+            && disk.revision != expected
         {
             return Err(CoreError::SidecarConflict {
                 expected,
-                actual: existing.revision,
+                actual: disk.revision,
             });
         }
 
+        let disk_rev = existing.as_ref().map_or(0, |m| m.revision);
         let mut to_write = self.clone();
         to_write.meta_version = META_SCHEMA_VERSION;
-        to_write.revision = to_write.revision.saturating_add(1);
+        to_write.revision = to_write.revision.max(disk_rev).saturating_add(1);
         to_write.rating = to_write.rating.min(5);
         to_write.recipe = to_write.recipe.sanitized();
         to_write.sync_active_to_variants();
@@ -462,32 +476,130 @@ impl PhotoMeta {
     }
 }
 
-/// Atomically writes `bytes` to `dest` via a hidden dot-prefixed temp file in the same
-/// directory, calling `sync_all()` before `std::fs::rename`.
+/// Returns a stable lockfile path inside `std::env::temp_dir()/rune-darkroom-locks/`
+/// keyed by the canonicalized target path so photo folders never accumulate `.lock` files.
+fn lock_file_path_for(target: &Path) -> Result<PathBuf, CoreError> {
+    let lock_dir = std::env::temp_dir().join("rune-darkroom-locks");
+    std::fs::create_dir_all(&lock_dir)?;
+    let canon = if let Ok(c) = std::fs::canonicalize(target) {
+        c
+    } else if let Some(parent) = target.parent()
+        && let Ok(cp) = std::fs::canonicalize(parent)
+        && let Some(name) = target.file_name()
+    {
+        cp.join(name)
+    } else if target.is_absolute() {
+        target.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(target)
+    } else {
+        target.to_path_buf()
+    };
+
+    let bytes = canon.to_string_lossy();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes.as_bytes() {
+        let b_norm = if cfg!(any(target_os = "macos", target_os = "windows")) {
+            b.to_ascii_lowercase()
+        } else {
+            *b
+        };
+        hash ^= u64::from(b_norm);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(lock_dir.join(format!("{hash:016x}.lock")))
+}
+
+/// Acquires a blocking exclusive OS file lock scoped to `target`.
+pub fn acquire_path_lock(target: &Path) -> Result<File, CoreError> {
+    let lock_path = lock_file_path_for(target)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Attempts to acquire a non-blocking exclusive OS file lock scoped to `target`.
+/// Returns `Ok(None)` if another process or thread currently holds the lock.
+pub fn try_acquire_path_lock(target: &Path) -> Result<Option<File>, CoreError> {
+    let lock_path = lock_file_path_for(target)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(err)) => Err(CoreError::Io(err)),
+    }
+}
+
+/// Atomically writes `bytes` to `dest` via a hidden dot-prefixed temp file created exclusively
+/// (`create_new(true)` so pre-existing symlinks cannot be followed), calling `sync_all()` before
+/// `std::fs::rename` and flushing the parent directory on Unix.
 pub fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let fname = dest
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "sidecar.json".to_owned());
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+
+    let (tmp, mut file) = {
+        let mut created = None;
+        for _ in 0..16 {
+            let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => {
+                    created = Some((candidate, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(CoreError::Io(e)),
+            }
+        }
+        created.ok_or_else(|| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Failed to create unique temporary file for atomic write",
+            ))
+        })?
+    };
 
     let write_res = (|| -> std::io::Result<()> {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
         Ok(())
     })();
 
     if let Err(e) = write_res {
+        drop(file);
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::Io(e));
     }
+    drop(file);
 
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::Io(e));
+    }
+
+    #[cfg(unix)]
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -523,6 +635,10 @@ pub struct SessionEntry {
     pub camera_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lens_label: Option<String>,
+    /// True when the on-disk `.rune-edit.json` sidecar failed to parse on load; prevents
+    /// accidental silent overwriting of a corrupt sidecar.
+    #[serde(skip)]
+    pub sidecar_corrupt: bool,
 }
 
 impl SessionEntry {
@@ -534,6 +650,7 @@ impl SessionEntry {
             color_tag,
             camera_label: None,
             lens_label: None,
+            sidecar_corrupt: false,
         }
     }
 
@@ -579,12 +696,14 @@ impl SessionCatalog {
         self.folder = folder;
         self.entries = paths
             .into_iter()
-            .map(|path| {
-                let meta = PhotoMeta::load_sidecar(&path)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                SessionEntry::new(path, meta)
+            .map(|path| match PhotoMeta::load_sidecar(&path) {
+                Ok(Some(meta)) => SessionEntry::new(path, meta),
+                Ok(None) => SessionEntry::new(path, PhotoMeta::default()),
+                Err(_) => {
+                    let mut entry = SessionEntry::new(path, PhotoMeta::default());
+                    entry.sidecar_corrupt = true;
+                    entry
+                }
             })
             .collect();
         self.filter = CullFilter::All;

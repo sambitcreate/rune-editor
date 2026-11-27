@@ -54,7 +54,8 @@ pub use crate::models::{
     inspect_all_model_statuses_in, inspect_model_install, inspect_model_install_in,
     inspect_model_status, inspect_model_status_in, load_ai_model_config, load_ai_model_config_from,
     model_decoder_path, model_dir, model_dir_in, model_encoder_path, model_spec, models_root_dir,
-    save_ai_model_config, save_ai_model_config_to,
+    save_ai_model_config, save_ai_model_config_to, update_ai_model_config,
+    update_ai_model_config_at,
 };
 pub use crate::patch::{
     BatchJob, EditActor, EditHistoryEntry, EditOp, FieldDiff, HslBandId, MatchReferenceOp,
@@ -90,7 +91,8 @@ pub use crate::registry::{
 };
 pub use crate::session::{
     ColorTag, CullFilter, CullFlag, META_SCHEMA_VERSION, PhotoMeta, PhotoVariant, SessionCatalog,
-    SessionEntry, SessionFolderLayout, create_capture_one_session, move_photo_with_sidecar,
+    SessionEntry, SessionFolderLayout, acquire_path_lock, create_capture_one_session,
+    move_photo_with_sidecar, try_acquire_path_lock,
 };
 pub use crate::styles::{
     UserStyle, apply_style_to_recipe, default_styles_dir, delete_user_style,
@@ -1972,11 +1974,87 @@ pub enum CoreError {
     UnknownPreset(String),
     #[error("Sidecar conflict: expected revision {expected}, found {actual}")]
     SidecarConflict { expected: u64, actual: u64 },
+    #[error("Corrupt sidecar '{path}': {message} (refusing to overwrite)")]
+    CorruptSidecar { path: PathBuf, message: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_at_or_above_099_does_not_panic_and_stays_in_bounds() {
+        for crop in [
+            [0.99, 0.99, 0.01, 0.01],
+            [0.995, 0.999, 0.5, 0.5],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.99, 0.99, 0.0, 0.0],
+            [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0],
+        ] {
+            let geo = GeometryParams {
+                crop,
+                ..GeometryParams::default()
+            };
+            let [x, y, w, h] = geo.sanitized_crop();
+            assert!((0.0..=0.99).contains(&x), "x out of bounds: {x}");
+            assert!((0.0..=0.99).contains(&y), "y out of bounds: {y}");
+            assert!(w >= 0.01 && x + w <= 1.0001, "invalid x={x} w={w}");
+            assert!(h >= 0.01 && y + h <= 1.0001, "invalid y={y} h={h}");
+        }
+    }
+
+    #[test]
+    fn corrupt_sidecar_is_never_overwritten_and_revisions_are_monotonic() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rune_core_sidecar_safety_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("DSC0001.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let sidecar = DevelopRecipe::sidecar_path_for(&photo);
+
+        // 1. Corrupt sidecar must be flagged in SessionCatalog and refused on save.
+        std::fs::write(&sidecar, b"{corrupt json").unwrap();
+        let catalog = SessionCatalog::from_paths(Some(dir.clone()), vec![photo.clone()]);
+        assert!(catalog.entries[0].sidecar_corrupt);
+        let mut fresh = PhotoMeta::default();
+        let err = fresh
+            .save_sidecar_in_place(&photo)
+            .expect_err("corrupt sidecar must not be overwritten");
+        assert!(matches!(err, CoreError::CorruptSidecar { .. }));
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "{corrupt json");
+
+        // 2. Valid sidecar: concurrent writer bumping revision on disk ensures monotonicity.
+        std::fs::remove_file(&sidecar).unwrap();
+        let mut writer_a = PhotoMeta::default();
+        writer_a.recipe.exposure = 0.5;
+        writer_a.save_sidecar_in_place(&photo).unwrap();
+        assert_eq!(writer_a.revision, 1);
+
+        let mut writer_b = PhotoMeta::load_sidecar(&photo).unwrap().unwrap();
+        writer_b.recipe.exposure = 1.0;
+        writer_b.save_sidecar_in_place(&photo).unwrap();
+        assert_eq!(writer_b.revision, 2);
+
+        // Stale writer_a saving with expected_revision gets SidecarConflict.
+        assert!(matches!(
+            writer_a.save_sidecar_checked_in_place(&photo, Some(1)),
+            Err(CoreError::SidecarConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        // Unchecked save still advances monotonically past disk revision (3, not 2).
+        writer_a.save_sidecar_in_place(&photo).unwrap();
+        assert_eq!(writer_a.revision, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn undo_redo_roundtrips_recipe() {

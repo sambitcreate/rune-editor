@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, session::atomic_write_bytes};
+use crate::{
+    CoreError,
+    session::{acquire_path_lock, atomic_write_bytes},
+};
 
 /// Environment variable overriding the default AI models directory (`~/.config/rune-darkroom/models`).
 pub const RUNE_MODELS_DIR_ENV: &str = "RUNE_MODELS_DIR";
@@ -30,7 +33,9 @@ const fn default_preferred_sam3_variant() -> ModelId {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentationEngine {
-    /// Automatically pick the strongest available backend (SAM 3 -> SAM 2.1 -> Apple Vision -> Heuristic).
+    /// Automatically pick the strongest available backend:
+    /// - Subject/Background: Apple Vision ANE (macOS) -> installed SAM 3 -> SAM 2.1 -> Heuristic.
+    /// - Interactive (points/box): installed SAM 3 -> SAM 2.1 -> Apple Vision ANE -> Heuristic.
     #[default]
     Auto,
     /// macOS Apple Vision `VNGenerateForegroundInstanceMaskRequest` (built-in, zero download).
@@ -202,10 +207,12 @@ impl fmt::Display for ModelId {
 pub struct ModelFileSpec {
     /// Local filename inside [`model_dir`].
     pub filename: &'static str,
-    /// Exact Hugging Face `resolve/main/` download URL.
+    /// Immutable commit-pinned Hugging Face `resolve/<commit>/` download URL.
     pub url: &'static str,
-    /// Approximate expected file size in bytes (for progress bars & disk estimates).
+    /// Exact expected file size in bytes (matching Hugging Face LFS size).
     pub approx_bytes: u64,
+    /// Verified lowercase hex SHA-256 digest of the file contents (Hugging Face LFS OID).
+    pub sha256: &'static str,
 }
 
 /// Complete immutable manifest and preprocessing contract for a downloadable ONNX model.
@@ -240,69 +247,81 @@ pub struct ModelSpec {
 const SAM21_HIERA_TINY_FILES: [ModelFileSpec; 4] = [
     ModelFileSpec {
         filename: "vision_encoder_fp16.onnx",
-        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/main/onnx/vision_encoder_fp16.onnx",
+        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/814a066640debee5a91e70aa401fb8e17e030503/onnx/vision_encoder_fp16.onnx",
         approx_bytes: 314_925,
+        sha256: "7773e79d589dada8e1e630cc7eb18b17b2c5b4faeb1eaab5ebf9df618ecbd50a",
     },
     ModelFileSpec {
         filename: "vision_encoder_fp16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/main/onnx/vision_encoder_fp16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/814a066640debee5a91e70aa401fb8e17e030503/onnx/vision_encoder_fp16.onnx_data",
         approx_bytes: 67_005_504,
+        sha256: "a4dd3759e9b6a476d991fb3493787992e78777e51462695e1bede71ae258103e",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_fp16.onnx",
-        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_fp16.onnx",
+        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/814a066640debee5a91e70aa401fb8e17e030503/onnx/prompt_encoder_mask_decoder_fp16.onnx",
         approx_bytes: 229_799,
+        sha256: "00ac7200451f246e8307aa1a1648113f47dc45625738406403a0e6b86c69fc55",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_fp16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_fp16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX/resolve/814a066640debee5a91e70aa401fb8e17e030503/onnx/prompt_encoder_mask_decoder_fp16.onnx_data",
         approx_bytes: 10_454_016,
+        sha256: "027b457a53f5bd76bb401c59555448451d04b4eab6d2f6a6758406b40133ee2c",
     },
 ];
 
 const SAM3_TRACKER_Q4F16_FILES: [ModelFileSpec; 4] = [
     ModelFileSpec {
         filename: "vision_encoder_q4f16.onnx",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder_q4f16.onnx",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/vision_encoder_q4f16.onnx",
         approx_bytes: 1_307_816,
+        sha256: "4b96732adab3d7d70ac0964ce540a61fad097fbc10c9b27612f47d676877cefc",
     },
     ModelFileSpec {
         filename: "vision_encoder_q4f16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder_q4f16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/vision_encoder_q4f16.onnx_data",
         approx_bytes: 295_622_656,
+        sha256: "d1d60808376dbd48e34cf89feaee708c13abed229f2398ab512149db34fdab07",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_q4f16.onnx",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_q4f16.onnx",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/prompt_encoder_mask_decoder_q4f16.onnx",
         approx_bytes: 243_598,
+        sha256: "6f77d5e2fb6fcb325297734b46cbb951534be08978599856d17c0030b51ea897",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_q4f16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_q4f16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/prompt_encoder_mask_decoder_q4f16.onnx_data",
         approx_bytes: 5_121_024,
+        sha256: "4c330254898062cce1ded5f2208e57b441df443886161af02b492b5a5ae2f6d0",
     },
 ];
 
 const SAM3_TRACKER_FP16_FILES: [ModelFileSpec; 4] = [
     ModelFileSpec {
         filename: "vision_encoder_fp16.onnx",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder_fp16.onnx",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/vision_encoder_fp16.onnx",
         approx_bytes: 1_263_005,
+        sha256: "f8c52be6de99124bb17f25792054406abc482ce3502166f948d5c5849cd14d02",
     },
     ModelFileSpec {
         filename: "vision_encoder_fp16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder_fp16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/vision_encoder_fp16.onnx_data",
         approx_bytes: 934_729_728,
+        sha256: "4b021a4d3068c9e9153f2f2fcc9e6d280156228671c00ab6c2ddfa737da7f151",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_fp16.onnx",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_fp16.onnx",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/prompt_encoder_mask_decoder_fp16.onnx",
         approx_bytes: 229_804,
+        sha256: "43241335a89e96cf3e933d31f0af41f2171e4f0ccba62a7d870fa9a5d7c77cc9",
     },
     ModelFileSpec {
         filename: "prompt_encoder_mask_decoder_fp16.onnx_data",
-        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder_fp16.onnx_data",
+        url: "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/429305c8a5b3de597243d919a07e4e6bdcd00ef7/onnx/prompt_encoder_mask_decoder_fp16.onnx_data",
         approx_bytes: 11_011_072,
+        sha256: "3c89f8f56c140806d65c37ec7b25ac70407d52cbfe6d8d0accbc5fff7ead562d",
     },
 ];
 
@@ -693,6 +712,15 @@ pub fn inspect_model_install_in(root: &Path, id: ModelId) -> ModelInstallState {
             if len > 0 {
                 non_empty_files += 1;
             }
+        } else {
+            let part_path = dir.join(format!("{}.part", file.filename));
+            if let Ok(meta) = std::fs::metadata(&part_path)
+                && meta.is_file()
+                && meta.len() > 0
+            {
+                any_file_exists = true;
+                total_bytes = total_bytes.saturating_add(meta.len());
+            }
         }
     }
 
@@ -820,6 +848,34 @@ pub fn save_ai_model_config_to(path: &Path, config: &AiModelConfig) -> Result<()
     atomic_write_bytes(path, json.as_bytes())
 }
 
+/// Performs a locked read-modify-write update on [`ai_model_config_path`], preventing concurrent
+/// GUI/CLI/MCP writers from clobbering each other and refusing to overwrite a corrupt JSON file.
+pub fn update_ai_model_config(
+    mutate: impl FnOnce(&mut AiModelConfig),
+) -> Result<AiModelConfig, CoreError> {
+    let path = ai_model_config_path();
+    update_ai_model_config_at(&path, mutate)
+}
+
+/// Performs a locked read-modify-write update on an explicit `ai_models.json` `path`,
+/// returning an error without modifying disk if the existing file fails to parse.
+pub fn update_ai_model_config_at(
+    path: &Path,
+    mutate: impl FnOnce(&mut AiModelConfig),
+) -> Result<AiModelConfig, CoreError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = acquire_path_lock(path)?;
+    let mut config = load_ai_model_config_from(path)?;
+    mutate(&mut config);
+    let clean = config.sanitized();
+    save_ai_model_config_to(path, &clean)?;
+    Ok(clean)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +957,24 @@ mod tests {
                     "unexpected URL for {id:?}: {}",
                     f.url
                 );
+                assert!(
+                    !f.url.contains("/resolve/main/"),
+                    "model URL must pin an immutable commit SHA, not mutable main: {}",
+                    f.url
+                );
+                assert_eq!(
+                    f.sha256.len(),
+                    64,
+                    "expected 64-char SHA-256 hex digest for {}",
+                    f.filename
+                );
+                assert!(
+                    f.sha256
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                    "invalid lowercase hex SHA-256 for {}",
+                    f.filename
+                );
                 assert!(f.url.contains(spec.hf_repo));
                 assert!(f.url.ends_with(f.filename));
             }
@@ -970,6 +1044,21 @@ mod tests {
         std::fs::write(dir.join(last.filename), b"").unwrap();
         assert!(inspect_model_install_in(&root, id).is_partial());
 
+        // A `.part`-only download must report Partial (not NotInstalled) so GUI can offer Resume.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.part", first.filename)),
+            vec![9u8; 4096],
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_model_install_in(&root, id),
+            ModelInstallState::Partial {
+                bytes_present: 4096
+            }
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1017,6 +1106,26 @@ mod tests {
         let clean = bad.sanitized();
         assert_eq!(clean.preferred_sam3_variant, ModelId::Sam3TrackerQ4f16);
         assert_eq!(clean.accepted_licenses, vec!["Meta SAM License"]);
+
+        // update_ai_model_config_at preserves existing fields and refuses to wipe corrupt JSON.
+        let merged = update_ai_model_config_at(&cfg_path, |cfg| {
+            cfg.active_engine = SegmentationEngine::AppleVision;
+        })
+        .unwrap();
+        assert_eq!(merged.active_engine, SegmentationEngine::AppleVision);
+        assert!(merged.is_license_accepted(ModelId::Sam3TrackerQ4f16));
+
+        std::fs::write(&cfg_path, b"{not valid json").unwrap();
+        assert!(
+            update_ai_model_config_at(&cfg_path, |cfg| {
+                cfg.active_engine = SegmentationEngine::Heuristic;
+            })
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            "{not valid json"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
