@@ -4,17 +4,22 @@
 //! `CARD_GAP = 12pt`, `ROW_GAP = 8pt`), crisp hairline separators, trailing `ⓘ` hover info
 //! badges replacing walls of helper prose, and inline `▸` progressive disclosure drawers.
 
+use rune::file_dialog::FileDialogOptions;
 use rune::{Color, Cursor, El, ScrollSpec, col, el, icon, row, text};
+use rune_editor_core::{
+    ModelId, ModelInstallState, ModelStatus, SegmentationEngine, models_root_dir,
+};
 use rune_editor_mcp::{MCP_PROTOCOL_LATEST, McpSettings};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Divider, Kit, SegmentedControl, Switch,
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, ControlSize, Divider, Kit,
+    SegmentedControl, Switch,
 };
 use rune_theme_opencode::icons;
 
 use crate::menu::trigger_watch_hot_folder;
 use crate::state::{
-    AppState, InfoTip, McpClientGuide, ProofMargin, SettingsSection, ShortcutAction,
-    ShortcutCategory,
+    AppState, InfoTip, McpClientGuide, ModelDownloadPhase, ProofMargin, SettingsSection,
+    ShortcutAction, ShortcutCategory,
 };
 use crate::tokens::{border, color, radius, size, space, ty};
 use crate::widgets::{advanced_disclosure_row, info_badge};
@@ -26,6 +31,7 @@ pub fn settings_view(s: &AppState, k: &Kit) -> El {
     let sidebar = settings_sidebar(s, k);
     let content = match s.settings_section {
         SettingsSection::AgentMcp => agent_mcp_section(s, k),
+        SettingsSection::AiModels => ai_models_section(s, k),
         SettingsSection::CliAndSkill => cli_and_skill_section(s, k),
         SettingsSection::Shortcuts => shortcuts_and_workflow_section(s, k),
         SettingsSection::Security => security_section(s, k),
@@ -168,6 +174,15 @@ fn settings_sidebar(s: &AppState, k: &Kit) -> El {
                     "Agent & Local MCP",
                     &icons::MCP,
                     Some(running),
+                ))
+                .child(nav_item(
+                    SettingsSection::AiModels,
+                    "AI Models",
+                    &icons::BRAIN,
+                    Some(
+                        s.ai_engine_summary.apple_vision_available
+                            || !s.ai_engine_summary.installed_models.is_empty(),
+                    ),
                 ))
                 .child(nav_item(
                     SettingsSection::CliAndSkill,
@@ -368,7 +383,7 @@ fn agent_mcp_section(s: &AppState, k: &Kit) -> El {
     let activity_label = match &s.mcp_last_activity {
         Some(last) => format!("{} tool call(s) · Last: {last}", s.mcp_request_count),
         None => format!(
-            "{} tool call(s) · {MCP_PROTOCOL_LATEST} · 9 tools · {param_count} synced params",
+            "{} tool call(s) · {MCP_PROTOCOL_LATEST} · 10 tools · {param_count} synced params",
             s.mcp_request_count
         ),
     };
@@ -563,10 +578,10 @@ fn agent_mcp_section(s: &AppState, k: &Kit) -> El {
     connect_card = connect_card.child(advanced_disclosure_row(
         k,
         "settings-disc-tools",
-        "Exposed MCP Tools (9)",
+        "Exposed MCP Tools (10)",
         s.settings_mcp_tools_open,
         0,
-        9,
+        10,
         |s| s.settings_mcp_tools_open = !s.settings_mcp_tools_open,
     ));
 
@@ -580,6 +595,674 @@ fn agent_mcp_section(s: &AppState, k: &Kit) -> El {
         .child(master_card)
         .child(controls_card)
         .child(connect_card)
+}
+
+fn format_mb(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 100.0 {
+        format!("{mb:.0} MB")
+    } else if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn engine_short_label(engine: SegmentationEngine) -> &'static str {
+    match engine {
+        SegmentationEngine::Auto => "Auto",
+        SegmentationEngine::AppleVision => "Apple Vision",
+        SegmentationEngine::Sam21Tiny => "SAM 2.1",
+        SegmentationEngine::Sam3Tracker => "SAM 3",
+        SegmentationEngine::Heuristic => "Heuristic",
+    }
+}
+
+fn status_badge_pill(k: &Kit, label: String, fg: Color, bg: Color, border_col: Color) -> El {
+    row()
+        .px(space::MD)
+        .py(space::XXS)
+        .items_center()
+        .radius(k.radius.md)
+        .continuous_corners()
+        .fill(bg)
+        .border(border::HAIRLINE, border_col)
+        .child(text(label).font(ty::mono_compact(k)).color(fg))
+}
+
+fn ai_models_section(s: &AppState, k: &Kit) -> El {
+    let engine_tip = InfoTip {
+        title: "AI Segmentation Engine",
+        shortcut: Some("W"),
+        description: "Controls which neural backend powers AI Subject, AI Background, and Interactive AI Select (W). Auto picks Apple Vision ANE for instant Subject/Bg and installed SAM 3 / SAM 2.1 for interactive clicks and boxes.",
+        cli_key: "rd model status  ·  rd model use <engine>  ·  MCP: rune_models",
+        tier: "Settings · AI Models",
+    };
+
+    // Active Engine selector pills: Auto | Apple Vision | SAM 2.1 | SAM 3 | Heuristic
+    let mut engine_pills = row()
+        .key("settings-ai-engine-pills")
+        .role("radiogroup")
+        .label("Active segmentation engine")
+        .w_full()
+        .gap(space::PILL_GAP);
+    for engine in SegmentationEngine::ALL {
+        let active = s.ai_model_config.active_engine == engine;
+        engine_pills = engine_pills.child(
+            row()
+                .key(format!("ai-engine-{}", engine.as_str()))
+                .role("radio")
+                .checked(active)
+                .cursor(Cursor::Pointer)
+                .grow(1.0)
+                .min_w(0.0)
+                .h(size::PILL_H)
+                .px(space::SM)
+                .center()
+                .radius(k.radius.sm)
+                .fill(color::pill_fill(k, active))
+                .hover(k.c.hover)
+                .border(
+                    if active {
+                        border::REGULAR
+                    } else {
+                        border::HAIRLINE
+                    },
+                    color::pill_border(k, active),
+                )
+                .child(
+                    text(engine_short_label(engine))
+                        .font(if active {
+                            ty::control_label_medium(k)
+                        } else {
+                            ty::control_label(k)
+                        })
+                        .color(if active {
+                            k.c.text_accent
+                        } else {
+                            k.c.text_muted
+                        })
+                        .truncate(),
+                )
+                .on_press_tx(move |s: &mut AppState, tx| s.set_ai_engine_tx(engine, tx)),
+        );
+    }
+
+    let engine_card = settings_card(k, "settings-ai-engine-card")
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(space::CARD_GAP)
+                .child(
+                    row()
+                        .items_center()
+                        .gap(space::ROW_GAP)
+                        .child(
+                            icon(&icons::BRAIN, size::ICON_LG)
+                                .color(k.c.text_base)
+                                .a11y_hidden(),
+                        )
+                        .child(
+                            text("AI Models & Smart Selection")
+                                .font(ty::dialog_title(k))
+                                .color(k.c.text_base),
+                        )
+                        .child(info_badge(
+                            k,
+                            engine_tip,
+                            s.hovered_info.is_some_and(|h| h.title == engine_tip.title),
+                        )),
+                )
+                .child(
+                    Badge::new("512×512 Mask Atlas")
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                ),
+        )
+        .child(row_hairline(k))
+        .child(
+            col()
+                .w_full()
+                .gap(space::ROW_GAP)
+                .child(
+                    row()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            text("Active Engine")
+                                .font(ty::control_label_medium(k))
+                                .color(k.c.text_base),
+                        )
+                        .child(
+                            text(s.ai_effective_engine_readout())
+                                .font(ty::mono_compact(k))
+                                .color(k.c.text_accent),
+                        ),
+                )
+                .child(engine_pills),
+        );
+
+    // Card 1: Built-in Apple Vision ANE
+    let vision_ready = s.ai_engine_summary.apple_vision_available;
+    let vision_badge = if vision_ready {
+        status_badge_pill(
+            k,
+            "Ready".to_owned(),
+            color::mcp_running(),
+            color::mcp_running_bg(),
+            color::mcp_running(),
+        )
+    } else {
+        status_badge_pill(
+            k,
+            "Unavailable".to_owned(),
+            k.c.text_muted,
+            k.c.bg_deep,
+            k.c.border_base,
+        )
+    };
+
+    let vision_tip = InfoTip {
+        title: "Apple Vision ANE",
+        shortcut: None,
+        description: "Built-in macOS Neural Engine foreground instance segmentation (VNGenerateForegroundInstanceMaskRequest). Zero download, private on-device execution.",
+        cli_key: "engine = apple_vision  ·  0 MB built-in",
+        tier: "AI Models · Built-in",
+    };
+
+    let apple_vision_card = settings_card(k, "settings-ai-model-apple-vision").child(
+        row()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(space::CARD_GAP)
+            .child(
+                col()
+                    .gap(space::XXS)
+                    .min_w(0.0)
+                    .shrink()
+                    .child(
+                        row()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(
+                                text("Apple Vision ANE")
+                                    .font(ty::control_label_medium(k))
+                                    .color(k.c.text_base),
+                            )
+                            .child(info_badge(
+                                k,
+                                vision_tip,
+                                s.hovered_info.is_some_and(|h| h.title == vision_tip.title),
+                            )),
+                    )
+                    .child(
+                        text("Built-in · macOS 14+ · 0 MB · Instant Subject, Background & Instance Click")
+                            .font(ty::caption(k))
+                            .color(k.c.text_muted),
+                    )
+                    .child(
+                        text(s.ai_engine_summary.apple_vision_label.as_str())
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_faint),
+                    ),
+            )
+            .child(vision_badge),
+    );
+
+    // Cards 2–4: Downloadable ONNX models (SAM 2.1 Tiny, SAM 3 Q4F16, SAM 3 FP16)
+    let mut model_cards = col().w_full().gap(space::CARD_GAP).child(apple_vision_card);
+
+    for id in ModelId::ALL {
+        let status = s
+            .ai_model_statuses
+            .iter()
+            .find(|st| st.id == id)
+            .cloned()
+            .unwrap_or_else(|| rune_editor_core::inspect_model_status(id, &s.ai_model_config));
+        model_cards = model_cards.child(downloadable_model_card(s, k, id, &status));
+    }
+
+    // Footer Card: Models directory + Open Folder + Refresh
+    let models_dir_display = models_root_dir().display().to_string();
+    let footer_card = settings_card(k, "settings-ai-footer-card").child(
+        row()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(space::CARD_GAP)
+            .child(
+                col()
+                    .gap(space::XXS)
+                    .min_w(0.0)
+                    .shrink()
+                    .child(
+                        text("Models Directory")
+                            .font(ty::control_label_medium(k))
+                            .color(k.c.text_base),
+                    )
+                    .child(
+                        text(models_dir_display)
+                            .font(ty::mono_compact(k))
+                            .color(k.c.text_muted)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                row()
+                    .items_center()
+                    .gap(space::PILL_GAP)
+                    .child(
+                        Button::new("Open Folder")
+                            .variant(ButtonVariant::Neutral)
+                            .control_size(ControlSize::Small)
+                            .icon(&icons::FOLDER)
+                            .on_press_tx(|s: &mut AppState, tx| s.open_ai_models_folder_tx(tx))
+                            .build(k),
+                    )
+                    .child(
+                        Button::new("Refresh")
+                            .variant(ButtonVariant::Neutral)
+                            .control_size(ControlSize::Small)
+                            .icon(&icons::OUTLINE_RESET)
+                            .on_press_tx(|s: &mut AppState, tx| s.refresh_ai_models_tx(tx))
+                            .build(k),
+                    ),
+            ),
+    );
+
+    col()
+        .w_full()
+        .gap(space::CARD_GAP)
+        .child(engine_card)
+        .child(model_cards)
+        .child(footer_card)
+}
+
+fn downloadable_model_card(s: &AppState, k: &Kit, id: ModelId, status: &ModelStatus) -> El {
+    let spec = id.spec();
+    let job = s.model_download_job(id);
+    let license_ok = s.is_ai_license_checked(id);
+
+    let (title, meta_line, tip) = match id {
+        ModelId::Sam21HieraTinyFp16 => (
+            "SAM 2.1 Hiera-Tiny (FP16)",
+            "~78 MB · Apache-2.0 · Fast interactive click & box segmentation on CoreML / CPU",
+            InfoTip {
+                title: "SAM 2.1 Hiera-Tiny (FP16)",
+                shortcut: None,
+                description: "Compact Meta SAM 2.1 ONNX model (~78 MB, Apache-2.0). Caches image embeddings per photo for responsive interactive point & bounding-box masks.",
+                cli_key: "rd model setup sam2.1-hiera-tiny",
+                tier: "AI Models · ONNX",
+            },
+        ),
+        ModelId::Sam3TrackerQ4f16 => (
+            "SAM 3 Tracker (Q4F16)",
+            "~302 MB · Meta SAM License · Quantized 4-bit/FP16 precision edges & fine hair",
+            InfoTip {
+                title: "SAM 3 Tracker (Q4F16)",
+                shortcut: None,
+                description: "Quantized Meta SAM 3 Tracker ONNX (~302 MB). Balanced memory footprint with high-accuracy promptable masks. Requires Meta SAM License acceptance.",
+                cli_key: "rd model setup sam3-tracker-q4f16 --accept-license",
+                tier: "AI Models · ONNX",
+            },
+        ),
+        ModelId::Sam3TrackerFp16 => (
+            "SAM 3 Tracker (FP16)",
+            "~947 MB · Meta SAM License · Full FP16 studio precision for complex masks",
+            InfoTip {
+                title: "SAM 3 Tracker (FP16)",
+                shortcut: None,
+                description: "Full-precision FP16 Meta SAM 3 Tracker ONNX (~947 MB) for maximum boundary fidelity on complex subjects. Requires Meta SAM License acceptance.",
+                cli_key: "rd model setup sam3-tracker-fp16 --accept-license",
+                tier: "AI Models · ONNX",
+            },
+        ),
+    };
+
+    let active_dl = match job.as_ref().map(|j| &j.phase) {
+        Some(ModelDownloadPhase::Downloading {
+            fraction,
+            file_index,
+            total_files,
+            file_name,
+            bytes_downloaded,
+            total_bytes,
+            status: dl_status,
+        }) => Some((
+            *fraction,
+            *file_index,
+            *total_files,
+            file_name.clone(),
+            *bytes_downloaded,
+            *total_bytes,
+            dl_status.clone(),
+        )),
+        _ => None,
+    };
+
+    let job_error = match job.as_ref().map(|j| &j.phase) {
+        Some(ModelDownloadPhase::Error(msg)) => Some(msg.clone()),
+        _ => None,
+    };
+
+    let state_badge = if let Some((frac, ..)) = &active_dl {
+        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as u32;
+        status_badge_pill(
+            k,
+            format!("Downloading {pct}%"),
+            k.c.text_accent,
+            color::ai_progress_bg(),
+            k.c.border_focus,
+        )
+    } else if job_error.is_some() {
+        status_badge_pill(
+            k,
+            "Error".to_owned(),
+            k.c.danger.fg,
+            color::ai_badge_error_bg(),
+            k.c.danger.fg,
+        )
+    } else {
+        match status.state {
+            ModelInstallState::Installed { total_bytes } => status_badge_pill(
+                k,
+                format!("Ready · {}", format_mb(total_bytes)),
+                color::mcp_running(),
+                color::mcp_running_bg(),
+                color::mcp_running(),
+            ),
+            ModelInstallState::Partial { bytes_present } => status_badge_pill(
+                k,
+                format!("Partial · {}", format_mb(bytes_present)),
+                color::ai_badge_warning(),
+                color::ai_badge_warning_bg(),
+                color::ai_badge_warning(),
+            ),
+            ModelInstallState::NotInstalled => status_badge_pill(
+                k,
+                "Not Downloaded".to_owned(),
+                k.c.text_muted,
+                k.c.bg_deep,
+                k.c.border_base,
+            ),
+        }
+    };
+
+    let mut card = settings_card(
+        k,
+        match id {
+            ModelId::Sam21HieraTinyFp16 => "settings-ai-model-sam21",
+            ModelId::Sam3TrackerQ4f16 => "settings-ai-model-sam3-q4f16",
+            ModelId::Sam3TrackerFp16 => "settings-ai-model-sam3-fp16",
+        },
+    )
+    .child(
+        row()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(space::CARD_GAP)
+            .child(
+                col()
+                    .gap(space::XXS)
+                    .min_w(0.0)
+                    .shrink()
+                    .child(
+                        row()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(
+                                text(title)
+                                    .font(ty::control_label_medium(k))
+                                    .color(k.c.text_base),
+                            )
+                            .child(info_badge(
+                                k,
+                                tip,
+                                s.hovered_info.is_some_and(|h| h.title == tip.title),
+                            )),
+                    )
+                    .child(text(meta_line).font(ty::caption(k)).color(k.c.text_muted))
+                    .child(
+                        text(spec.hf_repo)
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_faint),
+                    ),
+            )
+            .child(state_badge),
+    );
+
+    // Live download progress bar (proportional flex fill across full track width)
+    if let Some((frac, file_idx, total_files, file_name, bytes_dl, total_bytes, dl_status)) =
+        &active_dl
+    {
+        let clamped_frac = frac.clamp(0.0, 1.0);
+        let pct = (clamped_frac * 100.0).round();
+        let mut progress_track = row()
+            .w_full()
+            .h(6.0)
+            .radius(radius::circle(6.0))
+            .fill(k.c.layer_02)
+            .clip_rounded(radius::circle(6.0));
+        if clamped_frac > 0.001 {
+            progress_track = progress_track.child(
+                el().h(6.0)
+                    .grow(clamped_frac)
+                    .min_w(0.0)
+                    .radius(radius::circle(6.0))
+                    .fill(k.c.text_accent)
+                    .a11y_hidden(),
+            );
+        }
+        if 1.0 - clamped_frac > 0.001 {
+            progress_track = progress_track.child(
+                el().h(6.0)
+                    .grow(1.0 - clamped_frac)
+                    .min_w(0.0)
+                    .a11y_hidden(),
+            );
+        }
+        card = card.child(
+            col()
+                .w_full()
+                .gap(space::XS)
+                .padding(space::MD)
+                .radius(k.radius.md)
+                .fill(k.c.bg_deep)
+                .border(border::HAIRLINE, k.c.border_muted)
+                .child(
+                    row()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            text(format!(
+                                "{dl_status} ({}/{})",
+                                file_idx + 1,
+                                (*total_files).max(1)
+                            ))
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_base)
+                            .truncate(),
+                        )
+                        .child(
+                            text(format!(
+                                "{} / {} · {pct:.0}%",
+                                format_mb(*bytes_dl),
+                                format_mb(*total_bytes)
+                            ))
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_accent),
+                        ),
+                )
+                .child(progress_track)
+                .child(
+                    text(file_name.as_str())
+                        .font(ty::mono_micro(k))
+                        .color(k.c.text_faint)
+                        .truncate(),
+                ),
+        );
+    }
+
+    // Error banner if last download or import failed
+    if let Some(err) = job_error {
+        card = card.child(
+            row()
+                .w_full()
+                .px(space::LG)
+                .py(space::ROW_GAP)
+                .radius(k.radius.md)
+                .fill(k.c.bg_deep)
+                .border(border::HAIRLINE, k.c.danger.fg)
+                .child(
+                    text(err)
+                        .font(ty::mono_micro(k))
+                        .color(k.c.danger.fg)
+                        .wrap(),
+                ),
+        );
+    }
+
+    // Required license checkbox for Meta SAM License models
+    if spec.requires_license_acceptance {
+        card = card.child(
+            row()
+                .w_full()
+                .px(space::MD)
+                .py(space::XS)
+                .items_center()
+                .justify_between()
+                .gap(space::ROW_GAP)
+                .radius(k.radius.md)
+                .fill(k.c.bg_deep)
+                .border(
+                    border::HAIRLINE,
+                    if license_ok {
+                        color::mcp_running()
+                    } else {
+                        k.c.border_strong
+                    },
+                )
+                .child(
+                    Checkbox::new(license_ok)
+                        .label(format!(
+                            "I accept the {} (required to download or import)",
+                            spec.license
+                        ))
+                        .on_toggle(move |s: &mut AppState| {
+                            s.toggle_ai_license_acceptance(id);
+                        })
+                        .build(k),
+                )
+                .child(
+                    text("facebookresearch/sam3")
+                        .font(ty::mono_micro(k))
+                        .color(k.c.text_faint),
+                ),
+        );
+    }
+
+    // Action row: Download & Setup / Cancel, Import Local…, Remove
+    let is_downloading = active_dl.is_some();
+    let is_installed = status.state.is_installed();
+    let is_partial = status.state.is_partial();
+    let can_acquire = !spec.requires_license_acceptance || license_ok;
+
+    let mut action_row = row()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(space::ROW_GAP);
+    let mut left_actions = row().items_center().gap(space::PILL_GAP);
+
+    if is_downloading {
+        let cancelling = job
+            .as_ref()
+            .is_some_and(crate::state::ModelDownloadJob::is_cancel_requested);
+        left_actions = left_actions.child(
+            Button::new(if cancelling {
+                "Cancelling…"
+            } else {
+                "Cancel"
+            })
+            .variant(ButtonVariant::Danger)
+            .control_size(ControlSize::Small)
+            .icon(&icons::CLOSE)
+            .disabled(cancelling)
+            .on_press_tx(move |s: &mut AppState, tx| s.cancel_model_download_tx(id, tx))
+            .build(k),
+        );
+    } else {
+        if !is_installed {
+            let dl_label = if is_partial {
+                "Resume Download"
+            } else {
+                "Download & Setup"
+            };
+            left_actions = left_actions.child(
+                Button::new(dl_label)
+                    .variant(ButtonVariant::Contrast)
+                    .control_size(ControlSize::Small)
+                    .icon(&icons::DOWNLOAD)
+                    .disabled(!can_acquire)
+                    .help(if can_acquire {
+                        "Download ONNX weights directly from Hugging Face over HTTPS"
+                    } else {
+                        "Accept the Meta SAM License above before downloading"
+                    })
+                    .on_press_tx(move |s: &mut AppState, tx| s.start_model_download_tx(id, tx))
+                    .build(k),
+            );
+        }
+
+        let import_title = format!(
+            "Select local folder containing {} ONNX files",
+            id.display_name()
+        );
+        left_actions = left_actions.child(
+            Button::new("Import Local…")
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .icon(&icons::FOLDER)
+                .disabled(!can_acquire)
+                .help("Install model offline from a local directory containing the ONNX files")
+                .on_press_tx(move |_: &mut AppState, tx| {
+                    let options = FileDialogOptions {
+                        title: import_title.clone(),
+                        ..Default::default()
+                    };
+                    tx.open_folder(options, move |s: &mut AppState, result, tx| match result {
+                        Ok(Some(dir)) => s.import_model_from_local_dir_tx(id, dir, tx),
+                        Ok(None) => {}
+                        Err(err) => {
+                            s.status_message = Some(format!("Folder picker error: {err}"));
+                        }
+                    });
+                })
+                .build(k),
+        );
+    }
+
+    action_row = action_row.child(left_actions);
+
+    if !is_downloading && (is_installed || is_partial) {
+        action_row = action_row.child(
+            Button::new("Remove")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .icon(&icons::CLOSE)
+                .help("Delete local ONNX weights for this model")
+                .on_press_tx(move |s: &mut AppState, tx| s.remove_ai_model_tx(id, tx))
+                .build(k),
+        );
+    }
+
+    card.child(row_hairline(k)).child(action_row)
 }
 
 fn cli_and_skill_section(s: &AppState, k: &Kit) -> El {
@@ -1352,7 +2035,11 @@ fn tool_list_summary(k: &Kit) -> El {
         ),
         (
             "rune_edit_layers",
-            "Non-destructive · Adjustment layers, composable masks, AI subject/bg, heal/clone",
+            "Non-destructive · Adjustment layers, composable masks, AI select/subject/bg, heal/clone",
+        ),
+        (
+            "rune_models",
+            "Manage AI segmentation engines & optional SAM 2.1 / SAM 3 ONNX models",
         ),
     ];
     let mut list = col()

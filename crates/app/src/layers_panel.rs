@@ -13,7 +13,7 @@ use crate::state::{AppState, CanvasTool, InfoTip};
 use crate::tokens::{border, color, radius, size, space, ty};
 use crate::widgets::{
     advanced_disclosure_row, collapsible_section_card, crop_pill_btn, develop_slider_inner,
-    develop_slider_sized, mini_reset_btn,
+    develop_slider_sized, info_badge, mini_reset_btn,
 };
 
 /// Compact local-state Scrubbable Capsule for transient brush/heal tool parameters
@@ -218,11 +218,55 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
             |s, tx| s.add_ai_subject_layer_tx(true, tx),
         ));
 
-    // Active canvas mask tools quick strip (`Hand`, `Brush`, `Eraser`, `Linear`, `Radial`)
-    let tool_strip = row()
-        .key("layer-canvas-tools")
-        .role("radiogroup")
-        .label("Mask drawing tool")
+    // Active canvas mask tools quick strip (`Hand`, `AI Select (W)`, `Brush (B)`, `Erase (E)`, `Linear (L)`, `Radial (T)`)
+    let ai_select_tip = InfoTip {
+        title: "Interactive AI Select (W)",
+        shortcut: Some("W"),
+        description: "Click photo to include an object, Option+Click (or − Exclude) to subtract regions, and Shift+Drag to draw a bounding box. Uses SAM 3, SAM 2.1, or Apple Vision ANE.",
+        cli_key: "rd layer add --kind ai-select --point x,y,+  ·  MCP: rune_edit_layers",
+        tier: "Tier 0 · Smart Selection",
+    };
+
+    let tool_strip_header = row()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .child(
+            row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    text("MASK TOOLS")
+                        .font(ty::section_header(k))
+                        .color(k.c.text_faint),
+                )
+                .child(info_badge(
+                    k,
+                    ai_select_tip,
+                    s.hovered_info
+                        .is_some_and(|h| h.title == ai_select_tip.title),
+                )),
+        )
+        .child(
+            row()
+                .key("layers-ai-models-link")
+                .role("button")
+                .label("Open AI Models Settings")
+                .help("Configure Apple Vision, SAM 2.1, and SAM 3 models in Settings")
+                .cursor(Cursor::Pointer)
+                .px(space::SM)
+                .py(space::MICRO)
+                .radius(k.radius.xs)
+                .hover(k.c.hover)
+                .child(
+                    text("AI Models…")
+                        .font(ty::mono_micro(k))
+                        .color(k.c.text_accent),
+                )
+                .on_press_tx(|s: &mut AppState, tx| s.open_ai_models_settings_tx(tx)),
+        );
+
+    let tool_row1 = row()
         .w_full()
         .gap(space::XS)
         .child(crop_pill_btn(
@@ -238,21 +282,36 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
         ))
         .child(crop_pill_btn(
             k,
+            "tool-ai-select",
+            "radio",
+            "Interactive AI Select (W)",
+            "AI Select (W)",
+            size::PILL_COMPACT_H,
+            s.active_tool == CanvasTool::AiSelect,
+            k.c.text_muted,
+            |s, tx| s.set_canvas_tool_tx(CanvasTool::AiSelect, tx),
+        ))
+        .child(crop_pill_btn(
+            k,
             "tool-brush",
             "radio",
             "Brush mask (B)",
-            "Brush",
+            "Brush (B)",
             size::PILL_COMPACT_H,
             s.active_tool == CanvasTool::Brush,
             k.c.text_muted,
             |s, tx| s.set_canvas_tool_tx(CanvasTool::Brush, tx),
-        ))
+        ));
+
+    let tool_row2 = row()
+        .w_full()
+        .gap(space::XS)
         .child(crop_pill_btn(
             k,
             "tool-eraser",
             "radio",
             "Eraser mask (E)",
-            "Erase",
+            "Erase (E)",
             size::PILL_COMPACT_H,
             s.active_tool == CanvasTool::Eraser,
             k.c.text_muted,
@@ -263,7 +322,7 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
             "tool-linear",
             "radio",
             "Linear gradient mask (L)",
-            "Linear",
+            "Linear (L)",
             size::PILL_COMPACT_H,
             s.active_tool == CanvasTool::LinearGradient,
             k.c.text_muted,
@@ -274,12 +333,22 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
             "tool-radial",
             "radio",
             "Radial gradient mask (T)",
-            "Radial",
+            "Radial (T)",
             size::PILL_COMPACT_H,
             s.active_tool == CanvasTool::RadialGradient,
             k.c.text_muted,
             |s, tx| s.set_canvas_tool_tx(CanvasTool::RadialGradient, tx),
         ));
+
+    let tool_strip = col()
+        .key("layer-canvas-tools")
+        .role("radiogroup")
+        .label("Mask drawing tool")
+        .w_full()
+        .gap(space::XS)
+        .child(tool_strip_header)
+        .child(tool_row1)
+        .child(tool_row2);
 
     // Layer stack list (topmost adjustment layer at top, Background at bottom like Capture One).
     let mut stack_list = col().key("layer-stack-list").w_full().gap(space::XS);
@@ -491,8 +560,192 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
         .gap(space::ROW_GAP)
         .child(create_row1)
         .child(create_row2)
-        .child(tool_strip)
-        .child(stack_list);
+        .child(tool_strip);
+
+    // Compact interactive AI Select controls sub-panel when AI Select (W) is active
+    if s.active_tool == CanvasTool::AiSelect {
+        let mode_row = row()
+            .key("ai-select-mode-row")
+            .role("radiogroup")
+            .label("AI Select point polarity")
+            .w_full()
+            .gap(space::PILL_GAP)
+            .child(crop_pill_btn(
+                k,
+                "ai-sel-include",
+                "radio",
+                "Positive include points (Click)",
+                "+ Include",
+                size::PILL_COMPACT_H,
+                s.ai_select_include_mode,
+                color::ai_point_positive(),
+                |s, _| s.ai_select_include_mode = true,
+            ))
+            .child(crop_pill_btn(
+                k,
+                "ai-sel-exclude",
+                "radio",
+                "Negative exclude points (⌥Click)",
+                "− Exclude",
+                size::PILL_COMPACT_H,
+                !s.ai_select_include_mode,
+                color::ai_point_negative(),
+                |s, _| s.ai_select_include_mode = false,
+            ));
+
+        let actions_row = row()
+            .key("ai-select-actions-row")
+            .w_full()
+            .gap(space::XS)
+            .child(crop_pill_btn(
+                k,
+                "ai-sel-invert",
+                "button",
+                "Invert AI selection mask",
+                if s.ai_select_invert {
+                    "Inverted ✓"
+                } else {
+                    "Invert Mask"
+                },
+                size::PILL_COMPACT_H,
+                s.ai_select_invert,
+                k.c.text_muted,
+                |s, tx| s.ai_select_toggle_invert_tx(tx),
+            ))
+            .child(crop_pill_btn(
+                k,
+                "ai-sel-clear",
+                "button",
+                "Clear AI prompt points and box",
+                "Clear Points",
+                size::PILL_COMPACT_H,
+                false,
+                k.c.text_muted,
+                |s, tx| s.ai_select_clear_points_tx(tx),
+            ))
+            .child(crop_pill_btn(
+                k,
+                "ai-sel-done",
+                "button",
+                "Finish AI Select session (Esc)",
+                "Done",
+                size::PILL_COMPACT_H,
+                false,
+                k.c.text_base,
+                |s, tx| s.ai_select_done_tx(tx),
+            ));
+
+        let engine_badge_text = s
+            .last_ai_mask_status
+            .as_ref()
+            .map(|st| st.compact_badge())
+            .unwrap_or_else(|| s.ai_effective_engine_readout());
+
+        let prompt_count_label = format!(
+            "{} pt{}{}",
+            s.ai_select_points.len(),
+            if s.ai_select_points.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if s.ai_select_bbox.is_some() {
+                " + box"
+            } else {
+                ""
+            }
+        );
+
+        let mut ai_box = col()
+            .key("ai-select-controls")
+            .w_full()
+            .gap(space::SM)
+            .padding(space::MD)
+            .radius(k.radius.md)
+            .fill(k.c.bg_deep)
+            .border(border::HAIRLINE, k.c.border_base)
+            .child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::SM)
+                    .child(
+                        text(engine_badge_text)
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_accent)
+                            .truncate(),
+                    )
+                    .child(
+                        text(prompt_count_label)
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_faint),
+                    ),
+            )
+            .child(mode_row)
+            .child(actions_row);
+
+        if let Some(note) = s
+            .last_ai_mask_status
+            .as_ref()
+            .and_then(|st| st.fallback_note.as_deref())
+        {
+            ai_box = ai_box.child(
+                text(format!("Fallback: {note}"))
+                    .font(ty::mono_micro(k))
+                    .color(color::ai_badge_warning())
+                    .wrap(),
+            );
+        }
+
+        body = body.child(ai_box);
+    } else if let Some(ref ai_status) = s.last_ai_mask_status {
+        let mut status_col = col()
+            .key("ai-mask-status-strip")
+            .w_full()
+            .gap(space::XXS)
+            .px(space::MD)
+            .py(space::SM)
+            .radius(k.radius.sm)
+            .fill(k.c.bg_deep)
+            .border(border::HAIRLINE, k.c.border_muted)
+            .child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::SM)
+                    .child(
+                        text(ai_status.compact_badge())
+                            .font(ty::mono_micro(k))
+                            .color(k.c.text_muted)
+                            .truncate(),
+                    )
+                    .child(
+                        row()
+                            .key("ai-status-models-link")
+                            .role("button")
+                            .cursor(Cursor::Pointer)
+                            .child(
+                                text("AI Models…")
+                                    .font(ty::mono_micro(k))
+                                    .color(k.c.text_accent),
+                            )
+                            .on_press_tx(|s: &mut AppState, tx| s.open_ai_models_settings_tx(tx)),
+                    ),
+            );
+        if let Some(note) = ai_status.fallback_note.as_deref() {
+            status_col = status_col.child(
+                text(format!("Fallback: {note}"))
+                    .font(ty::mono_micro(k))
+                    .color(color::ai_badge_warning())
+                    .wrap(),
+            );
+        }
+        body = body.child(status_col);
+    }
+
+    body = body.child(stack_list);
 
     // Active Layer Opacity at Tier 0; Invert/Clear Mask + Mask Display tucked in Tier 1
     if let Some(layer_idx) = s.active_layer_index
@@ -644,8 +897,8 @@ fn layers_stack_card(s: &AppState, k: &Kit) -> El {
         s.hovered_info,
         InfoTip {
             title: "Adjustment Layers & Masks",
-            shortcut: Some("B / L / T / M"),
-            description: "Non-destructive masked adjustment layers supporting Linear, Radial, Luma Range, Brush/Eraser, and AI Subject/Background masks.",
+            shortcut: Some("W / B / L / T / M"),
+            description: "Non-destructive masked adjustment layers supporting Interactive AI Select (W), Linear, Radial, Luma Range, Brush/Eraser, and AI Subject/Background masks.",
             cli_key: "layers[]  ·  MCP: rune_edit_layers",
             tier: "Tier 0 · Layers",
         },
@@ -1005,13 +1258,12 @@ fn combine_masks_card(s: &AppState, k: &Kit, layer_idx: usize) -> El {
                 );
             }
             MaskShape::RasterMask { width, height, .. } => {
-                item_box = item_box.child(
-                    text(format!(
-                        "{width}×{height} AI Lab Saliency + Bilateral Edge Mask"
-                    ))
-                    .font(ty::caption(k))
-                    .color(k.c.text_muted),
-                );
+                let desc = if let Some(ref st) = s.last_ai_mask_status {
+                    format!("{width}×{height} AI Smart Mask · {}", st.compact_badge())
+                } else {
+                    format!("{width}×{height} AI Smart Mask")
+                };
+                item_box = item_box.child(text(desc).font(ty::caption(k)).color(k.c.text_muted));
             }
             MaskShape::Filled => {}
         }

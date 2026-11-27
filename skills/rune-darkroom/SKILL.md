@@ -186,16 +186,27 @@ rd copy-look ./shoot/DSC0012.ARW ./shoot --autoselect-adjusted
 rd edit ./shoot --picks --copy-from ./shoot/DSC0012.ARW --only wb,tone,color,hsl,curves
 ```
 
-### D. Adjustment Layers, Combine Masks, AI Subject/Background & Heal/Clone (`rd layer`, `rd heal`)
+### D. Adjustment Layers, Combine Masks, AI Subject/Background, AI Select, Model Setup & Heal/Clone (`rd layer`, `rd model`, `rd heal`)
 ```bash
+# Manage AI segmentation engines (Apple Vision ANE built-in + on-demand SAM 2.1 / SAM 3 ONNX):
+rd model list                                                     # Built-in Apple Vision ANE + SAM 2.1 / SAM 3 install & license state
+rd model status                                                   # Active engine, effective Subject & Interactive engines, models dir & disk usage
+rd model setup sam2.1                                             # Download SAM 2.1 Hiera Tiny FP16 (~78 MB, Apache-2.0)
+rd model setup sam3-tracker-q4f16 --accept-license                # Download SAM 3 Tracker Q4F16 (~302 MB, Meta SAM License)
+rd model setup sam2.1 --from-dir /path/to/local/onnx              # Offline local directory import (also honors RUNE_MODELS_DIR)
+rd model use sam3                                                 # Persist active engine (auto|apple-vision|sam2.1|sam3|heuristic)
+rd model remove sam2.1                                            # Remove installed ONNX weights
+
 # Add a sky-burn linear gradient layer, subtract a radial subject halo, and intersect bright highlights:
 rd layer add photo.ARW --name "Sky Burn" --kind linear --opacity 0.85 --set exposure=-0.6 --set dehaze=0.25
 rd layer mask-add photo.ARW --index 0 --kind radial --op subtract --center 0.5,0.5 --radius 0.25,0.20 --feather 0.45
 rd layer mask-add photo.ARW --index 0 --kind luma --op intersect --low 0.45 --high 1.0 --low-falloff 0.12
 
-# One-click AI Subject & AI Background layers:
-rd layer add photo.ARW --name "Subject Pop" --kind ai-subject --set exposure=0.35 --set clarity=0.20
+# One-click AI Subject, AI Background, and interactive AI Select (points/box) layers (`512×512` mask atlas):
+rd layer add photo.ARW --name "Subject Pop" --kind ai-subject --engine auto --set exposure=0.35 --set clarity=0.20
 rd layer add photo.ARW --name "Bg Dim" --kind ai-background --opacity 0.75 --set exposure=-0.40
+rd layer add photo.ARW --name "Jacket" --kind ai-select --point 0.50,0.45,+ --point 0.15,0.20,- --box 0.25,0.20,0.75,0.85 --engine auto --set exposure=0.25
+rd layer mask-add photo.ARW --index 0 --kind ai-select --op subtract --point 0.50,0.30,+ --invert --engine auto
 
 # Inspect, update, clear masks, or remove layers:
 rd layer list photo.ARW
@@ -250,7 +261,7 @@ rd batch run job.json --jobs 2 --ndjson
 
 ## 5. Local MCP Server (`2025-11-25`) — Live GUI & Stdio Integration
 
-Rune Darkroom ships a localhost-only (`127.0.0.1`) **MCP `2025-11-25`** server with 9 annotated tools:
+Rune Darkroom ships a localhost-only (`127.0.0.1`) **MCP `2025-11-25`** server with 10 annotated tools:
 
 - **Live GUI Streamable HTTP (`http://127.0.0.1:37420/mcp`):** Enable **Settings (`⌘,`) → Agent & Local MCP → Local MCP Server** inside Rune Darkroom. Omit `path` on any tool to inspect, preview, diff, or edit the photo currently open in the 120Hz Metal viewport (preserving existing `.rune-edit.json` `revision` + `history` and supporting `⌘Z` undo).
 - **Stdio CLI (`rd mcp`):** Runs headlessly over stdin/stdout (or `rd mcp --http --port 37420` for standalone localhost HTTP).
@@ -267,7 +278,8 @@ Rune Darkroom ships a localhost-only (`127.0.0.1`) **MCP `2025-11-25`** server w
 | `rune_diff_photo` | Computes CIEDE2000 color delta, EV shift, clipping deltas, and field diffs (`against_preset` optional). Supports **`assertions`** (`max_highlight_clip_pct`, `max_shadow_clip_pct`, `max_skin_de2000`, `max_mean_de2000`) to enforce quantitative guardrails. |
 | `rune_cull_or_export` | `action: "cull"` (`rating` `0..5`, `flag`: `pick`/`reject`/`none`, **`color_tag`**: `none`/`red`/`orange`/`yellow`/`green`/`blue`/`purple`/`pink`) or `action: "export"` (`out`, `format`, `quality`, `max_edge`, **`naming_template`**, **`watermark`** `{text, opacity, scale, position}`, **`strip_metadata`**, **`color_space`** `srgb`/`display_p3`, **`recipes`** multi-recipe array, **`overwrite`** defaulting to `false`). Rejects RAW extensions, non-image extensions, traversal subfolders, and source-file paths. |
 | `rune_manage_workflow` | Capture One workflow operations (`action`): **`profile_list`** (optional EXIF `camera_make`/`camera_model` for camera-match sorting; pinned strictly to `~/.config/rune-darkroom/profiles` — untrusted `profiles_dir` is rejected), **`variant_list`**, **`variant_new`**, **`variant_clone`**, **`variant_select`**, **`variant_delete`**, **`style_list`**, **`style_save`** (`autoselect_adjusted`, traversal-safe slug), **`style_apply`** (`stack`, `strength`), **`style_delete`**, **`copy_selective_groups`** (`src_path`, `dst_path`, `groups`, `autoselect_adjusted`), and **`session_init`** (`dir`, traversal/symlink-safe 4-folder Capture One session creation). |
-| `rune_edit_layers` | Non-destructive Adjustment Layers (up to 8), Composable Masks (`add`/`subtract`/`intersect` for `filled`/`linear`/`radial`/`luma`/`brush`/`ai_subject`/`ai_background`), Local Adjustments, and Spot Heal/Clone (up to 16) via `action`: **`layer_list`**, **`layer_add`**, **`layer_update`**, **`layer_remove`**, **`mask_add`**, **`mask_clear`**, **`ai_subject`**, **`ai_background`**, **`heal_list`**, **`heal_add`**, **`heal_remove`**, **`heal_clear`** (live GUI `⌘Z` undo sync). |
+| `rune_edit_layers` | Non-destructive Adjustment Layers (up to 8), Composable Masks (`add`/`subtract`/`intersect` for `filled`/`linear`/`radial`/`luma`/`brush`/`ai_subject`/`ai_background`/`ai_select`), Local Adjustments, and Spot Heal/Clone (up to 16) via `action`: **`layer_list`**, **`layer_add`**, **`layer_update`**, **`layer_remove`**, **`mask_add`**, **`mask_clear`**, **`ai_subject`** (optional `engine`), **`ai_background`** (optional `engine`), **`ai_select`** (`points: [{x, y, positive}]`, `box: [x0, y0, x1, y1]`, `invert`, `engine`, optional `layer_index`/`index`/`id`, `name`, `op`), **`heal_list`**, **`heal_add`**, **`heal_remove`**, **`heal_clear`** (live GUI `⌘Z` undo sync + segmentation telemetry: `engine_used`, `backend_label`, `elapsed_ms`, `instance_count`, `iou_score`, `fallback_note`). |
+| `rune_models` | Manage AI segmentation engines and on-demand ONNX models (built-in Apple Vision ANE + SAM 2.1 Hiera Tiny + SAM 3 Tracker Q4F16/FP16) via `action`: **`list`**, **`status`**, **`use`** (`engine`: `auto`/`apple_vision`/`sam2.1`/`sam3`/`heuristic`), **`download`** (`model`, `accept_license`), **`setup_local`** (`model`, `source_dir`, `accept_license`; rejects traversal/symlink paths), and **`remove`** (`model`). Enforces explicit `accept_license: true` for Meta SAM License (SAM 3) models. |
 
 ### Example MCP Tool Calls
 
@@ -337,6 +349,22 @@ Rune Darkroom ships a localhost-only (`127.0.0.1`) **MCP `2025-11-25`** server w
   "quality": 85,
   "overwrite": false
 }
+
+// 4. Interactive AI Select layer via rune_edit_layers:
+{
+  "action": "ai_select",
+  "name": "Subject Jacket",
+  "engine": "auto",
+  "points": [{ "x": 0.50, "y": 0.42, "positive": true }, { "x": 0.15, "y": 0.20, "positive": false }],
+  "box": [0.25, 0.18, 0.75, 0.85],
+  "invert": false,
+  "adjustments": { "exposure": 0.30, "clarity": 0.15 }
+}
+
+// 5. Inspect or configure AI segmentation models via rune_models:
+{ "action": "status" }
+{ "action": "setup_local", "model": "sam3-tracker-q4f16", "source_dir": "/path/to/sam3-onnx", "accept_license": true }
+{ "action": "use", "engine": "sam3" }
 ```
 
 ---

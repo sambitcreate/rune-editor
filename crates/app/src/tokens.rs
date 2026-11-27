@@ -630,4 +630,45 @@ pub mod color {
     pub fn popover_bg() -> Color {
         srgb(0.115, 0.115, 0.125).alpha(0.95)
     }
+
+    /// Interactive AI Select positive (`+ Include`) prompt marker fill (`#47D67A`).
+    #[inline]
+    pub fn ai_point_positive() -> Color {
+        srgb(0.28, 0.84, 0.48)
+    }
+
+    /// Interactive AI Select negative (`− Exclude`) prompt marker fill (`#F17471`).
+    #[inline]
+    pub fn ai_point_negative() -> Color {
+        srgb(0.95, 0.45, 0.44)
+    }
+
+    /// Interactive AI Select bounding-box dashed stroke (`#A2BCFF`).
+    #[inline]
+    pub fn ai_bbox_stroke() -> Color {
+        srgb(0.64, 0.74, 1.0)
+    }
+
+    /// Warning / partial install badge accent (`#F2CF76`).
+    #[inline]
+    pub fn ai_badge_warning() -> Color {
+        srgb(0.95, 0.81, 0.46)
+    }
+
+    #[inline]
+    pub fn ai_badge_warning_bg() -> Color {
+        srgb(0.95, 0.81, 0.46).alpha(0.14)
+    }
+
+    /// Danger / download error badge tint.
+    #[inline]
+    pub fn ai_badge_error_bg() -> Color {
+        srgb(0.95, 0.45, 0.44).alpha(0.14)
+    }
+
+    /// Accent / downloading progress bar tint.
+    #[inline]
+    pub fn ai_progress_bg() -> Color {
+        srgb(0.64, 0.74, 1.0).alpha(0.16)
+    }
 }

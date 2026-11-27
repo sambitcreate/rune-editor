@@ -7,31 +7,35 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rune::{AppHandle, LiveRegion, Pixels, TextEdit, Tx};
+use rune::{AppHandle, LiveRegion, Mods, Pixels, TextEdit, Tx};
 use rune_editor_core::{
-    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, AdjustmentLayer, BrushDab,
+    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, AdjustmentLayer, AiModelConfig, BrushDab,
     CameraProfileDescriptor, ChannelLevels, ClarityMethod, ColorTag, CompiledRecipe, CropAspect,
     CullFilter, CullFlag, DEFAULT_CAMERA_PROFILE, DEFAULT_PROFILE_STRENGTH, DevelopRecipe,
     FilmCurve, FilmNegativeParams, GrainType, HealMode, HealSpot, HistogramData, HistoryStack,
     LayerMaskItem, LevelsParams, LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK,
-    MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode,
-    ProfileCategory, SessionCatalog, SessionEntry, StylePreset, ToneCurves, UserStyle,
-    ViewportCamera, VignetteMethod, WbPreset, all_param_descriptors, apply_style_to_recipe,
-    auto_exposure_and_tone, auto_levels, auto_white_balance, builtin_presets, canonical_profile_id,
-    compute_histogram_compiled, copy_recipe_groups, create_capture_one_session,
-    default_curve_points, delete_user_style, filmic_tonemap, find_builtin_profile,
-    find_scalar_param, import_user_profile, is_valid_camera_profile_id, linear_to_srgb,
-    list_all_camera_profiles, list_user_styles, modified_recipe_groups, move_photo_with_sidecar,
-    pick_white_balance, recipe_to_sparse_patch, rgb_to_hsl_and_lab, save_user_style,
+    MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER, MAX_PROMPT_POINTS, MaskCombineOp, MaskShape, ModelId,
+    ModelStatus, PhotoMeta, ProcessingMode, ProfileCategory, PromptBox, PromptPoint,
+    SegmentationEngine, SessionCatalog, SessionEntry, SmartMaskPrompt, StylePreset, ToneCurves,
+    UserStyle, ViewportCamera, VignetteMethod, WbPreset, all_param_descriptors,
+    apply_style_to_recipe, auto_exposure_and_tone, auto_levels, auto_white_balance,
+    builtin_presets, canonical_profile_id, compute_histogram_compiled, copy_recipe_groups,
+    create_capture_one_session, default_curve_points, delete_user_style, filmic_tonemap,
+    find_builtin_profile, find_scalar_param, import_user_profile, is_valid_camera_profile_id,
+    linear_to_srgb, list_all_camera_profiles, list_user_styles, load_ai_model_config,
+    models_root_dir, modified_recipe_groups, move_photo_with_sidecar, pick_white_balance,
+    recipe_to_sparse_patch, rgb_to_hsl_and_lab, save_ai_model_config, save_user_style,
     stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
-    ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher, LinearImage,
-    NamingContext, RawDecodeMode, TextWatermark, ThumbnailRgba8, WatermarkPosition,
-    builtin_export_recipes, expand_naming_template, export_image_with_options, export_multi_recipe,
-    generate_demo_hdr_scene, generate_demo_thumbnail, generate_subject_mask, guard_not_source,
-    is_raw_extension, load_file, load_file_proxy_with_mode, load_from_memory, load_thumbnail,
-    scan_photo_folder,
+    ActiveEngineSummary, ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec,
+    HotFolderWatcher, LinearImage, ModelDownloadProgress, NamingContext, RawDecodeMode,
+    SmartMaskResult, TextWatermark, ThumbnailRgba8, WatermarkPosition, active_engine_summary,
+    builtin_export_recipes, download_model, expand_naming_template, export_image_with_options,
+    export_multi_recipe, generate_demo_hdr_scene, generate_demo_thumbnail, generate_heuristic_mask,
+    generate_smart_mask, guard_not_source, is_raw_extension, list_model_statuses, load_file,
+    load_file_proxy_with_mode, load_from_memory, load_thumbnail, remove_model, scan_photo_folder,
+    setup_model_from_local_dir,
 };
 use rune_editor_mcp::{ActiveCanvasSnapshot, LocalMcpServer, McpService, McpSettings};
 
@@ -517,6 +521,7 @@ pub enum CropDragHandle {
 pub enum CanvasTool {
     #[default]
     Hand,
+    AiSelect,
     Brush,
     Eraser,
     LinearGradient,
@@ -529,6 +534,7 @@ impl CanvasTool {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Hand => "Hand",
+            Self::AiSelect => "AI Select",
             Self::Brush => "Brush",
             Self::Eraser => "Eraser",
             Self::LinearGradient => "Linear Mask",
@@ -541,6 +547,7 @@ impl CanvasTool {
     pub const fn hud_badge(self) -> &'static str {
         match self {
             Self::Hand => "HAND",
+            Self::AiSelect => "AI SELECT (W)",
             Self::Brush => "BRUSH (B)",
             Self::Eraser => "ERASER (E)",
             Self::LinearGradient => "LINEAR MASK (L)",
@@ -555,9 +562,17 @@ impl CanvasTool {
     }
 }
 
-/// Transient drag tracking for interactive canvas Brush/Eraser/Gradient/Heal operations.
+/// Transient drag tracking for interactive canvas AI Select/Brush/Eraser/Gradient/Heal operations.
 #[derive(Clone, Copy, Debug)]
 pub enum LayerDragState {
+    AiSelect {
+        start_uv: [f32; 2],
+        current_uv: [f32; 2],
+        start_local: [f32; 2],
+        shift_held: bool,
+        alt_held: bool,
+        dragging_box: bool,
+    },
     Brush {
         layer_idx: usize,
         mask_idx: usize,
@@ -578,11 +593,137 @@ pub enum LayerDragState {
     },
 }
 
+/// Telemetry from the most recent AI Subject, AI Background, or Interactive AI Select run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiMaskStatus {
+    pub engine: SegmentationEngine,
+    pub backend_label: String,
+    pub elapsed_ms: u64,
+    pub iou_score: Option<f32>,
+    pub instance_count: Option<usize>,
+    pub fallback_note: Option<String>,
+}
+
+impl AiMaskStatus {
+    pub fn from_result(res: &SmartMaskResult) -> Self {
+        Self {
+            engine: res.engine_used,
+            backend_label: res.backend_label.clone(),
+            elapsed_ms: res.elapsed_ms,
+            iou_score: res.iou_score,
+            instance_count: res.instance_count,
+            fallback_note: res.fallback_note.clone(),
+        }
+    }
+
+    /// Compact single-line badge text, e.g. `Apple Vision ANE · 48ms` or `SAM 2.1 · 18ms · IoU 0.94`.
+    pub fn compact_badge(&self) -> String {
+        let short_engine = match self.engine {
+            SegmentationEngine::AppleVision => "Apple Vision ANE",
+            SegmentationEngine::Sam21Tiny => "SAM 2.1",
+            SegmentationEngine::Sam3Tracker => "SAM 3",
+            SegmentationEngine::Heuristic => "Heuristic",
+            SegmentationEngine::Auto => self.backend_label.as_str(),
+        };
+        let mut parts = vec![short_engine.to_owned(), format!("{}ms", self.elapsed_ms)];
+        if let Some(iou) = self.iou_score {
+            parts.push(format!("IoU {:.2}", iou));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Lifecycle phase of a background ONNX model download job displayed in Settings → AI Models.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelDownloadPhase {
+    Downloading {
+        fraction: f32,
+        file_index: usize,
+        total_files: usize,
+        file_name: String,
+        bytes_downloaded: u64,
+        total_bytes: u64,
+        status: String,
+    },
+    Completed,
+    Cancelled,
+    Error(String),
+}
+
+/// Shared state for an active or recently finished ONNX model download job.
+#[derive(Clone, Debug)]
+pub struct ModelDownloadJob {
+    pub phase: ModelDownloadPhase,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl ModelDownloadJob {
+    pub fn with_phase(phase: ModelDownloadPhase) -> Self {
+        Self {
+            phase,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self.phase, ModelDownloadPhase::Downloading { .. })
+    }
+
+    pub fn apply_progress(&mut self, progress: ModelDownloadProgress) {
+        self.phase = ModelDownloadPhase::Downloading {
+            fraction: progress.overall_fraction.clamp(0.0, 1.0),
+            file_index: progress.file_index,
+            total_files: progress.total_files,
+            file_name: progress.file_name,
+            bytes_downloaded: progress.bytes_downloaded,
+            total_bytes: progress.total_bytes,
+            status: progress.status,
+        };
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII registry of active/recent ONNX model download jobs.
+///
+/// Automatically signals cancellation on every active download's `AtomicBool` when dropped
+/// (e.g. on `AppState` drop / window close), without preventing `..AppState::default()` struct
+/// update syntax.
+#[derive(Default)]
+pub struct ModelDownloadRegistry {
+    pub jobs: Arc<Mutex<HashMap<ModelId, Arc<Mutex<ModelDownloadJob>>>>>,
+}
+
+impl ModelDownloadRegistry {
+    pub fn cancel_all(&self) {
+        if let Ok(map) = self.jobs.lock() {
+            for job_arc in map.values() {
+                if let Ok(job) = job_arc.lock() {
+                    job.request_cancel();
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ModelDownloadRegistry {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
 /// Active navigation section inside the dedicated Settings view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsSection {
     #[default]
     AgentMcp,
+    AiModels,
     CliAndSkill,
     Shortcuts,
     Security,
@@ -681,6 +822,7 @@ impl ShortcutCategory {
 /// Customizable single-key actions persisted in `~/.config/rune-darkroom/settings.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShortcutAction {
+    AiSelect,
     Brush,
     Eraser,
     LinearMask,
@@ -699,7 +841,8 @@ pub enum ShortcutAction {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
+        Self::AiSelect,
         Self::Brush,
         Self::Eraser,
         Self::LinearMask,
@@ -719,6 +862,7 @@ impl ShortcutAction {
 
     pub const fn id(self) -> &'static str {
         match self {
+            Self::AiSelect => "ai_select",
             Self::Brush => "brush",
             Self::Eraser => "eraser",
             Self::LinearMask => "linear_mask",
@@ -743,6 +887,7 @@ impl ShortcutAction {
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::AiSelect => "AI Select Mask (Layers)",
             Self::Brush => "Mask Brush",
             Self::Eraser => "Mask Eraser (Layers)",
             Self::LinearMask => "Linear Gradient Mask",
@@ -763,7 +908,8 @@ impl ShortcutAction {
 
     pub const fn category(self) -> ShortcutCategory {
         match self {
-            Self::Brush
+            Self::AiSelect
+            | Self::Brush
             | Self::Eraser
             | Self::LinearMask
             | Self::RadialMask
@@ -781,6 +927,7 @@ impl ShortcutAction {
 
     pub const fn default_key(self) -> &'static str {
         match self {
+            Self::AiSelect => "w",
             Self::Brush => "b",
             Self::Eraser => "e",
             Self::LinearMask => "l",
@@ -1205,6 +1352,14 @@ pub struct AppState {
     // Interactive Capture One tools & live probe state
     pub active_tool: CanvasTool,
     pub active_layer_index: Option<usize>,
+    pub current_mods: Mods,
+    pub ai_select_points: Vec<PromptPoint>,
+    pub ai_select_bbox: Option<PromptBox>,
+    pub ai_select_bbox_preview: Option<PromptBox>,
+    pub ai_select_invert: bool,
+    pub ai_select_include_mode: bool,
+    pub ai_select_target_layer: Option<usize>,
+    pub last_ai_mask_status: Option<AiMaskStatus>,
     pub brush_radius: f32,
     pub brush_hardness: f32,
     pub brush_opacity: f32,
@@ -1288,6 +1443,14 @@ pub struct AppState {
     pub mcp_last_activity: Option<String>,
     pub mcp_copied_tag: Option<String>,
     pub app_handle: Option<AppHandle<AppState>>,
+
+    // AI Segmentation Models & Download Manager state (Settings → AI Models)
+    pub ai_model_config: AiModelConfig,
+    pub ai_model_statuses: Vec<ModelStatus>,
+    pub ai_engine_summary: ActiveEngineSummary,
+    pub ai_license_toggles: HashMap<ModelId, bool>,
+    pub ai_download_jobs: ModelDownloadRegistry,
+    pub ai_download_revision: u64,
 }
 
 fn image_camera_make_model(image: &LinearImage) -> (Option<&str>, Option<&str>) {
@@ -1365,6 +1528,13 @@ impl Default for AppState {
         let mcp_allow_live = Arc::new(AtomicBool::new(mcp_settings.allow_live_canvas_edits));
 
         let user_profiles = collect_sorted_user_profiles(&image, None);
+        let ai_model_config = load_ai_model_config().unwrap_or_default();
+        let ai_model_statuses = list_model_statuses();
+        let ai_engine_summary = active_engine_summary();
+        let mut ai_license_toggles = HashMap::new();
+        for id in ModelId::ALL {
+            ai_license_toggles.insert(id, ai_model_config.is_license_accepted(id));
+        }
 
         Self {
             image,
@@ -1439,6 +1609,14 @@ impl Default for AppState {
             hovered_info: None,
             active_tool: CanvasTool::Hand,
             active_layer_index: None,
+            current_mods: Mods::default(),
+            ai_select_points: Vec::new(),
+            ai_select_bbox: None,
+            ai_select_bbox_preview: None,
+            ai_select_invert: false,
+            ai_select_include_mode: true,
+            ai_select_target_layer: None,
+            last_ai_mask_status: None,
             brush_radius: 0.06,
             brush_hardness: 0.45,
             brush_opacity: 0.85,
@@ -1516,6 +1694,12 @@ impl Default for AppState {
             mcp_last_activity: None,
             mcp_copied_tag: None,
             app_handle: None,
+            ai_model_config,
+            ai_model_statuses,
+            ai_engine_summary,
+            ai_license_toggles,
+            ai_download_jobs: ModelDownloadRegistry::default(),
+            ai_download_revision: 0,
         }
     }
 }
@@ -1678,8 +1862,342 @@ impl AppState {
         self.hovered_info = None;
         if show {
             self.show_export = false;
+            self.refresh_ai_models();
         }
         self.mcp_copied_tag = None;
+        self.sync_window_state(tx);
+    }
+
+    /// Jumps straight from Layers / darkroom workspace into `Settings → AI Models`.
+    pub fn open_ai_models_settings_tx(&mut self, tx: &mut Tx) {
+        self.settings_section = SettingsSection::AiModels;
+        self.refresh_ai_models();
+        self.set_show_settings_tx(true, tx);
+    }
+
+    /// Reloads AI segmentation config, disk install statuses, license toggles, and engine summary.
+    pub fn refresh_ai_models(&mut self) {
+        self.ai_model_config = load_ai_model_config().unwrap_or_default();
+        self.ai_model_statuses = list_model_statuses();
+        self.ai_engine_summary = active_engine_summary();
+        for id in ModelId::ALL {
+            let entry = self.ai_license_toggles.entry(id).or_insert(false);
+            if self.ai_model_config.is_license_accepted(id) {
+                *entry = true;
+            }
+        }
+    }
+
+    pub fn refresh_ai_models_tx(&mut self, tx: &mut Tx) {
+        self.refresh_ai_models();
+        self.status_message = Some("Refreshed AI segmentation models".to_owned());
+        self.sync_window_state(tx);
+    }
+
+    /// Selects and atomically persists the active segmentation engine (`ai_models.json`).
+    pub fn set_ai_engine(&mut self, engine: SegmentationEngine) -> Result<(), String> {
+        self.ai_model_config.active_engine = engine;
+        save_ai_model_config(&self.ai_model_config).map_err(|e| e.to_string())?;
+        self.ai_model_statuses = list_model_statuses();
+        self.ai_engine_summary = active_engine_summary();
+        self.status_message = Some(format!(
+            "AI Segmentation Engine: {} ({})",
+            engine.display_name(),
+            self.ai_effective_engine_readout()
+        ));
+        Ok(())
+    }
+
+    pub fn set_ai_engine_tx(&mut self, engine: SegmentationEngine, tx: &mut Tx) {
+        if let Err(err) = self.set_ai_engine(engine) {
+            self.status_message = Some(format!("Failed to save AI model config: {err}"));
+        }
+        self.sync_window_state(tx);
+    }
+
+    /// Human-readable effective engine summary shown in `Settings → AI Models`.
+    pub fn ai_effective_engine_readout(&self) -> String {
+        let subj = match self.ai_engine_summary.effective_auto_engine {
+            SegmentationEngine::AppleVision => "Apple Vision ANE",
+            SegmentationEngine::Sam3Tracker => "SAM 3",
+            SegmentationEngine::Sam21Tiny => "SAM 2.1",
+            SegmentationEngine::Heuristic => "Heuristic",
+            SegmentationEngine::Auto => "Auto",
+        };
+        let inter = match self.ai_engine_summary.effective_interactive_engine {
+            SegmentationEngine::AppleVision => "Apple Vision ANE",
+            SegmentationEngine::Sam3Tracker => "SAM 3",
+            SegmentationEngine::Sam21Tiny => "SAM 2.1",
+            SegmentationEngine::Heuristic => "Heuristic",
+            SegmentationEngine::Auto => "Auto",
+        };
+        format!("Subject: {subj} · Interactive: {inter}")
+    }
+
+    pub fn is_ai_license_checked(&self, id: ModelId) -> bool {
+        !id.spec().requires_license_acceptance
+            || self.ai_model_config.is_license_accepted(id)
+            || self.ai_license_toggles.get(&id).copied().unwrap_or(false)
+    }
+
+    pub fn toggle_ai_license_acceptance(&mut self, id: ModelId) {
+        let next = !self.ai_license_toggles.get(&id).copied().unwrap_or(false);
+        self.ai_license_toggles.insert(id, next);
+        // If user accepts a SAM 3 license, mark both SAM 3 variants toggled so UI stays cohesive.
+        if id.is_sam3() {
+            self.ai_license_toggles
+                .insert(ModelId::Sam3TrackerQ4f16, next);
+            self.ai_license_toggles
+                .insert(ModelId::Sam3TrackerFp16, next);
+        }
+    }
+
+    /// Returns a snapshot of the current download job for `id`, if any.
+    pub fn model_download_job(&self, id: ModelId) -> Option<ModelDownloadJob> {
+        let job_arc = self
+            .ai_download_jobs
+            .jobs
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).cloned())?;
+        job_arc.lock().ok().map(|j| j.clone())
+    }
+
+    /// Starts a background download for `id` using `download_model` with live progress & cancel.
+    pub fn start_model_download(&mut self, id: ModelId) -> Result<(), String> {
+        let spec = id.spec();
+        let accepted = self.is_ai_license_checked(id);
+        if spec.requires_license_acceptance && !accepted {
+            let msg = format!(
+                "Accept the {} before downloading {}",
+                spec.license, spec.display_name
+            );
+            let job = Arc::new(Mutex::new(ModelDownloadJob::with_phase(
+                ModelDownloadPhase::Error(msg.clone()),
+            )));
+            if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+                map.insert(id, job);
+            }
+            self.status_message = Some(msg.clone());
+            return Err(msg);
+        }
+
+        if let Some(existing) = self.model_download_job(id)
+            && existing.is_active()
+        {
+            return Ok(());
+        }
+
+        let initial_job = ModelDownloadJob::with_phase(ModelDownloadPhase::Downloading {
+            fraction: 0.0,
+            file_index: 0,
+            total_files: spec.files.len(),
+            file_name: spec
+                .files
+                .first()
+                .map(|f| f.filename.to_owned())
+                .unwrap_or_default(),
+            bytes_downloaded: 0,
+            total_bytes: spec.approx_bytes,
+            status: format!("Starting {}…", spec.display_name),
+        });
+        let cancel = initial_job.cancel.clone();
+        let job = Arc::new(Mutex::new(initial_job));
+        if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+            map.insert(id, job.clone());
+        }
+        self.status_message = Some(format!("Downloading {}…", spec.display_name));
+
+        let app_handle = self.app_handle.clone();
+        std::thread::spawn(move || {
+            let progress_job = job.clone();
+            let progress_handle = app_handle.clone();
+            let result = download_model(id, accepted, Some(cancel), move |progress| {
+                if let Ok(mut guard) = progress_job.lock() {
+                    guard.apply_progress(progress);
+                }
+                if let Some(ref handle) = progress_handle {
+                    handle.update_if(|s, _| {
+                        s.ai_download_revision = s.ai_download_revision.saturating_add(1);
+                        true
+                    });
+                }
+            });
+
+            let final_status_msg = match result {
+                Ok(_status) => {
+                    if let Ok(mut guard) = job.lock() {
+                        guard.phase = ModelDownloadPhase::Completed;
+                    }
+                    format!(
+                        "Installed {} — ready for Smart Selection",
+                        spec.display_name
+                    )
+                }
+                Err(rune_editor_decode::ModelError::Cancelled(_)) => {
+                    if let Ok(mut guard) = job.lock() {
+                        guard.phase = ModelDownloadPhase::Cancelled;
+                    }
+                    format!("Cancelled download of {}", spec.display_name)
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if let Ok(mut guard) = job.lock() {
+                        guard.phase = ModelDownloadPhase::Error(msg.clone());
+                    }
+                    format!("Download failed for {}: {msg}", spec.display_name)
+                }
+            };
+
+            if let Some(handle) = app_handle {
+                handle.update_if(move |s, _| {
+                    s.ai_download_revision = s.ai_download_revision.saturating_add(1);
+                    let completed = matches!(
+                        s.model_download_job(id).map(|j| j.phase),
+                        Some(ModelDownloadPhase::Completed)
+                    );
+                    if id.is_sam3() && completed {
+                        s.persist_preferred_sam3_variant(id);
+                    } else {
+                        s.refresh_ai_models();
+                    }
+                    s.status_message = Some(final_status_msg);
+                    true
+                });
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Reloads `ai_models.json` from disk first (preserving any `accepted_licenses` written by
+    /// `download_model` / `setup_model_from_local_dir`), updates `preferred_sam3_variant`, and saves.
+    fn persist_preferred_sam3_variant_at(&mut self, config_path: &Path, id: ModelId) {
+        if !id.is_sam3() {
+            return;
+        }
+        let mut fresh = rune_editor_core::load_ai_model_config_from(config_path)
+            .unwrap_or_else(|_| self.ai_model_config.clone());
+        fresh.preferred_sam3_variant = id;
+        let _ = rune_editor_core::save_ai_model_config_to(config_path, &fresh);
+        self.ai_model_config = fresh;
+    }
+
+    fn persist_preferred_sam3_variant(&mut self, id: ModelId) {
+        let path = rune_editor_core::ai_model_config_path();
+        self.persist_preferred_sam3_variant_at(&path, id);
+        self.refresh_ai_models();
+    }
+
+    /// Signals cancellation on every active background ONNX model download job (called on Drop/close).
+    pub fn cancel_all_model_downloads(&self) {
+        self.ai_download_jobs.cancel_all();
+    }
+
+    pub fn start_model_download_tx(&mut self, id: ModelId, tx: &mut Tx) {
+        let _ = self.start_model_download(id);
+        self.sync_window_state(tx);
+    }
+
+    /// Cancels an active download job for `id` via its shared `AtomicBool`.
+    pub fn cancel_model_download(&mut self, id: ModelId) -> bool {
+        let job_arc = self
+            .ai_download_jobs
+            .jobs
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).cloned());
+        if let Some(job_arc) = job_arc
+            && let Ok(job) = job_arc.lock()
+        {
+            job.request_cancel();
+            self.status_message = Some(format!("Cancelling {} download…", id.display_name()));
+            return true;
+        }
+        false
+    }
+
+    pub fn cancel_model_download_tx(&mut self, id: ModelId, tx: &mut Tx) {
+        self.cancel_model_download(id);
+        self.sync_window_state(tx);
+    }
+
+    /// Installs model `id` offline from a local directory using `setup_model_from_local_dir`.
+    pub fn import_model_from_local_dir(&mut self, id: ModelId, dir: &Path) -> Result<(), String> {
+        let accepted = self.is_ai_license_checked(id);
+        match setup_model_from_local_dir(id, dir, accepted) {
+            Ok(_) => {
+                if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+                    map.remove(&id);
+                }
+                if id.is_sam3() {
+                    self.persist_preferred_sam3_variant(id);
+                } else {
+                    self.refresh_ai_models();
+                }
+                self.status_message = Some(format!(
+                    "Imported {} from {}",
+                    id.display_name(),
+                    dir.display()
+                ));
+                Ok(())
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let job = Arc::new(Mutex::new(ModelDownloadJob::with_phase(
+                    ModelDownloadPhase::Error(msg.clone()),
+                )));
+                if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+                    map.insert(id, job);
+                }
+                self.status_message = Some(format!("Import failed: {msg}"));
+                Err(msg)
+            }
+        }
+    }
+
+    pub fn import_model_from_local_dir_tx(&mut self, id: ModelId, dir: PathBuf, tx: &mut Tx) {
+        let _ = self.import_model_from_local_dir(id, &dir);
+        self.sync_window_state(tx);
+    }
+
+    /// Removes installed/partial files for `id` from `models_root_dir()`.
+    pub fn remove_ai_model(&mut self, id: ModelId) -> Result<(), String> {
+        remove_model(id).map_err(|e| e.to_string())?;
+        if let Ok(mut map) = self.ai_download_jobs.jobs.lock() {
+            map.remove(&id);
+        }
+        self.refresh_ai_models();
+        self.status_message = Some(format!("Removed {}", id.display_name()));
+        Ok(())
+    }
+
+    pub fn remove_ai_model_tx(&mut self, id: ModelId, tx: &mut Tx) {
+        if let Err(err) = self.remove_ai_model(id) {
+            self.status_message = Some(format!("Failed to remove {}: {err}", id.display_name()));
+        }
+        self.sync_window_state(tx);
+    }
+
+    /// Opens `models_root_dir()` in Finder (macOS) or the OS file manager.
+    pub fn open_ai_models_folder_tx(&mut self, tx: &mut Tx) {
+        let dir = models_root_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(target_os = "macos")]
+        let res = Command::new("open").arg(&dir).spawn();
+        #[cfg(target_os = "linux")]
+        let res = Command::new("xdg-open").arg(&dir).spawn();
+        #[cfg(target_os = "windows")]
+        let res = Command::new("explorer").arg(&dir).spawn();
+
+        match res {
+            Ok(_) => {
+                self.status_message = Some(format!("Opened models folder: {}", dir.display()));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Could not open models folder: {err}"));
+            }
+        }
         self.sync_window_state(tx);
     }
 
@@ -1802,6 +2320,7 @@ impl AppState {
         self.speed_edit_snapshot = None;
         self.crop_drag = None;
         self.layer_drag = None;
+        self.ai_select_bbox_preview = None;
         self.drag_undo_snapshot = None;
         self.dragging_curve_pt = None;
         self.last_drag_pos = None;
@@ -3014,7 +3533,15 @@ impl AppState {
 
     pub fn select_layer(&mut self, index: Option<usize>) {
         let len = self.recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS);
-        self.active_layer_index = index.filter(|&i| i < len);
+        let next_idx = index.filter(|&i| i < len);
+        if next_idx != self.ai_select_target_layer {
+            self.ai_select_points.clear();
+            self.ai_select_bbox = None;
+            self.ai_select_bbox_preview = None;
+            self.ai_select_invert = false;
+            self.ai_select_target_layer = next_idx;
+        }
+        self.active_layer_index = next_idx;
         self.sync_active_layer_camera();
         self.status_message = Some(match self.active_layer_index {
             Some(i) => format!("Selected layer: {}", self.recipe.layers[i].name),
@@ -3030,6 +3557,7 @@ impl AppState {
     pub fn set_canvas_tool(&mut self, tool: CanvasTool) {
         self.active_tool = tool;
         self.layer_drag = None;
+        self.ai_select_bbox_preview = None;
         if tool.is_retouch_or_mask() {
             self.camera.crop_mode = false;
             self.crop_drag = None;
@@ -3043,11 +3571,18 @@ impl AppState {
             if matches!(tool, CanvasTool::Heal | CanvasTool::Clone) {
                 self.heal_open = true;
             }
+            if tool == CanvasTool::AiSelect {
+                self.layers_open = true;
+                self.ai_select_target_layer = self.active_layer_index;
+            }
         }
-        self.status_message = Some(if tool == CanvasTool::Hand {
-            "Hand cursor active".to_owned()
-        } else {
-            format!("Tool: {} — drag on photo • Esc for Hand", tool.label())
+        self.status_message = Some(match tool {
+            CanvasTool::Hand => "Hand cursor active".to_owned(),
+            CanvasTool::AiSelect => {
+                "AI Select: Click to include · ⌥Click to exclude · ⇧Drag for box · Esc done"
+                    .to_owned()
+            }
+            _ => format!("Tool: {} — drag on photo • Esc for Hand", tool.label()),
         });
     }
 
@@ -3218,13 +3753,44 @@ impl AppState {
     }
 
     pub fn add_ai_subject_layer(&mut self, background: bool) -> Option<usize> {
-        let mask = generate_subject_mask(&self.image, background);
+        let prompt = if background {
+            SmartMaskPrompt::AutoBackground
+        } else {
+            SmartMaskPrompt::AutoSubject
+        };
         let name = if background {
             "AI Background".to_owned()
         } else {
             "AI Subject".to_owned()
         };
-        self.add_layer_with_shape(name, Some(mask))
+
+        let (mask, status) = match generate_smart_mask(&self.image, &prompt, None) {
+            Ok(res) => {
+                let status = AiMaskStatus::from_result(&res);
+                (res.mask, status)
+            }
+            Err(err) => {
+                let mask = generate_heuristic_mask(&self.image, background);
+                let status = AiMaskStatus {
+                    engine: SegmentationEngine::Heuristic,
+                    backend_label: "Heuristic Fallback".to_owned(),
+                    elapsed_ms: 0,
+                    iou_score: None,
+                    instance_count: None,
+                    fallback_note: Some(err.to_string()),
+                };
+                (mask, status)
+            }
+        };
+
+        let idx = self.add_layer_with_shape(name.clone(), Some(mask))?;
+        let mut msg = format!("{name} · {}", status.compact_badge());
+        if let Some(note) = &status.fallback_note {
+            msg.push_str(&format!(" ({note})"));
+        }
+        self.last_ai_mask_status = Some(status);
+        self.status_message = Some(msg);
+        Some(idx)
     }
 
     pub fn add_ai_subject_layer_tx(&mut self, background: bool, tx: &mut Tx) {
@@ -3232,6 +3798,156 @@ impl AppState {
             self.set_mask_overlay_mode(1);
         }
         self.sync_window_state(tx);
+    }
+
+    /// Runs interactive `AI Select` segmentation for current `ai_select_points` + `ai_select_bbox`,
+    /// creating or updating the active layer's `RasterMask` and turning on Rubylith overlay.
+    pub fn run_ai_select_segmentation(&mut self) -> bool {
+        if self.ai_select_points.is_empty() && self.ai_select_bbox.is_none() {
+            return false;
+        }
+        let prompt = SmartMaskPrompt::Interactive {
+            points: self.ai_select_points.clone(),
+            bbox: self.ai_select_bbox,
+            invert: self.ai_select_invert,
+        };
+        match generate_smart_mask(&self.image, &prompt, None) {
+            Ok(res) => {
+                let status = AiMaskStatus::from_result(&res);
+                let mut next = self.recipe.clone();
+                let target_idx = self
+                    .ai_select_target_layer
+                    .or(self.active_layer_index)
+                    .filter(|&i| i < next.layers.len());
+
+                let layer_idx = if let Some(idx) = target_idx {
+                    if let Some(mi) = next.layers[idx]
+                        .masks
+                        .iter()
+                        .rposition(|m| matches!(m.shape, MaskShape::RasterMask { .. }))
+                    {
+                        next.layers[idx].masks[mi].shape = res.mask;
+                    } else if next.layers[idx].masks.len() < MAX_MASKS_PER_LAYER {
+                        next.layers[idx].masks.push(LayerMaskItem::new(res.mask));
+                    } else if let Some(last) = next.layers[idx].masks.last_mut() {
+                        last.shape = res.mask;
+                    }
+                    idx
+                } else {
+                    if next.layers.len() >= MAX_ADJUSTMENT_LAYERS {
+                        self.status_message = Some(format!(
+                            "Maximum {MAX_ADJUSTMENT_LAYERS} adjustment layers reached"
+                        ));
+                        return false;
+                    }
+                    let id = self.next_layer_id();
+                    next.layers.push(AdjustmentLayer::new_with_mask(
+                        id,
+                        "AI Selection".to_owned(),
+                        res.mask,
+                    ));
+                    next.layers.len() - 1
+                };
+
+                next.preset_name = None;
+                self.active_layer_index = Some(layer_idx);
+                self.ai_select_target_layer = Some(layer_idx);
+                let mut msg = format!("AI Select · {}", status.compact_badge());
+                if let Some(note) = &status.fallback_note {
+                    msg.push_str(&format!(" ({note})"));
+                }
+                self.last_ai_mask_status = Some(status);
+                self.commit_recipe_change(next, msg);
+                if self.camera.mask_overlay_mode == 0 {
+                    self.camera.mask_overlay_mode = 1;
+                }
+                self.sync_active_layer_camera();
+                true
+            }
+            Err(err) => {
+                self.status_message = Some(format!("AI Select failed: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Appends a normalized `[0, 1]` prompt point (`+ Include` or `− Exclude`) and segments immediately.
+    pub fn ai_select_add_point(&mut self, u: f32, v: f32, positive: bool) -> bool {
+        if self.ai_select_points.len() >= MAX_PROMPT_POINTS {
+            self.status_message = Some(format!(
+                "Maximum {MAX_PROMPT_POINTS} AI Select prompt points reached"
+            ));
+            return false;
+        }
+        self.ai_select_points
+            .push(PromptPoint::new(u, v, positive).sanitized());
+        self.run_ai_select_segmentation()
+    }
+
+    /// Sets the interactive bounding box (`PromptBox`) and runs segmentation immediately.
+    pub fn ai_select_set_bbox(&mut self, bbox: PromptBox) -> bool {
+        let clean = bbox.sanitized();
+        if !clean.is_valid() {
+            return false;
+        }
+        self.ai_select_bbox = Some(clean);
+        self.ai_select_bbox_preview = None;
+        self.run_ai_select_segmentation()
+    }
+
+    /// Toggles `AI Select` mask inversion and re-segments (or flips active layer invert if no prompts).
+    pub fn ai_select_toggle_invert(&mut self) -> bool {
+        self.ai_select_invert = !self.ai_select_invert;
+        if !self.ai_select_points.is_empty() || self.ai_select_bbox.is_some() {
+            self.run_ai_select_segmentation()
+        } else {
+            self.toggle_active_layer_invert()
+        }
+    }
+
+    pub fn ai_select_toggle_invert_tx(&mut self, tx: &mut Tx) {
+        if self.ai_select_toggle_invert() {
+            self.sync_window_state(tx);
+        }
+    }
+
+    /// Clears interactive prompt points & bounding box without discarding the active layer mask.
+    pub fn ai_select_clear_points(&mut self) {
+        self.ai_select_points.clear();
+        self.ai_select_bbox = None;
+        self.ai_select_bbox_preview = None;
+        self.ai_select_invert = false;
+        self.status_message = Some("Cleared AI Select prompts".to_owned());
+    }
+
+    pub fn ai_select_clear_points_tx(&mut self, tx: &mut Tx) {
+        self.ai_select_clear_points();
+        self.sync_window_state(tx);
+    }
+
+    /// Finishes the interactive `AI Select` session, keeping the mask and returning to Hand cursor.
+    pub fn ai_select_done(&mut self) {
+        self.ai_select_points.clear();
+        self.ai_select_bbox = None;
+        self.ai_select_bbox_preview = None;
+        self.ai_select_invert = false;
+        self.ai_select_target_layer = None;
+        self.set_canvas_tool(CanvasTool::Hand);
+    }
+
+    pub fn ai_select_done_tx(&mut self, tx: &mut Tx) {
+        self.ai_select_done();
+        self.sync_window_state(tx);
+    }
+
+    /// Clears all interactive AI Select prompt state & telemetry when switching photos.
+    pub fn reset_ai_select_for_photo_switch(&mut self) {
+        self.ai_select_points.clear();
+        self.ai_select_bbox = None;
+        self.ai_select_bbox_preview = None;
+        self.ai_select_invert = false;
+        self.ai_select_target_layer = None;
+        self.last_ai_mask_status = None;
     }
 
     pub fn duplicate_layer_tx(&mut self, idx: usize, tx: &mut Tx) {
@@ -3245,6 +3961,11 @@ impl AppState {
         let insert_at = idx + 1;
         next.layers.insert(insert_at, cloned);
         next.preset_name = None;
+        if let Some(t) = self.ai_select_target_layer
+            && insert_at <= t
+        {
+            self.ai_select_target_layer = Some(t + 1);
+        }
         self.active_layer_index = Some(insert_at);
         self.commit_recipe_change(next, "Duplicated adjustment layer");
         self.sync_window_state(tx);
@@ -3266,6 +3987,17 @@ impl AppState {
                 self.active_layer_index = Some(cur - 1);
             }
         }
+        if let Some(t) = self.ai_select_target_layer {
+            if t == idx {
+                self.ai_select_target_layer = None;
+                self.ai_select_points.clear();
+                self.ai_select_bbox = None;
+                self.ai_select_bbox_preview = None;
+                self.ai_select_invert = false;
+            } else if idx < t {
+                self.ai_select_target_layer = Some(t - 1);
+            }
+        }
         self.commit_recipe_change(next, format!("Deleted layer: {}", removed.name));
         true
     }
@@ -3276,14 +4008,14 @@ impl AppState {
         }
     }
 
-    pub fn move_layer_tx(&mut self, idx: usize, delta: isize, tx: &mut Tx) {
+    pub fn move_layer(&mut self, idx: usize, delta: isize) -> bool {
         let len = self.recipe.layers.len();
         if idx >= len {
-            return;
+            return false;
         }
         let target = idx as isize + delta;
         if target < 0 || target >= len as isize {
-            return;
+            return false;
         }
         let target = target as usize;
         let mut next = self.recipe.clone();
@@ -3294,8 +4026,19 @@ impl AppState {
         } else if self.active_layer_index == Some(target) {
             self.active_layer_index = Some(idx);
         }
+        if self.ai_select_target_layer == Some(idx) {
+            self.ai_select_target_layer = Some(target);
+        } else if self.ai_select_target_layer == Some(target) {
+            self.ai_select_target_layer = Some(idx);
+        }
         self.commit_recipe_change(next, "Reordered adjustment layer");
-        self.sync_window_state(tx);
+        true
+    }
+
+    pub fn move_layer_tx(&mut self, idx: usize, delta: isize, tx: &mut Tx) {
+        if self.move_layer(idx, delta) {
+            self.sync_window_state(tx);
+        }
     }
 
     pub fn toggle_layer_enabled_tx(&mut self, idx: usize, tx: &mut Tx) {
@@ -3500,16 +4243,28 @@ impl AppState {
         self.sync_window_state(tx);
     }
 
-    /// Interactive canvas drag start for Brush, Eraser, Linear/Radial Gradient, and Heal/Clone.
+    /// Interactive canvas drag start for AI Select, Brush, Eraser, Linear/Radial Gradient, and Heal/Clone.
     pub fn begin_canvas_tool_drag(&mut self, local_x: f32, local_y: f32) {
         let Some([su, sv]) = self.viewport_local_to_source_uv(local_x, local_y) else {
             return;
         };
+        if self.active_tool == CanvasTool::AiSelect {
+            self.layer_drag = Some(LayerDragState::AiSelect {
+                start_uv: [su, sv],
+                current_uv: [su, sv],
+                start_local: [local_x, local_y],
+                shift_held: self.current_mods.shift,
+                alt_held: self.current_mods.alt,
+                dragging_box: false,
+            });
+            self.ai_select_bbox_preview = None;
+            return;
+        }
         if self.drag_undo_snapshot.is_none() {
             self.drag_undo_snapshot = Some(self.recipe.clone());
         }
         match self.active_tool {
-            CanvasTool::Hand => {}
+            CanvasTool::Hand | CanvasTool::AiSelect => {}
             CanvasTool::Brush | CanvasTool::Eraser => {
                 let erase = self.active_tool == CanvasTool::Eraser;
                 let layer_idx = match self.active_layer_index {
@@ -3700,6 +4455,30 @@ impl AppState {
             return;
         };
         match drag {
+            LayerDragState::AiSelect {
+                start_uv,
+                start_local,
+                shift_held,
+                alt_held,
+                dragging_box,
+                ..
+            } => {
+                let shift_now = shift_held || self.current_mods.shift;
+                let moved = (local_x - start_local[0]).hypot(local_y - start_local[1]);
+                let is_box = dragging_box || (shift_now && moved >= 4.0);
+                self.layer_drag = Some(LayerDragState::AiSelect {
+                    start_uv,
+                    current_uv: [su, sv],
+                    start_local,
+                    shift_held: shift_now,
+                    alt_held,
+                    dragging_box: is_box,
+                });
+                if is_box {
+                    self.ai_select_bbox_preview =
+                        Some(PromptBox::new(start_uv[0], start_uv[1], su, sv).sanitized());
+                }
+            }
             LayerDragState::Brush {
                 layer_idx,
                 mask_idx,
@@ -3765,7 +4544,27 @@ impl AppState {
         }
     }
 
-    pub fn end_canvas_tool_drag_tx(&mut self, tx: &mut Tx) {
+    pub fn finish_canvas_tool_drag(&mut self) {
+        if let Some(LayerDragState::AiSelect {
+            start_uv,
+            current_uv,
+            shift_held,
+            alt_held,
+            dragging_box,
+            ..
+        }) = self.layer_drag.take()
+        {
+            self.ai_select_bbox_preview = None;
+            let candidate_box =
+                PromptBox::new(start_uv[0], start_uv[1], current_uv[0], current_uv[1]).sanitized();
+            if (dragging_box || shift_held) && candidate_box.is_valid() {
+                self.ai_select_set_bbox(candidate_box);
+            } else {
+                let positive = self.ai_select_include_mode && !alt_held;
+                self.ai_select_add_point(start_uv[0], start_uv[1], positive);
+            }
+            return;
+        }
         self.layer_drag = None;
         self.recipe.preset_name = None;
         self.catalog.update_active_recipe(self.recipe.clone());
@@ -3775,6 +4574,10 @@ impl AppState {
             self.history.push(prev);
         }
         self.recompute_histogram();
+    }
+
+    pub fn end_canvas_tool_drag_tx(&mut self, tx: &mut Tx) {
+        self.finish_canvas_tool_drag();
         self.sync_window_state(tx);
     }
 
@@ -4693,6 +5496,7 @@ impl AppState {
                 self.saved_recipe = restored_meta.recipe;
                 self.refresh_user_profiles();
                 self.clear_transient_interactions();
+                self.reset_ai_select_for_photo_switch();
                 self.history.clear();
                 self.camera.reset();
                 self.wb_eyedropper_active = false;
@@ -4824,6 +5628,7 @@ impl AppState {
             self.recipe = entry.meta.recipe.clone();
             self.saved_recipe = entry.meta.recipe;
             self.clear_transient_interactions();
+            self.reset_ai_select_for_photo_switch();
             self.wb_eyedropper_active = false;
             self.color_slice_picker_active = false;
             self.skin_picker_active = false;
@@ -4864,6 +5669,7 @@ impl AppState {
                 self.saved_recipe = entry.meta.recipe;
                 self.refresh_user_profiles();
                 self.clear_transient_interactions();
+                self.reset_ai_select_for_photo_switch();
                 self.history.clear();
                 self.camera.reset();
                 self.wb_eyedropper_active = false;
@@ -5812,7 +6618,8 @@ mod tests {
         assert!(s.toggle_active_layer_invert());
         assert!(s.recipe.layers[0].inverted);
 
-        // AI Subject mask generation adds a valid 256×256 RasterMask layer
+        // AI Subject mask generation adds a valid 512×512 RasterMask layer
+        const MASK_DIM: u32 = rune_editor_core::LAYER_MASK_TILE_SIZE as u32;
         let l1 = s
             .add_ai_subject_layer(false)
             .expect("AI subject layer added");
@@ -5820,11 +6627,12 @@ mod tests {
         assert!(matches!(
             s.recipe.layers[1].masks[0].shape,
             MaskShape::RasterMask {
-                width: 256,
-                height: 256,
+                width: MASK_DIM,
+                height: MASK_DIM,
                 ..
             }
         ));
+        assert!(s.last_ai_mask_status.is_some());
         assert_eq!(s.mcp_shared_canvas.lock().unwrap().recipe.layers.len(), 2);
 
         // Spot Heal & Clone creation + MCP sync + undo
@@ -6226,5 +7034,300 @@ LUT_3D_SIZE 2
         assert!(s.delete_active_variant());
         assert_eq!(s.recipe.camera_profile, "auto");
         assert_eq!(s.active_raw_decode_mode, RawDecodeMode::Linear);
+    }
+
+    #[test]
+    fn ai_select_tool_points_bbox_invert_and_undo() {
+        const MASK_DIM: u32 = rune_editor_core::LAYER_MASK_TILE_SIZE as u32;
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+
+        // 1. Activating AiSelect switches to Layers tab and advertises shortcut W
+        assert_eq!(ShortcutAction::AiSelect.default_key(), "w");
+        s.set_canvas_tool(CanvasTool::AiSelect);
+        assert_eq!(s.active_tool, CanvasTool::AiSelect);
+        assert!(s.active_tool.is_retouch_or_mask());
+        assert_eq!(s.active_tool.hud_badge(), "AI SELECT (W)");
+        assert_eq!(s.active_tab, InspectorTab::Layers);
+
+        // 2. Positive prompt point creates a 512×512 RasterMask layer, enables mask overlay, pushes undo & syncs MCP
+        assert!(s.ai_select_add_point(0.50, 0.45, true));
+        assert_eq!(s.ai_select_points.len(), 1);
+        assert!(s.ai_select_points[0].positive);
+        assert_eq!(s.recipe.layers.len(), 1);
+        assert_eq!(s.active_layer_index, Some(0));
+        assert_eq!(s.camera.mask_overlay_mode, 1);
+        assert!(s.last_ai_mask_status.is_some());
+        assert!(s.history.can_undo());
+        assert_eq!(s.mcp_shared_canvas.lock().unwrap().recipe.layers.len(), 1);
+        assert!(matches!(
+            s.recipe.layers[0].masks[0].shape,
+            MaskShape::RasterMask {
+                width: MASK_DIM,
+                height: MASK_DIM,
+                ..
+            }
+        ));
+
+        // 3. Negative prompt point refines the SAME layer rather than spawning a second layer
+        assert!(s.ai_select_add_point(0.12, 0.18, false));
+        assert_eq!(s.ai_select_points.len(), 2);
+        assert!(!s.ai_select_points[1].positive);
+        assert_eq!(s.recipe.layers.len(), 1);
+
+        // 4. Shift+Drag produces a live bbox preview before release
+        s.current_mods.shift = true;
+        s.begin_canvas_tool_drag(260.0, 140.0);
+        s.update_canvas_tool_drag(540.0, 460.0);
+        assert!(
+            s.ai_select_bbox_preview.is_some(),
+            "Shift+Drag must populate live bounding-box preview"
+        );
+        let preview_box = s.ai_select_bbox_preview.unwrap();
+        assert!(preview_box.is_valid());
+        s.current_mods.shift = false;
+        s.layer_drag = None;
+
+        // 5. Committing bbox + toggling Invert updates the 512×512 RasterMask and pushes undo
+        assert!(s.ai_select_set_bbox(preview_box));
+        assert_eq!(s.ai_select_bbox, Some(preview_box.sanitized()));
+        assert!(s.ai_select_bbox_preview.is_none());
+
+        let mask_before_invert = s.recipe.layers[0].masks[0].shape.clone();
+        assert!(s.ai_select_toggle_invert());
+        assert!(s.ai_select_invert);
+        let mask_after_invert = s.recipe.layers[0].masks[0].shape.clone();
+        assert_ne!(
+            mask_before_invert, mask_after_invert,
+            "inverting interactive AI selection must invert the generated RasterMask"
+        );
+
+        // 6. Undo restores pre-invert mask cleanly
+        s.undo();
+        assert_eq!(s.recipe.layers[0].masks[0].shape, mask_before_invert);
+
+        // 7. Clear Points & Done preserve the layer mask while clearing transient prompts and returning to Hand
+        s.ai_select_clear_points();
+        assert!(s.ai_select_points.is_empty());
+        assert!(s.ai_select_bbox.is_none());
+        assert!(!s.ai_select_invert);
+        assert_eq!(s.recipe.layers.len(), 1);
+
+        s.ai_select_done();
+        assert_eq!(s.active_tool, CanvasTool::Hand);
+        assert!(s.ai_select_target_layer.is_none());
+        assert_eq!(s.recipe.layers.len(), 1);
+    }
+
+    #[test]
+    fn settings_ai_models_config_license_gate_and_download_job_state() {
+        let mut s = AppState::default();
+
+        // 1. All 3 downloadable models are cataloged and effective engine readout is populated
+        assert_eq!(s.ai_model_statuses.len(), ModelId::ALL.len());
+        let readout = s.ai_effective_engine_readout();
+        assert!(
+            readout.contains("Subject:") && readout.contains("Interactive:"),
+            "unexpected effective engine readout: {readout}"
+        );
+
+        // 2. SAM 3 license gate blocks download when unchecked and toggles cleanly across SAM 3 variants
+        s.ai_model_config.accepted_licenses.clear();
+        s.ai_license_toggles
+            .insert(ModelId::Sam3TrackerQ4f16, false);
+        s.ai_license_toggles.insert(ModelId::Sam3TrackerFp16, false);
+        assert!(!s.is_ai_license_checked(ModelId::Sam3TrackerQ4f16));
+        assert!(s.is_ai_license_checked(ModelId::Sam21HieraTinyFp16));
+        let err = s
+            .start_model_download(ModelId::Sam3TrackerQ4f16)
+            .expect_err("SAM 3 download must be blocked until license checkbox is accepted");
+        assert!(err.contains("Meta SAM License"));
+        let job = s
+            .model_download_job(ModelId::Sam3TrackerQ4f16)
+            .expect("blocked download records error job state");
+        assert!(matches!(job.phase, ModelDownloadPhase::Error(_)));
+
+        s.toggle_ai_license_acceptance(ModelId::Sam3TrackerQ4f16);
+        assert!(s.is_ai_license_checked(ModelId::Sam3TrackerQ4f16));
+        assert!(s.is_ai_license_checked(ModelId::Sam3TrackerFp16));
+
+        // 3. ModelDownloadJob progress & AtomicBool cancellation lifecycle
+        let mut dl_job = ModelDownloadJob::with_phase(ModelDownloadPhase::Completed);
+        assert!(!dl_job.is_active());
+        assert!(!dl_job.is_cancel_requested());
+        dl_job.apply_progress(ModelDownloadProgress {
+            model_id: ModelId::Sam21HieraTinyFp16,
+            file_index: 1,
+            total_files: 4,
+            file_name: "vision_encoder_fp16.onnx_data".to_owned(),
+            bytes_downloaded: 33_500_000,
+            total_bytes: 67_005_504,
+            overall_fraction: 0.43,
+            status: "Downloading vision_encoder_fp16.onnx_data".to_owned(),
+        });
+        assert!(dl_job.is_active());
+        let shared_job = Arc::new(Mutex::new(dl_job));
+        s.ai_download_jobs
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(ModelId::Sam21HieraTinyFp16, shared_job);
+        assert!(s.cancel_model_download(ModelId::Sam21HieraTinyFp16));
+        assert!(
+            s.model_download_job(ModelId::Sam21HieraTinyFp16)
+                .unwrap()
+                .is_cancel_requested()
+        );
+
+        // 4. Hermetic AiModelConfig save/load roundtrip into temp file
+        let tmp_cfg = std::env::temp_dir().join(format!(
+            "rune_darkroom_ai_cfg_test_{}.json",
+            std::process::id()
+        ));
+        let mut cfg = AiModelConfig {
+            active_engine: SegmentationEngine::Sam21Tiny,
+            ..AiModelConfig::default()
+        };
+        cfg.accept_license(ModelId::Sam3TrackerQ4f16);
+        rune_editor_core::save_ai_model_config_to(&tmp_cfg, &cfg).unwrap();
+        let reloaded = rune_editor_core::load_ai_model_config_from(&tmp_cfg).unwrap();
+        assert_eq!(reloaded.active_engine, SegmentationEngine::Sam21Tiny);
+        assert!(reloaded.is_license_accepted(ModelId::Sam3TrackerQ4f16));
+
+        // 5. P1 #1 regression: persisting preferred SAM 3 variant reloads disk `accepted_licenses`
+        //    so a stale in-memory `ai_model_config` never wipes license acceptance written on disk.
+        s.ai_model_config = AiModelConfig::default();
+        assert!(
+            !s.ai_model_config
+                .is_license_accepted(ModelId::Sam3TrackerQ4f16)
+        );
+        s.persist_preferred_sam3_variant_at(&tmp_cfg, ModelId::Sam3TrackerFp16);
+        let after_variant = rune_editor_core::load_ai_model_config_from(&tmp_cfg).unwrap();
+        assert_eq!(
+            after_variant.preferred_sam3_variant,
+            ModelId::Sam3TrackerFp16
+        );
+        assert!(
+            after_variant.is_license_accepted(ModelId::Sam3TrackerQ4f16),
+            "persisting preferred SAM 3 variant must preserve accepted_licenses from disk"
+        );
+        let _ = std::fs::remove_file(&tmp_cfg);
+
+        // 6. P1 #4 regression: dropping AppState cancels all active background download jobs.
+        let drop_cancel_flag = {
+            let doomed = AppState::default();
+            let job = ModelDownloadJob::with_phase(ModelDownloadPhase::Downloading {
+                fraction: 0.25,
+                file_index: 0,
+                total_files: 4,
+                file_name: "vision_encoder_fp16.onnx_data".to_owned(),
+                bytes_downloaded: 10_000_000,
+                total_bytes: 67_005_504,
+                status: "Downloading".to_owned(),
+            });
+            let flag = job.cancel.clone();
+            doomed
+                .ai_download_jobs
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(ModelId::Sam21HieraTinyFp16, Arc::new(Mutex::new(job)));
+            assert!(!flag.load(Ordering::Relaxed));
+            drop(doomed);
+            flag
+        };
+        assert!(
+            drop_cancel_flag.load(Ordering::Relaxed),
+            "dropping AppState must signal cancel on active download jobs"
+        );
+    }
+
+    #[test]
+    fn ai_select_reversed_bbox_photo_switch_and_layer_stack_invariants() {
+        let mut s = AppState {
+            viewport_rect_pts: [800.0, 600.0],
+            viewport_scale: 1.0,
+            ..AppState::default()
+        };
+        s.set_canvas_tool(CanvasTool::AiSelect);
+
+        // 1. P1 #2 regression: reversed Shift+Drag directions (BR->TL, R->L, B->T) commit a valid
+        //    sanitized PromptBox and never fall back to dropping a click point.
+        for (start_xy, end_xy) in [
+            ((540.0, 460.0), (260.0, 140.0)), // bottom-right -> top-left
+            ((540.0, 140.0), (260.0, 460.0)), // top-right -> bottom-left
+            ((260.0, 460.0), (540.0, 140.0)), // bottom-left -> top-right
+        ] {
+            s.ai_select_clear_points();
+            s.current_mods.shift = true;
+            s.begin_canvas_tool_drag(start_xy.0, start_xy.1);
+            s.update_canvas_tool_drag(end_xy.0, end_xy.1);
+            let preview = s
+                .ai_select_bbox_preview
+                .expect("reversed Shift+Drag must produce sanitized preview box");
+            assert!(preview.is_valid(), "preview must be valid: {preview:?}");
+            s.finish_canvas_tool_drag();
+            s.current_mods.shift = false;
+            assert!(
+                s.ai_select_bbox.is_some_and(|b| b.is_valid()),
+                "reversed Shift+Drag must commit a valid PromptBox"
+            );
+            assert!(
+                s.ai_select_points.is_empty(),
+                "reversed Shift+Drag must not fall back to adding a click point"
+            );
+        }
+
+        // 2. P1 #3 regression: layer stack edits (select_layer, move_layer, remove_layer) keep
+        //    ai_select_target_layer synchronized and never overwrite the wrong layer.
+        assert_eq!(s.recipe.layers.len(), 1);
+        assert_eq!(s.ai_select_target_layer, Some(0));
+        let l1 = s
+            .add_layer_with_shape("Second Layer".to_owned(), Some(MaskShape::Filled))
+            .expect("second layer added");
+        assert_eq!(l1, 1);
+        // Selecting layer 1 clears old prompts and rebinds target to layer 1
+        s.ai_select_add_point(0.5, 0.5, true);
+        assert_eq!(s.ai_select_target_layer, Some(0));
+        s.select_layer(Some(1));
+        assert_eq!(s.ai_select_target_layer, Some(1));
+        assert!(s.ai_select_points.is_empty());
+        assert!(s.ai_select_bbox.is_none());
+
+        // Moving layer 1 down to index 0 updates ai_select_target_layer 1 -> 0
+        assert!(s.move_layer(1, -1));
+        assert_eq!(s.ai_select_target_layer, Some(0));
+
+        // Removing layer 0 clears ai_select_target_layer & prompts
+        s.ai_select_points.push(PromptPoint::new(0.4, 0.4, true));
+        assert!(s.remove_layer(0));
+        assert_eq!(s.ai_select_target_layer, None);
+        assert!(s.ai_select_points.is_empty());
+
+        // Removing a lower-index layer decrements ai_select_target_layer
+        let l_top = s
+            .add_layer_with_shape("Top Layer".to_owned(), Some(MaskShape::Filled))
+            .unwrap();
+        assert_eq!(l_top, 1);
+        s.select_layer(Some(1));
+        assert_eq!(s.ai_select_target_layer, Some(1));
+        assert!(s.remove_layer(0));
+        assert_eq!(s.ai_select_target_layer, Some(0));
+
+        // 3. P1 #3 regression: photo switch clears points, bbox, invert, target layer, and telemetry
+        s.ai_select_add_point(0.5, 0.45, true);
+        s.ai_select_invert = true;
+        assert!(!s.ai_select_points.is_empty());
+        assert!(s.last_ai_mask_status.is_some());
+        s.reset_ai_select_for_photo_switch();
+        assert!(s.ai_select_points.is_empty());
+        assert!(s.ai_select_bbox.is_none());
+        assert!(s.ai_select_bbox_preview.is_none());
+        assert!(!s.ai_select_invert);
+        assert!(s.ai_select_target_layer.is_none());
+        assert!(s.last_ai_mask_status.is_none());
     }
 }

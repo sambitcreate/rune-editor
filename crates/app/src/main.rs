@@ -27,14 +27,14 @@ mod widgets;
 
 use rune::{
     App, AppSpec, CloseResponse, Color, ColorScheme, Cursor, Cx, Drag, El, Key, KeyEvent, LineCap,
-    MacColorSpace, MacWindowOptions, MagnifyEvent, Phase, PointerEvent, PrewarmEffects,
+    MacColorSpace, MacWindowOptions, MagnifyEvent, Mods, Phase, PointerEvent, PrewarmEffects,
     RotateEvent, Shape, SurfaceFit, Titlebar, Tx, WheelEvent, col, effect, el, row, text,
 };
 use rune_editor_core::{
     AdjustmentLayer, ClarityMethod, ColorTag, ColorWheel, CompositionGrid, CropAspect, CullFlag,
     FilmCurve, FilmNegativeParams, GrainType, HealMode, HealSpot, HslBand, LayerMaskItem,
-    LocalAdjustments, MaskCombineOp, MaskShape, ProcessingMode, ToneCurves, UserStyle,
-    VignetteMethod, WbPreset, auto_levels,
+    LocalAdjustments, MaskCombineOp, MaskShape, ProcessingMode, PromptBox, PromptPoint, ToneCurves,
+    UserStyle, VignetteMethod, WbPreset, auto_levels,
 };
 use rune_editor_decode::{ExportColorSpace, WatermarkPosition};
 use rune_kit::{
@@ -612,6 +612,42 @@ fn photo_viewport(s: &AppState, k: &Kit) -> El {
                 .justify_center()
                 .child(pill),
         );
+    } else if s.active_tool == CanvasTool::AiSelect {
+        let mode_hint = if s.ai_select_include_mode {
+            "Click: +Include  •  ⌥Click: −Exclude  •  ⇧Drag: Box  •  Esc: Done"
+        } else {
+            "Exclude Mode — Click: −Exclude  •  ⇧Drag: Box  •  Esc: Done"
+        };
+        let pill = k.elevate(
+            row()
+                .key("hud-ai-select")
+                .items_center()
+                .gap(space::MD)
+                .px(space::XXL)
+                .py(space::CONTROL)
+                .radius(k.radius.lg)
+                .continuous_corners()
+                .backdrop_blur(size::HUD_BLUR_STRONG)
+                .fill(color::hud_surface_strong(k))
+                .border(border::HAIRLINE, k.c.border_focus)
+                .child(
+                    text("AI SELECT")
+                        .font(ty::section_header(k))
+                        .color(k.c.text_accent),
+                )
+                .child(
+                    text(mode_hint)
+                        .font(ty::control_label(k))
+                        .color(k.c.text_muted),
+                ),
+            &k.elevation.floating,
+        );
+        container = container.child(
+            row()
+                .pin(Some(0.0), None, Some(0.0), Some(space::HUD_X))
+                .justify_center()
+                .child(pill),
+        );
     }
 
     container
@@ -620,6 +656,7 @@ fn photo_viewport(s: &AppState, k: &Kit) -> El {
 /// Renders crisp Capture One Pro vector guides directly over the GPU photo viewport:
 /// - Linear Gradient: 3 parallel lines (start, center, end feather) + axis & center handles.
 /// - Radial Gradient: dashed rotated ellipse + center crosshair.
+/// - Interactive AI Select: green `+` positive points, red `−` negative points, dashed bounding box.
 /// - Spot Heal & Clone: target circle (orange Heal / cyan Clone) + dashed connector + source circle.
 fn canvas_vector_guides(s: &AppState) -> Option<El> {
     let show_layer_guides = s.active_tab == InspectorTab::Layers
@@ -630,6 +667,9 @@ fn canvas_vector_guides(s: &AppState) -> Option<El> {
     let show_heal_guides = !s.recipe.heal_spots.is_empty()
         && (s.active_tab == InspectorTab::Layers
             || matches!(s.active_tool, CanvasTool::Heal | CanvasTool::Clone));
+    let active_bbox = s.ai_select_bbox_preview.or(s.ai_select_bbox);
+    let show_ai_guides = s.active_tool == CanvasTool::AiSelect
+        && (!s.ai_select_points.is_empty() || active_bbox.is_some());
 
     let active_layer = if show_layer_guides {
         s.active_layer_index.and_then(|i| s.recipe.layers.get(i))
@@ -647,7 +687,7 @@ fn canvas_vector_guides(s: &AppState) -> Option<El> {
         })
     });
 
-    if !has_gradient_guide && !show_heal_guides {
+    if !has_gradient_guide && !show_heal_guides && !show_ai_guides {
         return None;
     }
 
@@ -827,6 +867,97 @@ fn canvas_vector_guides(s: &AppState) -> Option<El> {
                         color::heal_connector_line(),
                     );
                 }
+            }
+        }
+    }
+
+    if show_ai_guides {
+        // Dashed bounding box (live preview while Shift+Dragging, or committed PromptBox)
+        if let Some(bbox) = active_bbox {
+            let p00 = s.source_uv_to_viewport_local([bbox.x0, bbox.y0], vw, vh);
+            let p10 = s.source_uv_to_viewport_local([bbox.x1, bbox.y0], vw, vh);
+            let p11 = s.source_uv_to_viewport_local([bbox.x1, bbox.y1], vw, vh);
+            let p01 = s.source_uv_to_viewport_local([bbox.x0, bbox.y1], vw, vh);
+            let edges = [(p00, p10), (p10, p11), (p11, p01), (p01, p00)];
+            for (a, b) in edges {
+                let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+                let dashes = ((len / 10.0).ceil() as usize).clamp(4, 32);
+                for i in (0..dashes).step_by(2) {
+                    let t0 = i as f32 / dashes as f32;
+                    let t1 = ((i + 1) as f32 / dashes as f32).min(1.0);
+                    let da = [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0];
+                    let db = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
+                    shape = shape.line(
+                        da,
+                        db,
+                        border::CURVE_ACTIVE,
+                        LineCap::Round,
+                        color::ai_bbox_stroke(),
+                    );
+                }
+            }
+            // Crisp corner ticks
+            for corner in [p00, p10, p11, p01] {
+                let r = 3.5_f32;
+                let mut ring = Vec::with_capacity(13);
+                for i in 0..=12 {
+                    let ang = (i as f32 / 12.0) * std::f32::consts::TAU;
+                    ring.push([corner[0] + ang.cos() * r, corner[1] + ang.sin() * r]);
+                }
+                shape = shape.fill(ring, color::ai_bbox_stroke());
+            }
+        }
+
+        // Crisp prompt point markers: green `+` dot for positive, red `−` dot for negative
+        let white = Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.96,
+        };
+        let dark_halo = Color {
+            r: 0.02,
+            g: 0.02,
+            b: 0.02,
+            a: 0.72,
+        };
+        for pt in &s.ai_select_points {
+            let c = s.source_uv_to_viewport_local([pt.x, pt.y], vw, vh);
+            let fill_col = if pt.positive {
+                color::ai_point_positive()
+            } else {
+                color::ai_point_negative()
+            };
+            let circle_pts = |radius: f32| -> Vec<[f32; 2]> {
+                let mut pts = Vec::with_capacity(21);
+                for i in 0..=20 {
+                    let ang = (i as f32 / 20.0) * std::f32::consts::TAU;
+                    pts.push([c[0] + ang.cos() * radius, c[1] + ang.sin() * radius]);
+                }
+                pts
+            };
+            shape = shape
+                .fill(circle_pts(9.5), dark_halo)
+                .fill(circle_pts(7.5), fill_col)
+                .stroke(circle_pts(7.5), border::ACTIVE, white);
+
+            // Centered `+` or `−` glyph
+            let arm = 3.6_f32;
+            shape = shape.line(
+                [c[0] - arm, c[1]],
+                [c[0] + arm, c[1]],
+                border::CURVE_ACTIVE,
+                LineCap::Round,
+                white,
+            );
+            if pt.positive {
+                shape = shape.line(
+                    [c[0], c[1] - arm],
+                    [c[0], c[1] + arm],
+                    border::CURVE_ACTIVE,
+                    LineCap::Round,
+                    white,
+                );
             }
         }
     }
@@ -1044,6 +1175,7 @@ fn close_confirm_overlay(k: &Kit) -> El {
                             .on_press_tx(|s: &mut AppState, tx| {
                                 s.confirm_close = false;
                                 s.saved_recipe = s.recipe.clone();
+                                s.cancel_all_model_downloads();
                                 tx.close_window();
                             })
                             .build(k),
@@ -1055,6 +1187,7 @@ fn close_confirm_overlay(k: &Kit) -> El {
                             .on_press_tx(|s: &mut AppState, tx| {
                                 s.save_sidecar_tx(tx);
                                 s.confirm_close = false;
+                                s.cancel_all_model_downloads();
                                 tx.close_window();
                             })
                             .build(k),
@@ -1157,6 +1290,10 @@ fn handle_key(s: &mut AppState, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 s.clear_compare_variant_tx(tx);
                 return true;
             }
+            if s.active_tool == CanvasTool::AiSelect {
+                s.ai_select_done_tx(tx);
+                return true;
+            }
             if s.active_tool.is_retouch_or_mask() {
                 s.set_canvas_tool_tx(CanvasTool::Hand, tx);
                 return true;
@@ -1240,6 +1377,15 @@ fn handle_key(s: &mut AppState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::Text(ch) if !cmd && ev.mods.alt && ch.eq_ignore_ascii_case("m") => {
             s.toggle_gray_mask_overlay_tx(tx);
+            true
+        }
+        Key::Text(ch)
+            if !cmd
+                && !ev.mods.alt
+                && (s.active_tab == InspectorTab::Layers || s.active_tool.is_retouch_or_mask())
+                && s.shortcuts.matches(ShortcutAction::AiSelect, ch) =>
+        {
+            s.set_canvas_tool_tx(CanvasTool::AiSelect, tx);
             true
         }
         Key::Text(ch)
@@ -2199,6 +2345,42 @@ fn scene_proof_margin(s: &mut AppState) {
     s.status_message = Some("Proof Margin: Exhibition (84 pt Gallery Mat • ⌘⇧M)".to_owned());
 }
 
+fn scene_layers_ai_select(s: &mut AppState) {
+    scene_editorial(s);
+    s.active_tab = InspectorTab::Layers;
+    s.layers_open = true;
+    s.layers_mask_actions_open = false;
+    s.masks_open = true;
+    s.local_adj_open = true;
+    s.heal_open = false;
+    s.set_canvas_tool(CanvasTool::AiSelect);
+    s.ai_select_include_mode = true;
+    s.ai_select_points = vec![
+        PromptPoint::new(0.49, 0.36, true),
+        PromptPoint::new(0.50, 0.62, true),
+        PromptPoint::new(0.18, 0.24, false),
+    ];
+    s.ai_select_bbox = Some(PromptBox::new(0.26, 0.12, 0.74, 0.90));
+    s.run_ai_select_segmentation();
+    if let Some(layer) = s.recipe.layers.first_mut() {
+        layer.adjustments = LocalAdjustments {
+            exposure: 0.24,
+            clarity: 0.16,
+            sharpen: 0.22,
+            ..LocalAdjustments::default()
+        };
+    }
+    s.camera.mask_overlay_mode = 1;
+    s.recompute_histogram();
+}
+
+fn scene_settings_ai_models(s: &mut AppState) {
+    s.show_settings = true;
+    s.settings_section = SettingsSection::AiModels;
+    s.refresh_ai_models();
+    s.status_message = Some("Settings — AI Models & Smart Selection".to_owned());
+}
+
 fn scene_settings_shortcuts(s: &mut AppState) {
     s.show_settings = true;
     s.settings_section = SettingsSection::Shortcuts;
@@ -2230,12 +2412,15 @@ fn main() {
             ("clipboard-styles", scene_clipboard_styles),
             ("export-recipes", scene_export_recipes),
             ("loupe", scene_loupe),
+            ("layers", scene_layers_ai_select),
+            ("layers-ai-select", scene_layers_ai_select),
             ("layers-mask", scene_layers_mask),
             ("layers-grayscale", scene_layers_grayscale),
             ("heal-clone", scene_heal_clone),
             ("film-negative", scene_film_negative),
             ("camera-profiles", scene_camera_profiles),
             ("proof-margin", scene_proof_margin),
+            ("settings-ai-models", scene_settings_ai_models),
             ("settings-shortcuts", scene_settings_shortcuts),
             ("crop", scene_crop),
             ("lens-keystone", scene_lens_keystone),
@@ -2266,8 +2451,12 @@ fn main() {
         .macos_window(MacWindowOptions::default().color_space(MacColorSpace::Srgb))
         .prewarm_effects(PrewarmEffects::BACKDROP_BLUR)
         .compositor(DarkroomCompositor::default())
+        .on_modifiers(|s, mods, _| {
+            s.current_mods = mods;
+        })
         .on_focus(|s, focused, tx| {
             if !focused {
+                s.current_mods = Mods::default();
                 s.end_speed_edit_tx(tx);
             }
         })
@@ -2276,6 +2465,7 @@ fn main() {
                 s.confirm_close = true;
                 CloseResponse::Defer
             } else {
+                s.cancel_all_model_downloads();
                 CloseResponse::Close
             }
         })
@@ -2705,5 +2895,103 @@ mod scroll_tests {
             rt.state.active_camera_profile_label(),
             ("Rune ProStandard".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn ai_select_and_settings_ai_models_layout_zero_overlap() {
+        // 1. Layers AI Select scene: controls sit cleanly inside inspector below titlebar;
+        //    clicking `AI Models…` jumps straight to Settings → AI Models.
+        {
+            let mut s = AppState::default();
+            scene_layers_ai_select(&mut s);
+            let mut rt = make_runtime(s, size::WINDOW_DEFAULT);
+
+            let inspector = find_rect(&rt, "develop-inspector");
+            for key in [
+                "tool-ai-select",
+                "ai-select-controls",
+                "ai-sel-include",
+                "ai-sel-exclude",
+                "ai-sel-invert",
+                "ai-sel-clear",
+                "ai-sel-done",
+                "layers-ai-models-link",
+            ] {
+                let r = find_rect(&rt, key);
+                assert!(r[2] > 20.0 && r[3] >= 14.0, "{key} non-zero rect: {r:?}");
+                assert!(
+                    r[0] >= inspector[0] - 0.5 && r[0] + r[2] <= inspector[0] + inspector[2] + 0.5,
+                    "{key} ({r:?}) must stay within inspector bounds ({inspector:?})"
+                );
+                assert!(
+                    r[1] >= size::TITLEBAR_H,
+                    "{key} ({r:?}) must clear titlebar / traffic lights"
+                );
+            }
+
+            let hud = find_rect(&rt, "hud-ai-select");
+            let guides = find_rect(&rt, "canvas-vector-guides");
+            assert!(hud[1] >= size::TITLEBAR_H && hud[2] > 120.0);
+            assert!(guides[1] >= size::TITLEBAR_H && guides[2] > 200.0 && guides[3] > 200.0);
+
+            // Pressing Esc during AI Select runs `ai_select_done_tx` (clears prompts + returns to Hand)
+            rt.update(|s, tx| {
+                assert!(handle_key(
+                    s,
+                    &KeyEvent {
+                        key: Key::Escape,
+                        mods: Mods::default(),
+                    },
+                    tx,
+                ));
+            });
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.active_tool, CanvasTool::Hand);
+            assert!(rt.state.ai_select_points.is_empty());
+            assert!(rt.state.ai_select_bbox.is_none());
+            assert!(rt.state.ai_select_target_layer.is_none());
+
+            // Click one-click `AI Models…` link -> jumps straight to Settings → AI Models
+            let link = find_rect(&rt, "layers-ai-models-link");
+            let lx = link[0] + link[2] * 0.5;
+            let ly = link[1] + link[3] * 0.5;
+            rt.pointer_move(lx, ly);
+            rt.pointer_down(lx, ly);
+            rt.pointer_up(lx, ly);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.show_settings);
+            assert_eq!(rt.state.settings_section, SettingsSection::AiModels);
+        }
+
+        // 2. Settings → AI Models scene: all 4 model cards + engine selector + footer render
+        //    with zero overlap on macOS traffic lights or left sidebar, and scroll cleanly at WINDOW_MIN.
+        {
+            let mut s = AppState::default();
+            scene_settings_ai_models(&mut s);
+            let rt = make_runtime(s, size::WINDOW_DEFAULT);
+
+            let sidebar = find_rect(&rt, "settings-sidebar");
+            assert!(sidebar[1] >= size::TITLEBAR_H);
+            for key in [
+                "settings-ai-engine-card",
+                "settings-ai-engine-pills",
+                "settings-ai-model-apple-vision",
+                "settings-ai-model-sam21",
+                "settings-ai-model-sam3-q4f16",
+                "settings-ai-model-sam3-fp16",
+                "settings-ai-footer-card",
+            ] {
+                let r = find_rect(&rt, key);
+                assert!(r[2] > 200.0 && r[3] >= 24.0, "{key} non-zero rect: {r:?}");
+                assert!(
+                    r[1] >= size::TITLEBAR_H,
+                    "{key} ({r:?}) must clear titlebar / traffic lights"
+                );
+                assert!(
+                    r[0] >= sidebar[0] + sidebar[2] - 0.5,
+                    "{key} ({r:?}) must not overlap settings sidebar ({sidebar:?})"
+                );
+            }
+        }
     }
 }
