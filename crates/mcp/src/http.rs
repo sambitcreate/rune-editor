@@ -165,7 +165,21 @@ impl LocalMcpServer {
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(20));
                         }
-                        Err(_) => break,
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => {
+                            // Transient accept error (e.g. EMFILE/ENFILE fd pressure): back off briefly
+                            // rather than permanently terminating the local MCP listener.
+                            thread::sleep(Duration::from_millis(25));
+                        }
                     }
                 }
             })
@@ -511,7 +525,11 @@ fn handle_connection(
             .get("connection")
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        let keep_alive = if http_version.eq_ignore_ascii_case("HTTP/1.0") {
+        let has_unread_body_for_non_post =
+            method != "POST" && (parsed_content_length.unwrap_or(0) > 0 || has_transfer_encoding);
+        let keep_alive = if has_unread_body_for_non_post {
+            false
+        } else if http_version.eq_ignore_ascii_case("HTTP/1.0") {
             client_conn.contains("keep-alive")
         } else {
             !client_conn.contains("close")

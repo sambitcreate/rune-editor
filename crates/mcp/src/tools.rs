@@ -20,8 +20,8 @@ use rune_editor_core::{
     is_valid_camera_profile_id, list_all_camera_profiles, list_user_styles_in_dir,
     load_ai_model_config, load_user_style_in_dir, modified_recipe_groups, pick_white_balance,
     recipe_field_diffs, recipe_non_default_map, recipe_schema_json, reset_recipe_group,
-    resolve_builtin_preset, sanitize_style_slug, save_ai_model_config, save_user_style_in_dir,
-    set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
+    resolve_builtin_preset, sanitize_style_slug, save_user_style_in_dir, set_param_by_str,
+    stack_style_onto_recipe, temperature_to_kelvin, update_ai_model_config,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, LinearImage, ModelError,
@@ -63,6 +63,12 @@ pub trait McpHostBridge: Send + Sync {
     /// Returns the currently active GUI photo/recipe if running inside Rune Darkroom.
     fn active_canvas(&self) -> Option<ActiveCanvasSnapshot> {
         None
+    }
+
+    /// Returns `false` when the host GUI has disabled live MCP canvas edits (Settings → Agent & MCP).
+    /// Checked BEFORE writing sidecars when targeting the active photo.
+    fn allows_live_edits(&self) -> bool {
+        true
     }
 
     /// Applies an updated recipe directly to the live GUI canvas (pushing undo history so
@@ -108,26 +114,29 @@ impl ProxyCache {
         }
     }
 
-    fn get_or_load(&mut self, path: &Path, max_edge: u32) -> Result<Arc<LinearImage>, String> {
+    fn get(&mut self, path: &Path, max_edge: u32) -> Option<Arc<LinearImage>> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|(p, edge, _)| p == path && *edge == max_edge)?;
+        let entry = self.entries.remove(pos)?;
+        let img = entry.2.clone();
+        self.entries.push_front(entry);
+        Some(img)
+    }
+
+    fn insert(&mut self, path: PathBuf, max_edge: u32, img: Arc<LinearImage>) {
         if let Some(pos) = self
             .entries
             .iter()
-            .position(|(p, edge, _)| p == path && *edge == max_edge)
+            .position(|(p, edge, _)| p == &path && *edge == max_edge)
         {
-            let entry = self.entries.remove(pos).unwrap();
-            let img = entry.2.clone();
-            self.entries.push_front(entry);
-            return Ok(img);
+            self.entries.remove(pos);
         }
-        let img = Arc::new(
-            load_file_proxy(path, Some(max_edge)).map_err(|e| format!("Decode failed: {e}"))?,
-        );
         if self.entries.len() >= 4 {
             self.entries.pop_back();
         }
-        self.entries
-            .push_front((path.to_path_buf(), max_edge, img.clone()));
-        Ok(img)
+        self.entries.push_front((path, max_edge, img));
     }
 }
 
@@ -363,6 +372,30 @@ impl McpService {
         }
     }
 
+    fn load_cached_proxy(&self, path: &Path, proxy_edge: u32) -> Result<Arc<LinearImage>, String> {
+        {
+            let mut guard = self.cache.lock().unwrap_or_else(|poisoned| {
+                let mut g = poisoned.into_inner();
+                g.entries.clear();
+                g
+            });
+            if let Some(hit) = guard.get(path, proxy_edge) {
+                return Ok(hit);
+            }
+        }
+        // Decode outside the cache lock so concurrent MCP requests never block on one slow RAW decode.
+        let img = Arc::new(
+            load_file_proxy(path, Some(proxy_edge)).map_err(|e| format!("Decode failed: {e}"))?,
+        );
+        let mut guard = self.cache.lock().unwrap_or_else(|poisoned| {
+            let mut g = poisoned.into_inner();
+            g.entries.clear();
+            g
+        });
+        guard.insert(path.to_path_buf(), proxy_edge, img.clone());
+        Ok(img)
+    }
+
     fn resolve_target(
         &self,
         args: &Value,
@@ -383,20 +416,25 @@ impl McpService {
                     Some("Pass a valid file path or omit `path` to target the active GUI canvas."),
                 ));
             }
-            let meta = PhotoMeta::load_sidecar(&path)
+            let mut meta = PhotoMeta::load_sidecar(&path)
                 .map_err(|e| tool_err("IO_ERROR", e.to_string(), None))?
                 .unwrap_or_default();
-            let img = self
-                .cache
-                .lock()
-                .map_err(|_| tool_err("INTERNAL_ERROR", "Cache lock poisoned", None))?
-                .get_or_load(&path, proxy_edge)
-                .map_err(|e| tool_err("DECODE_FAILED", e, None))?;
-            let is_active = self
-                .host
-                .active_canvas()
-                .and_then(|s| s.source_path)
-                .is_some_and(|active_p| active_p == path);
+            let active_snap = self.host.active_canvas();
+            let is_active = active_snap
+                .as_ref()
+                .and_then(|s| s.source_path.as_deref())
+                .is_some_and(|active_p| same_file_path(active_p, &path));
+            let img = if is_active && let Some(snap) = active_snap {
+                // Preserve unsaved live GUI canvas state when an explicit `path` targets the active photo.
+                meta.rating = snap.rating;
+                meta.flag = snap.flag;
+                meta.color_tag = snap.color_tag;
+                meta.recipe = snap.recipe;
+                snap.image
+            } else {
+                self.load_cached_proxy(&path, proxy_edge)
+                    .map_err(|e| tool_err("DECODE_FAILED", e, None))?
+            };
             Ok((Some(path), img, meta, is_active))
         } else if let Some(snap) = self.host.active_canvas() {
             // Preserve existing on-disk sidecar provenance (`revision` + `history`) when
@@ -409,6 +447,7 @@ impl McpService {
             };
             meta.rating = snap.rating;
             meta.flag = snap.flag;
+            meta.color_tag = snap.color_tag;
             meta.recipe = snap.recipe;
             Ok((snap.source_path, snap.image, meta, true))
         } else {
@@ -948,6 +987,13 @@ impl McpService {
         let mut live_updated = false;
 
         if !dry_run && !diffs.is_empty() {
+            if is_active && !self.host.allows_live_edits() {
+                return tool_err(
+                    "LIVE_CANVAS_DISABLED",
+                    "Live canvas edits are disabled in Rune Darkroom Settings → Agent & MCP.",
+                    None,
+                );
+            }
             let summary = format!("MCP ({agent_name}): {} field(s)", diffs.len());
             if let Some(path) = &path_opt {
                 meta.push_history(
@@ -1162,7 +1208,7 @@ impl McpService {
                 let rating = args
                     .get("rating")
                     .and_then(Value::as_u64)
-                    .map(|r| (r as u8).min(5));
+                    .map(|r| r.min(5) as u8);
                 let flag = match args.get("flag") {
                     None => None,
                     Some(v) => match v.as_str() {
@@ -1220,10 +1266,21 @@ impl McpService {
                             None,
                         );
                     }
-                    let mut meta = PhotoMeta::load_sidecar(p)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                    let mut meta = match PhotoMeta::load_sidecar(p) {
+                        Ok(opt) => opt.unwrap_or_default(),
+                        Err(e) => {
+                            return tool_err(
+                                "SIDECAR_CORRUPT",
+                                format!(
+                                    "Refusing to overwrite corrupt sidecar for '{}': {e}",
+                                    p.display()
+                                ),
+                                Some(
+                                    "Repair or back up the malformed `.rune-edit.json` sidecar before culling.",
+                                ),
+                            );
+                        }
+                    };
                     if let Some(r) = rating {
                         meta.rating = r;
                     }
@@ -1898,6 +1955,13 @@ impl McpService {
                 let diffs = recipe_field_diffs(&before, &meta.recipe);
                 let mut live = false;
                 if !diffs.is_empty() {
+                    if is_active && !self.host.allows_live_edits() {
+                        return tool_err(
+                            "LIVE_CANVAS_DISABLED",
+                            "Live canvas edits are disabled in Rune Darkroom Settings → Agent & MCP.",
+                            None,
+                        );
+                    }
                     let summary = format!(
                         "MCP style {} '{}'",
                         if stack { "stack" } else { "apply" },
@@ -2024,6 +2088,13 @@ impl McpService {
                 let diffs = recipe_field_diffs(&before, &dst_meta.recipe);
                 let mut live = false;
                 if !diffs.is_empty() {
+                    if is_active && !self.host.allows_live_edits() {
+                        return tool_err(
+                            "LIVE_CANVAS_DISABLED",
+                            "Live canvas edits are disabled in Rune Darkroom Settings → Agent & MCP.",
+                            None,
+                        );
+                    }
                     let summary = format!("MCP copy_selective_groups ({} group(s))", groups.len());
                     if let Some(p) = &dst_path_opt {
                         dst_meta.push_history(
@@ -2368,6 +2439,13 @@ impl McpService {
             let diffs = recipe_field_diffs(&before, &meta.recipe);
             let mut live_updated = false;
             if !dry_run && !diffs.is_empty() {
+                if is_active && !self.host.allows_live_edits() {
+                    return tool_err(
+                        "LIVE_CANVAS_DISABLED",
+                        "Live canvas edits are disabled in Rune Darkroom Settings → Agent & MCP.",
+                        None,
+                    );
+                }
                 if let Some(p) = &path_opt {
                     meta.push_history(
                         EditActor::Agent {
@@ -2965,16 +3043,18 @@ impl McpService {
                         ),
                     );
                 };
-                let mut config = load_ai_model_config().unwrap_or_default();
-                config.active_engine = eng;
-                if let Some(m) = ModelId::from_str_loose(raw)
-                    && m.is_sam3()
-                {
-                    config.preferred_sam3_variant = m;
-                }
-                if let Err(e) = save_ai_model_config(&config) {
-                    return tool_err("IO_ERROR", e.to_string(), None);
-                }
+                let config = match update_ai_model_config(|cfg| {
+                    cfg.active_engine = eng;
+                    if let Some(m) = ModelId::from_str_loose(raw)
+                        && m.is_sam3()
+                    {
+                        cfg.preferred_sam3_variant = m;
+                    }
+                }) {
+                    Ok(c) => c,
+                    Err(e) => return tool_err("IO_ERROR", e.to_string(), None),
+                };
+                let _ = config;
                 let summary = active_engine_summary();
                 tool_ok(
                     json!({
@@ -3710,9 +3790,12 @@ fn map_model_error_to_mcp(err: ModelError) -> Value {
             Some("Review the license URL and re-call `rune_models` with `accept_license: true`."),
         ),
         ModelError::MissingLocalFile { .. } => tool_err("INPUT_NOT_FOUND", err.to_string(), None),
-        ModelError::InvalidPath(_) | ModelError::EmptyOrCorruptFile { .. } => {
+        ModelError::InvalidPath(_)
+        | ModelError::EmptyOrCorruptFile { .. }
+        | ModelError::ChecksumMismatch { .. } => {
             tool_err("VALIDATION_ERROR", err.to_string(), None)
         }
+        ModelError::Busy(_) => tool_err("MODEL_BUSY", err.to_string(), None),
         ModelError::Cancelled(_) => tool_err("DOWNLOAD_CANCELLED", err.to_string(), None),
         ModelError::DownloadFailed { .. } | ModelError::Io(_) | ModelError::Core(_) => {
             tool_err("IO_ERROR", err.to_string(), None)
@@ -4158,7 +4241,32 @@ fn validate_mcp_output_path(
         ));
     }
 
+    // Even with `overwrite: true`, refuse to overwrite any existing photo that has an associated
+    // `.rune-edit.json` sidecar (protecting other original camera photos in a shoot folder).
+    if (dest.exists() || dest.symlink_metadata().is_ok())
+        && DevelopRecipe::sidecar_path_for(dest).exists()
+    {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            format!(
+                "Refusing to overwrite '{}': a `.rune-edit.json` sidecar exists for this file, indicating it is an edited original.",
+                dest.display()
+            ),
+            Some("Export to a separate output directory or filename."),
+        ));
+    }
+
     Ok(())
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 fn parse_norm_xy(val: Option<&Value>, field: &str) -> Result<Option<[f32; 2]>, Value> {

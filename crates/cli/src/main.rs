@@ -110,6 +110,12 @@ impl From<rune_editor_core::CoreError> for CliError {
                     "Sidecar changed concurrently (expected revision {expected}, found {actual})"
                 ))
             }
+            rune_editor_core::CoreError::CorruptSidecar { path, message } => Self::validation(
+                format!(
+                    "Refusing to overwrite corrupt sidecar '{}': {message}",
+                    path.display()
+                ),
+            ),
             rune_editor_core::CoreError::Json(e) => Self::validation(format!("Invalid JSON: {e}")),
             rune_editor_core::CoreError::Io(e) => Self::io(format!("I/O error: {e}")),
         }
@@ -162,9 +168,11 @@ impl From<rune_editor_decode::ModelError> for CliError {
                 Self::not_found(err.to_string())
             }
             rune_editor_decode::ModelError::InvalidPath(_)
-            | rune_editor_decode::ModelError::EmptyOrCorruptFile { .. } => {
+            | rune_editor_decode::ModelError::EmptyOrCorruptFile { .. }
+            | rune_editor_decode::ModelError::ChecksumMismatch { .. } => {
                 Self::validation(err.to_string())
             }
+            rune_editor_decode::ModelError::Busy(_) => Self::conflict(err.to_string()),
             rune_editor_decode::ModelError::Cancelled(_) => Self {
                 code: "DOWNLOAD_CANCELLED",
                 exit: exit_code::PARTIAL_OR_ASSERT,
@@ -961,6 +969,9 @@ pub struct PreviewArgs {
     /// Ignore persistent crop/geometry when rendering preview.
     #[arg(long)]
     pub no_crop: bool,
+    /// Allow overwriting an existing file at `--out` (never permits overwriting source/RAW files).
+    #[arg(long)]
+    pub overwrite: bool,
 }
 
 #[derive(Args, Debug)]

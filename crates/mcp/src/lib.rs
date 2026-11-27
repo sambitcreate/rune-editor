@@ -3115,4 +3115,158 @@ LUT_3D_SIZE 2
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn audit_regressions_rating_clamp_corrupt_sidecar_live_edits_and_sidecar_overwrite_guard() {
+        use rune_editor_core::{ColorTag, CullFlag, DevelopRecipe, PhotoMeta};
+        use rune_editor_decode::{ExportFormat, export_image, generate_demo_hdr_scene};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ToggleLiveHost {
+            snap: Mutex<ActiveCanvasSnapshot>,
+            allow_live: AtomicBool,
+        }
+        impl McpHostBridge for ToggleLiveHost {
+            fn active_canvas(&self) -> Option<ActiveCanvasSnapshot> {
+                Some(self.snap.lock().unwrap().clone())
+            }
+            fn allows_live_edits(&self) -> bool {
+                self.allow_live.load(Ordering::Relaxed)
+            }
+            fn apply_live_recipe(
+                &self,
+                _target_path: Option<&std::path::Path>,
+                new_recipe: DevelopRecipe,
+                _summary: String,
+            ) -> Result<bool, String> {
+                if !self.allow_live.load(Ordering::Relaxed) {
+                    return Err("Live canvas edits are disabled".to_owned());
+                }
+                self.snap.lock().unwrap().recipe = new_recipe;
+                Ok(true)
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rune_mcp_audit_reg_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = Arc::new(generate_demo_hdr_scene(64, 48));
+        let active_photo = dir.join("active.jpg");
+        let sibling_photo = dir.join("sibling.jpg");
+        export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &active_photo,
+            ExportFormat::Jpeg { quality: 85 },
+        )
+        .unwrap();
+        export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &sibling_photo,
+            ExportFormat::Jpeg { quality: 85 },
+        )
+        .unwrap();
+        PhotoMeta::default().save_sidecar(&sibling_photo).unwrap();
+
+        let host = Arc::new(ToggleLiveHost {
+            snap: Mutex::new(ActiveCanvasSnapshot {
+                display_name: "active.jpg".to_owned(),
+                source_path: Some(active_photo.clone()),
+                image: img.clone(),
+                recipe: DevelopRecipe::default(),
+                rating: 0,
+                flag: CullFlag::None,
+                color_tag: ColorTag::None,
+                demo_mode: false,
+                folder: Some(dir.clone()),
+                catalog_len: 2,
+            }),
+            allow_live: AtomicBool::new(false),
+        });
+        let svc = McpService::new(host.clone());
+        let call = |id: u64, name: &str, args: serde_json::Value| -> serde_json::Value {
+            svc.handle_request(&protocol::JsonRpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: Some(json!(id)),
+                method: "tools/call".to_owned(),
+                params: Some(json!({ "name": name, "arguments": args })),
+            })
+            .unwrap()
+        };
+
+        // 1. Live edits disabled must fail BEFORE writing any sidecar to disk.
+        let edit_blocked = call(1, "rune_edit_photo", json!({ "set": { "exposure": 1.0 } }));
+        assert_eq!(edit_blocked["result"]["isError"], true);
+        assert_eq!(
+            edit_blocked["result"]["structuredContent"]["code"],
+            "LIVE_CANVAS_DISABLED"
+        );
+        assert!(
+            !DevelopRecipe::sidecar_path_for(&active_photo).exists(),
+            "sidecar must NOT be written when live edits are disabled"
+        );
+
+        // 2. Rating 256 must clamp to 5, never wrap to 0 via `as u8`.
+        let rate_res = call(
+            2,
+            "rune_cull_or_export",
+            json!({ "action": "cull", "path": active_photo, "rating": 256 }),
+        );
+        assert_eq!(rate_res["result"]["isError"], false);
+        assert_eq!(rate_res["result"]["structuredContent"]["rating"], 5);
+        assert_eq!(
+            PhotoMeta::load_sidecar(&active_photo)
+                .unwrap()
+                .unwrap()
+                .rating,
+            5
+        );
+
+        // 3. MCP cull on a corrupt sidecar must fail with SIDECAR_CORRUPT and preserve the file.
+        let corrupt_photo = dir.join("corrupt.jpg");
+        export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &corrupt_photo,
+            ExportFormat::Jpeg { quality: 85 },
+        )
+        .unwrap();
+        let corrupt_sidecar = DevelopRecipe::sidecar_path_for(&corrupt_photo);
+        std::fs::write(&corrupt_sidecar, b"{broken").unwrap();
+        let cull_corrupt = call(
+            3,
+            "rune_cull_or_export",
+            json!({ "action": "cull", "path": corrupt_photo, "rating": 4 }),
+        );
+        assert_eq!(cull_corrupt["result"]["isError"], true);
+        assert_eq!(
+            cull_corrupt["result"]["structuredContent"]["code"],
+            "SIDECAR_CORRUPT"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&corrupt_sidecar).unwrap(),
+            "{broken"
+        );
+
+        // 4. Even with `overwrite: true`, MCP export refuses to clobber another photo that has a sidecar.
+        let clobber = call(
+            4,
+            "rune_cull_or_export",
+            json!({
+                "action": "export",
+                "path": active_photo,
+                "out": sibling_photo,
+                "overwrite": true
+            }),
+        );
+        assert_eq!(clobber["result"]["isError"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

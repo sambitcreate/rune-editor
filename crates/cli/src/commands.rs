@@ -25,8 +25,8 @@ use rune_editor_core::{
     load_user_style_in_dir, modified_recipe_groups, parse_cube_lut, parse_dcp_profile,
     parse_icc_profile, pick_white_balance, recipe_field_diffs, recipe_non_default_map,
     recipe_schema_json, reset_recipe_group, resolve_builtin_preset, rgb_to_hsl_and_lab,
-    sanitize_profile_slug, save_ai_model_config, save_user_style_in_dir, search_params,
-    set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
+    sanitize_profile_slug, save_user_style_in_dir, search_params, set_param_by_str,
+    stack_style_onto_recipe, temperature_to_kelvin, update_ai_model_config,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher,
@@ -2355,6 +2355,12 @@ fn cmd_preview(args: PreviewArgs, opts: &RuntimeOpts) -> Result<u8, CliError> {
     let format = infer_format_from_ext(&args.out, args.quality);
     if !opts.dry_run {
         guard_not_source(&args.photo, &args.out)?;
+        if !args.overwrite && (args.out.exists() || args.out.symlink_metadata().is_ok()) {
+            return Err(CliError::validation(format!(
+                "Refusing to overwrite existing file '{}' without `--overwrite`.",
+                args.out.display()
+            )));
+        }
         export_image_with_options(
             &img,
             &meta.recipe,
@@ -2556,26 +2562,23 @@ fn cmd_export(args: ExportArgs, opts: &RuntimeOpts) -> Result<u8, CliError> {
         && !args.out.is_dir()
         && args.out.extension().is_some();
 
-    let pairs: Vec<(PathBuf, PathBuf)> = files
-        .iter()
-        .enumerate()
-        .map(|(idx, src)| {
-            let dest = if single_file_dest {
-                args.out.clone()
-            } else if let Some(tpl) = &args.naming_template {
-                let meta = PhotoMeta::load_sidecar(src)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let ctx = build_naming_context(src, idx + 1, &meta, &args.to);
-                let stem = expand_naming_template(tpl, &ctx);
-                args.out.join(format!("{stem}.{ext}"))
-            } else {
-                render_dest_path(src, &args.out, &args.naming, ext)
-            };
-            (src.clone(), dest)
-        })
-        .collect();
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(files.len());
+    for (idx, src) in files.iter().enumerate() {
+        let dest = if single_file_dest {
+            args.out.clone()
+        } else if let Some(tpl) = &args.naming_template {
+            let meta = PhotoMeta::load_sidecar(src)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let ctx = build_naming_context(src, idx + 1, &meta, &args.to);
+            let stem = expand_naming_template(tpl, &ctx);
+            args.out.join(format!("{stem}.{ext}"))
+        } else {
+            render_dest_path(src, &args.out, &args.naming, ext)?
+        };
+        pairs.push((src.clone(), dest));
+    }
     check_duplicate_export_paths(&pairs)?;
 
     let jobs = args.jobs.clamp(1, 8);
@@ -2767,6 +2770,35 @@ fn cmd_batch_run(manifest_arg: &str, jobs: usize, opts: &RuntimeOpts) -> Result<
         });
     }
 
+    if !job.exports.is_empty() {
+        let mut planned_pairs: Vec<(PathBuf, PathBuf)> =
+            Vec::with_capacity(files.len() * job.exports.len());
+        for src in &files {
+            for target in &job.exports {
+                let (_fmt, ext) = parse_export_format(&target.format, target.quality)?;
+                let dest =
+                    render_dest_path(src, &target.output_dir, &target.filename_template, ext)?;
+                guard_not_source(src, &dest)?;
+                // Prevent overwriting any neighbouring original photo in the batch (e.g. RAW+JPEG pairs).
+                for other_src in &files {
+                    guard_not_source(other_src, &dest)?;
+                }
+                if !opts.dry_run
+                    && !target.overwrite
+                    && (dest.exists() || dest.symlink_metadata().is_ok())
+                {
+                    return Err(CliError::validation(format!(
+                        "Refusing to overwrite existing file '{}' for export target '{}' (set `overwrite: true` to replace).",
+                        dest.display(),
+                        target.id
+                    )));
+                }
+                planned_pairs.push((src.clone(), dest));
+            }
+        }
+        check_duplicate_export_paths(&planned_pairs)?;
+    }
+
     let start = Instant::now();
     let actor_name = job.agent.clone().unwrap_or_else(|| "batch".to_owned());
     let pool = rayon::ThreadPoolBuilder::new()
@@ -2935,8 +2967,18 @@ fn run_batch_item(
         };
         for target in &job.exports {
             let (fmt, ext) = parse_export_format(&target.format, target.quality)?;
-            let dest = render_dest_path(src, &target.output_dir, &target.filename_template, ext);
+            let dest = render_dest_path(src, &target.output_dir, &target.filename_template, ext)?;
             guard_not_source(src, &dest)?;
+            if !opts.dry_run
+                && !target.overwrite
+                && (dest.exists() || dest.symlink_metadata().is_ok())
+            {
+                return Err(CliError::validation(format!(
+                    "Refusing to overwrite existing file '{}' for export target '{}' (set `overwrite: true` to replace).",
+                    dest.display(),
+                    target.id
+                )));
+            }
             if let Some(img) = &full_img {
                 export_image_with_options(
                     img,
@@ -3380,13 +3422,51 @@ fn infer_format_from_ext(path: &Path, quality: u8) -> ExportFormat {
     }
 }
 
-fn render_dest_path(src: &Path, out_dir: &Path, template: &str, ext: &str) -> PathBuf {
+fn render_dest_path(
+    src: &Path,
+    out_dir: &Path,
+    template: &str,
+    ext: &str,
+) -> Result<PathBuf, CliError> {
+    use std::path::Component;
+
     let stem = src
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "photo".to_owned());
     let fname = template.replace("{stem}", &stem).replace("{ext}", ext);
-    out_dir.join(fname)
+    if fname.trim().is_empty() || fname.contains('\0') || fname.contains('\\') {
+        return Err(CliError::validation(format!(
+            "Invalid export filename template '{template}'"
+        )));
+    }
+    let rel = Path::new(&fname);
+    let mut clean_rel = PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                if s.starts_with('.') {
+                    return Err(CliError::validation(format!(
+                        "Hidden path segment '{s}' is not allowed in export filename template '{template}'"
+                    )));
+                }
+                clean_rel.push(seg);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(CliError::validation(format!(
+                    "Export filename template '{template}' must stay within output directory (path traversal rejected)"
+                )));
+            }
+        }
+    }
+    if clean_rel.as_os_str().is_empty() {
+        return Err(CliError::validation(format!(
+            "Export filename template '{template}' resolved to an empty path"
+        )));
+    }
+    Ok(out_dir.join(clean_rel))
 }
 
 fn sets_touch_geometry(sets: &[String]) -> bool {
@@ -3929,16 +4009,25 @@ fn cmd_model(sub: ModelCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     "Unknown segmentation engine '{engine}'. Valid: auto, apple-vision, sam2.1, sam3, heuristic"
                 ))
             })?;
-            let mut config = load_ai_model_config().unwrap_or_default();
-            config.active_engine = eng;
-            if let Some(m) = ModelId::from_str_loose(&engine)
-                && m.is_sam3()
-            {
-                config.preferred_sam3_variant = m;
-            }
-            if !opts.dry_run {
-                save_ai_model_config(&config)?;
-            }
+            let config = if opts.dry_run {
+                let mut preview = load_ai_model_config()?;
+                preview.active_engine = eng;
+                if let Some(m) = ModelId::from_str_loose(&engine)
+                    && m.is_sam3()
+                {
+                    preview.preferred_sam3_variant = m;
+                }
+                preview
+            } else {
+                update_ai_model_config(|cfg| {
+                    cfg.active_engine = eng;
+                    if let Some(m) = ModelId::from_str_loose(&engine)
+                        && m.is_sam3()
+                    {
+                        cfg.preferred_sam3_variant = m;
+                    }
+                })?
+            };
             let summary = active_engine_summary();
             let active_engine = if opts.dry_run {
                 eng
@@ -6808,6 +6897,126 @@ DOMAIN_MAX 1.0 1.0 1.0
             }
             other => panic!("expected 512x512 RasterMask, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_run_blocks_traversal_neighbour_overwrite_and_existing_files_without_overwrite() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rune_cli_batch_safety_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo_a = dir.join("IMG_0001.jpg");
+        let photo_b = dir.join("IMG_0001.png");
+        let img = rune_editor_decode::generate_demo_hdr_scene(64, 48);
+        rune_editor_decode::export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &photo_a,
+            ExportFormat::Jpeg { quality: 85 },
+        )
+        .unwrap();
+        rune_editor_decode::export_image(
+            &img,
+            &DevelopRecipe::default(),
+            &photo_b,
+            ExportFormat::Png8,
+        )
+        .unwrap();
+
+        let opts = RuntimeOpts {
+            format: ResolvedFormat::Json,
+            dry_run: false,
+            quiet: true,
+            verbose: false,
+            backend: crate::BackendMode::Cpu,
+        };
+
+        // 1. Path traversal (`../`) in filename_template must be rejected.
+        let traversal_manifest = dir.join("job_traversal.json");
+        std::fs::write(
+            &traversal_manifest,
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "inputs": { "paths": [photo_a] },
+                "exports": [{
+                    "id": "bad",
+                    "output_dir": dir.join("out"),
+                    "filename_template": "../escape.{ext}",
+                    "format": "jpeg"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cmd_batch_run(traversal_manifest.to_str().unwrap(), 1, &opts).is_err());
+
+        // 2. Exporting a PNG pair into the same folder as `{stem}.jpg` must not clobber neighbouring `IMG_0001.jpg`.
+        let neighbour_manifest = dir.join("job_neighbour.json");
+        std::fs::write(
+            &neighbour_manifest,
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "inputs": { "paths": [&dir] },
+                "exports": [{
+                    "id": "clobber",
+                    "output_dir": &dir,
+                    "filename_template": "{stem}.{ext}",
+                    "format": "jpeg",
+                    "overwrite": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cmd_batch_run(neighbour_manifest.to_str().unwrap(), 1, &opts).is_err());
+
+        // 3. Existing destination file without `overwrite: true` must fail cleanly.
+        let out_dir = dir.join("exports");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let existing = out_dir.join("IMG_0001.jpg");
+        std::fs::write(&existing, b"keep-me").unwrap();
+        let existing_manifest = dir.join("job_exists.json");
+        std::fs::write(
+            &existing_manifest,
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "inputs": { "paths": [&photo_a] },
+                "exports": [{
+                    "id": "no_overwrite",
+                    "output_dir": &out_dir,
+                    "filename_template": "{stem}.{ext}",
+                    "format": "jpeg"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cmd_batch_run(existing_manifest.to_str().unwrap(), 1, &opts).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
+        // 4. `rd preview` refuses to overwrite an existing file without `--overwrite`.
+        assert!(
+            cmd_preview(
+                PreviewArgs {
+                    photo: photo_a.clone(),
+                    out: existing.clone(),
+                    max_edge: 128,
+                    quality: 80,
+                    no_crop: false,
+                    overwrite: false,
+                },
+                &opts,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
