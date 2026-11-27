@@ -21,6 +21,7 @@ use ort::value::{Tensor, TensorElementType, ValueType};
 use rune_editor_core::{
     LAYER_MASK_TILE_SIZE, MaskShape, ModelId, ModelSpec, PromptBox, PromptPoint, SmartMaskPrompt,
     inspect_model_install, linear_to_srgb, model_decoder_path, model_encoder_path,
+    rgb_to_hsl_and_lab,
 };
 
 use crate::LinearImage;
@@ -189,6 +190,7 @@ pub fn segment(
     // Step 2: Run prompt encoder + mask decoder.
     let (mask, iou_score) = match run_mask_decoder(
         &mut cache.decoder,
+        image,
         &encoded_tensors,
         spec,
         &points,
@@ -210,6 +212,7 @@ pub fn segment(
             cache.backend_label = sam_backend_label(model_id, cache.encoder_used_coreml, false);
             run_mask_decoder(
                 &mut cache.decoder,
+                image,
                 &encoded_tensors,
                 spec,
                 &points,
@@ -395,8 +398,10 @@ fn run_vision_encoder(
     Ok(cached)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mask_decoder(
     decoder: &mut Session,
+    image: &LinearImage,
     encoded: &[CachedTensor],
     spec: &ModelSpec,
     points: &[PromptPoint],
@@ -605,20 +610,24 @@ fn run_mask_decoder(
         return Err("SAM decoder pred_masks slice out of bounds".to_owned());
     }
 
-    let mut probs = vec![0.0_f32; plane_len];
-    for (dst, &logit) in probs
+    let mut raw_logits = vec![-20.0_f32; plane_len];
+    for (dst, &logit) in raw_logits
         .iter_mut()
         .zip(&mask_logits[offset..offset + plane_len])
     {
-        let clamped = if logit.is_finite() {
+        *dst = if logit.is_finite() {
             logit.clamp(-20.0, 20.0)
         } else {
             -20.0
         };
-        *dst = 1.0 / (1.0 + (-clamped).exp());
     }
 
-    let mask = upsample_probs_to_raster_mask(&probs, mask_w, mask_h, invert);
+    // Refine raw decoder logits with an image-guided period-4-nulling joint bilateral filter
+    // (eliminating SAM 2.1 / SAM 3 ConvTranspose2d stride-2/stride-4 checkerboard ripples while
+    // snapping silhouettes cleanly to true photo edges), then bilinearly upsample in logit space
+    // and apply a crisp anti-aliased sigmoid around `logit = 0.0`.
+    let clean_logits = refine_sam_logits_guided(&raw_logits, mask_w, mask_h, image);
+    let mask = upsample_logits_to_raster_mask(&clean_logits, mask_w, mask_h, invert);
     Ok((mask, best_iou))
 }
 
@@ -887,36 +896,151 @@ fn auto_seed_points(image: &LinearImage) -> Vec<PromptPoint> {
     pts
 }
 
-fn upsample_probs_to_raster_mask(
-    probs: &[f32],
+/// Downsamples `image` to a `dst_w × dst_h` perceptual CIE Lab guide grid for edge-aware
+/// SAM logit de-checkerboarding.
+fn downsample_image_to_lab_guide(image: &LinearImage, dst_w: usize, dst_h: usize) -> Vec<[f32; 3]> {
+    let total = dst_w.saturating_mul(dst_h);
+    let mut lab_grid = vec![[0.0_f32; 3]; total];
+    let sw = image.width as usize;
+    let sh = image.height as usize;
+    if sw == 0 || sh == 0 || total == 0 || image.rgba16f.len() < sw * sh * 4 {
+        return lab_grid;
+    }
+
+    let sx_scale = sw as f32 / dst_w as f32;
+    let sy_scale = sh as f32 / dst_h as f32;
+
+    for gy in 0..dst_h {
+        let sy = (((gy as f32 + 0.5) * sy_scale).floor() as usize).min(sh - 1);
+        let src_row = sy * sw;
+        let dst_row = gy * dst_w;
+        for gx in 0..dst_w {
+            let sx = (((gx as f32 + 0.5) * sx_scale).floor() as usize).min(sw - 1);
+            let base = (src_row + sx) * 4;
+            let to_srgb = |h: f16| {
+                let v = h.to_f32();
+                if v.is_finite() {
+                    linear_to_srgb(v.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            };
+            let srgb = [
+                to_srgb(image.rgba16f[base]),
+                to_srgb(image.rgba16f[base + 1]),
+                to_srgb(image.rgba16f[base + 2]),
+            ];
+            let (_, lab) = rgb_to_hsl_and_lab(srgb);
+            lab_grid[dst_row + gx] = lab;
+        }
+    }
+    lab_grid
+}
+
+/// Removes SAM 2.1 / SAM 3 `ConvTranspose2d` stride-2 and stride-4 checkerboard ripples from raw
+/// decoder logits via a 2-pass separable image-guided joint bilateral filter.
+///
+/// The 5-tap spatial kernel `[0.5, 1.0, 1.0, 1.0, 0.5]` has exact mathematical zeros at both
+/// `ω = π` (period 2) and `ω = π/2` (period 4), completely cancelling ViT/deconv grid artifacts
+/// across smooth regions while preserving crisp object boundaries guided by the photo's CIE Lab
+/// color edges.
+fn refine_sam_logits_guided(logits: &[f32], w: usize, h: usize, image: &LinearImage) -> Vec<f32> {
+    if w < 4 || h < 4 || logits.len() < w * h {
+        return logits.to_vec();
+    }
+
+    let guide = downsample_image_to_lab_guide(image, w, h);
+    // Exact period-2 and period-4 nulling symmetric kernel.
+    const SPATIAL: [f32; 5] = [0.5, 1.0, 1.0, 1.0, 0.5];
+    const INV_2_SIGMA_LAB2: f32 = 0.5 / (12.0 * 12.0);
+
+    let mut cur = logits[..w * h].to_vec();
+    let mut tmp = vec![0.0_f32; w * h];
+
+    for _pass in 0..2 {
+        // Horizontal pass
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let c_lab = guide[row + x];
+                let mut sum = 0.0_f32;
+                let mut w_sum = 0.0_f32;
+                for (ki, &sw) in SPATIAL.iter().enumerate() {
+                    let nx = (x as isize + ki as isize - 2).clamp(0, (w - 1) as isize) as usize;
+                    let n_lab = guide[row + nx];
+                    let dl = n_lab[0] - c_lab[0];
+                    let da = n_lab[1] - c_lab[1];
+                    let db = n_lab[2] - c_lab[2];
+                    let d2 = dl * dl + da * da + db * db;
+                    let wt = sw * (-d2 * INV_2_SIGMA_LAB2).exp();
+                    sum += cur[row + nx] * wt;
+                    w_sum += wt;
+                }
+                tmp[row + x] = if w_sum > 1e-6 {
+                    sum / w_sum
+                } else {
+                    cur[row + x]
+                };
+            }
+        }
+
+        // Vertical pass
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let c_lab = guide[row + x];
+                let mut sum = 0.0_f32;
+                let mut w_sum = 0.0_f32;
+                for (ki, &sw) in SPATIAL.iter().enumerate() {
+                    let ny = (y as isize + ki as isize - 2).clamp(0, (h - 1) as isize) as usize;
+                    let idx = ny * w + x;
+                    let n_lab = guide[idx];
+                    let dl = n_lab[0] - c_lab[0];
+                    let da = n_lab[1] - c_lab[1];
+                    let db = n_lab[2] - c_lab[2];
+                    let d2 = dl * dl + da * da + db * db;
+                    let wt = sw * (-d2 * INV_2_SIGMA_LAB2).exp();
+                    sum += tmp[idx] * wt;
+                    w_sum += wt;
+                }
+                cur[row + x] = if w_sum > 1e-6 {
+                    sum / w_sum
+                } else {
+                    tmp[row + x]
+                };
+            }
+        }
+    }
+
+    cur
+}
+
+/// Bilinearly upsamples raw refined SAM logits to the `512×512` `R8` mask tile BEFORE applying
+/// a crisp anti-aliased sigmoid around `logit = 0.0` (matching official SAM 2/3 logit-space
+/// interpolation while keeping pure background at `0` and solid interior at `255`).
+fn upsample_logits_to_raster_mask(
+    logits: &[f32],
     src_w: usize,
     src_h: usize,
     invert: bool,
 ) -> MaskShape {
     let grid = LAYER_MASK_TILE_SIZE;
     let mut bytes = vec![0u8; grid * grid];
-    if src_w == 0 || src_h == 0 || probs.len() < src_w * src_h {
+    if src_w == 0 || src_h == 0 || logits.len() < src_w * src_h {
         if invert {
             bytes.fill(255);
         }
         return MaskShape::from_raster_u8(grid as u32, grid as u32, &bytes);
     }
 
+    const LOGIT_GAIN: f32 = 4.5;
+    let sx_scale = src_w as f32 / grid as f32;
+    let sy_scale = src_h as f32 / grid as f32;
     let max_sx = (src_w - 1) as f32;
     let max_sy = (src_h - 1) as f32;
-    let scale_x = if grid > 1 {
-        max_sx / (grid - 1) as f32
-    } else {
-        0.0
-    };
-    let scale_y = if grid > 1 {
-        max_sy / (grid - 1) as f32
-    } else {
-        0.0
-    };
 
     for gy in 0..grid {
-        let fy = (gy as f32 * scale_y).clamp(0.0, max_sy);
+        let fy = ((gy as f32 + 0.5) * sy_scale - 0.5).clamp(0.0, max_sy);
         let y0 = fy.floor() as usize;
         let y1 = (y0 + 1).min(src_h - 1);
         let ty = fy - y0 as f32;
@@ -925,19 +1049,27 @@ fn upsample_probs_to_raster_mask(
         let dst_row = gy * grid;
 
         for gx in 0..grid {
-            let fx = (gx as f32 * scale_x).clamp(0.0, max_sx);
+            let fx = ((gx as f32 + 0.5) * sx_scale - 0.5).clamp(0.0, max_sx);
             let x0 = fx.floor() as usize;
             let x1 = (x0 + 1).min(src_w - 1);
             let tx = fx - x0 as f32;
 
-            let p00 = probs[row0 + x0];
-            let p10 = probs[row0 + x1];
-            let p01 = probs[row1 + x0];
-            let p11 = probs[row1 + x1];
-            let top = p00 + (p10 - p00) * tx;
-            let bot = p01 + (p11 - p01) * tx;
-            let v = (top + (bot - top) * ty).clamp(0.0, 1.0);
-            let q = (v * 255.0).round() as u8;
+            let l00 = logits[row0 + x0];
+            let l10 = logits[row0 + x1];
+            let l01 = logits[row1 + x0];
+            let l11 = logits[row1 + x1];
+            let top = l00 + (l10 - l00) * tx;
+            let bot = l01 + (l11 - l01) * tx;
+            let logit = top + (bot - top) * ty;
+
+            let scaled = (logit * LOGIT_GAIN).clamp(-20.0, 20.0);
+            let mut prob = 1.0 / (1.0 + (-scaled).exp());
+            if prob < 0.005 {
+                prob = 0.0;
+            } else if prob > 0.995 {
+                prob = 1.0;
+            }
+            let q = (prob * 255.0).round() as u8;
             bytes[dst_row + gx] = if invert { 255 - q } else { q };
         }
     }
@@ -982,4 +1114,146 @@ pub(crate) fn compute_image_fingerprint(image: &LinearImage) -> u64 {
         }
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_image(w: u32, h: u32, rgba16f: Vec<f16>) -> LinearImage {
+        LinearImage {
+            width: w,
+            height: h,
+            rgba16f,
+            histogram_proxy: Vec::new(),
+            display_name: "test".to_owned(),
+            source_path: None,
+            format_label: "Test".to_owned(),
+            exif: None,
+            camera_calibration: None,
+        }
+    }
+
+    fn make_uniform_image(w: u32, h: u32, lin_rgb: [f32; 3]) -> LinearImage {
+        let mut rgba16f = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            rgba16f.push(f16::from_f32(lin_rgb[0]));
+            rgba16f.push(f16::from_f32(lin_rgb[1]));
+            rgba16f.push(f16::from_f32(lin_rgb[2]));
+            rgba16f.push(f16::from_f32(1.0));
+        }
+        make_test_image(w, h, rgba16f)
+    }
+
+    #[test]
+    fn guided_logit_refinement_eliminates_stride4_checkerboard_ripples() {
+        let size = 64usize;
+        let image = make_uniform_image(size as u32, size as u32, [0.35, 0.25, 0.20]);
+
+        // Synthetic SAM 2.1 ConvTranspose2d stride-4 grid: foreground around +1.8 with ±1.1
+        // period-4 and period-2 ripples on the left half, background around -3.5 with ±0.9
+        // ripples on the right half (no image edge on uniform test — verifies pure nulling).
+        let mut fg_logits = vec![0.0_f32; size * size];
+        let mut bg_logits = vec![0.0_f32; size * size];
+        for y in 0..size {
+            let cy4 = if y % 4 == 0 { 1.0 } else { -1.0 / 3.0 };
+            let cy2 = if y % 2 == 0 { 0.4 } else { -0.4 };
+            for x in 0..size {
+                let cx4 = if x % 4 == 0 { 1.0 } else { -1.0 / 3.0 };
+                let cx2 = if x % 2 == 0 { 0.4 } else { -0.4 };
+                let ripple = 0.8 * (cx4 + cy4) + 0.5 * (cx2 + cy2);
+                fg_logits[y * size + x] = 1.8 + ripple;
+                bg_logits[y * size + x] = -3.5 + ripple;
+            }
+        }
+
+        let clean_fg = refine_sam_logits_guided(&fg_logits, size, size, &image);
+        let clean_bg = refine_sam_logits_guided(&bg_logits, size, size, &image);
+
+        // Interior pixels must have virtually zero residual ripple.
+        let mut fg_min = f32::INFINITY;
+        let mut fg_max = f32::NEG_INFINITY;
+        for y in 4..(size - 4) {
+            for x in 4..(size - 4) {
+                let v = clean_fg[y * size + x];
+                fg_min = fg_min.min(v);
+                fg_max = fg_max.max(v);
+            }
+        }
+        assert!(
+            (fg_max - fg_min) < 1e-4,
+            "period-2/4 checkerboard ripple should be completely nulled, got range {fg_min}..{fg_max}"
+        );
+
+        let fg_mask = upsample_logits_to_raster_mask(&clean_fg, size, size, false);
+        let bg_mask = upsample_logits_to_raster_mask(&clean_bg, size, size, false);
+        let bg_inv = upsample_logits_to_raster_mask(&clean_bg, size, size, true);
+
+        assert!(
+            fg_mask
+                .decode_raster_u8()
+                .unwrap()
+                .2
+                .iter()
+                .all(|&b| b == 255),
+            "solid foreground logits should snap cleanly to 255"
+        );
+        assert!(
+            bg_mask
+                .decode_raster_u8()
+                .unwrap()
+                .2
+                .iter()
+                .all(|&b| b == 0),
+            "background logits should snap cleanly to 0 with no leak"
+        );
+        assert!(
+            bg_inv
+                .decode_raster_u8()
+                .unwrap()
+                .2
+                .iter()
+                .all(|&b| b == 255),
+            "inverted background logits should snap cleanly to 255"
+        );
+    }
+
+    #[test]
+    fn guided_logit_refinement_preserves_sharp_photo_edges() {
+        let size = 64usize;
+        let mut rgba16f = Vec::with_capacity(size * size * 4);
+        let mut logits = vec![0.0_f32; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                // High-contrast vertical boundary at x = 32: dark foreground on left, bright bg on right.
+                let is_fg = x < 32;
+                let lum = if is_fg { 0.04 } else { 0.82 };
+                rgba16f.push(f16::from_f32(lum));
+                rgba16f.push(f16::from_f32(lum));
+                rgba16f.push(f16::from_f32(lum));
+                rgba16f.push(f16::from_f32(1.0));
+
+                let ripple = if (x % 4 == 0) ^ (y % 4 == 0) {
+                    0.9
+                } else {
+                    -0.9
+                };
+                logits[y * size + x] = if is_fg { 2.5 + ripple } else { -3.0 + ripple };
+            }
+        }
+        let image = make_test_image(size as u32, size as u32, rgba16f);
+
+        let clean = refine_sam_logits_guided(&logits, size, size, &image);
+        // Right next to the boundary (x = 31 vs x = 32), the Lab edge must stop logit bleed.
+        let left_edge = clean[32 * size + 31];
+        let right_edge = clean[32 * size + 32];
+        assert!(
+            left_edge > 1.5,
+            "foreground edge pixel should remain strongly positive, got {left_edge}"
+        );
+        assert!(
+            right_edge < -1.5,
+            "background edge pixel should remain strongly negative, got {right_edge}"
+        );
+    }
 }
