@@ -11,6 +11,7 @@ pub mod color_science;
 pub mod curves;
 pub mod geometry;
 pub mod layers;
+pub mod models;
 pub mod patch;
 pub mod profile_io;
 pub mod profiles;
@@ -42,8 +43,18 @@ pub use crate::layers::{
     AdjustmentLayer, BrushDab, HealMode, HealSpot, LAYER_MASK_ATLAS_HEIGHT, LAYER_MASK_ATLAS_WIDTH,
     LAYER_MASK_TILE_SIZE, LayerLumaRangeSpec, LayerMaskAtlas, LayerMaskItem, LocalAdjustments,
     MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK, MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER,
-    MaskCombineOp, MaskShape, apply_local_adjustments_linear, bake_layer_mask_atlas, decode_base64,
-    encode_base64, evaluate_spatial_mask_shape, luma_range_mask,
+    MAX_RASTER_MASK_DIM, MaskCombineOp, MaskShape, apply_local_adjustments_linear,
+    bake_layer_mask_atlas, decode_base64, encode_base64, evaluate_spatial_mask_shape,
+    luma_range_mask,
+};
+pub use crate::models::{
+    AiModelConfig, MAX_PROMPT_POINTS, MODEL_SPECS, ModelFileSpec, ModelId, ModelInstallState,
+    ModelSpec, ModelStatus, PromptBox, PromptPoint, RUNE_MODELS_DIR_ENV, SegmentationEngine,
+    SmartMaskPrompt, ai_model_config_path, inspect_all_model_statuses,
+    inspect_all_model_statuses_in, inspect_model_install, inspect_model_install_in,
+    inspect_model_status, inspect_model_status_in, load_ai_model_config, load_ai_model_config_from,
+    model_decoder_path, model_dir, model_dir_in, model_encoder_path, model_spec, models_root_dir,
+    save_ai_model_config, save_ai_model_config_to,
 };
 pub use crate::patch::{
     BatchJob, EditActor, EditHistoryEntry, EditOp, FieldDiff, HslBandId, MatchReferenceOp,

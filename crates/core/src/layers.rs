@@ -1,5 +1,5 @@
 //! Capture One-style Adjustment Layers, Composable Masks (`Add`/`Subtract`/`Intersect`),
-//! Linear/Radial/Luma/Brush/Raster masks, Spot Heal & Clone, and unified `1024×512` `R8Unorm`
+//! Linear/Radial/Luma/Brush/Raster masks, Spot Heal & Clone, and unified `2048×1024` `R8Unorm`
 //! mask atlas baking with exact GPU↔CPU parity.
 
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,13 @@ pub const MAX_ADJUSTMENT_LAYERS: usize = 8;
 /// Maximum number of composable mask items stored per adjustment layer.
 pub const MAX_MASKS_PER_LAYER: usize = 4;
 
-/// Resolution (`256×256`) of each layer's baked spatial mask tile inside the `4×2` atlas.
-pub const LAYER_MASK_TILE_SIZE: usize = 256;
+/// Resolution (`512×512`) of each layer's baked spatial mask tile inside the `4×2` atlas.
+pub const LAYER_MASK_TILE_SIZE: usize = 512;
 
-/// Width in pixels of the `4×2` `R8Unorm` layer mask atlas (`1024`).
+/// Width in pixels of the `4×2` `R8Unorm` layer mask atlas (`2048`).
 pub const LAYER_MASK_ATLAS_WIDTH: u32 = (LAYER_MASK_TILE_SIZE * 4) as u32;
 
-/// Height in pixels of the `4×2` `R8Unorm` layer mask atlas (`512`).
+/// Height in pixels of the `4×2` `R8Unorm` layer mask atlas (`1024`).
 pub const LAYER_MASK_ATLAS_HEIGHT: u32 = (LAYER_MASK_TILE_SIZE * 2) as u32;
 
 /// Maximum number of Spot Heal / Clone stamps evaluated in Stage 0.
@@ -28,8 +28,14 @@ pub const MAX_HEAL_SPOTS: usize = 16;
 /// to bound CPU mask baking work against untrusted sidecar or MCP payloads.
 pub const MAX_BRUSH_DABS_PER_MASK: usize = 1024;
 
-/// Maximum base64 byte length accepted by [`MaskShape::decode_raster_u8`] (`512×512×2` bytes).
-const MAX_RASTER_MASK_B64_LEN: usize = 512 * 512 * 2;
+/// Maximum width or height accepted for [`MaskShape::RasterMask`] (`1024×1024`) to prevent
+/// OOM denial-of-service from untrusted sidecars while supporting legacy `256×256`, native
+/// `512×512`, and high-resolution `1024×1024` masks.
+pub const MAX_RASTER_MASK_DIM: u32 = 1024;
+
+/// Maximum base64 byte length accepted by [`MaskShape::decode_raster_u8`] (`1024×1024×2` bytes).
+const MAX_RASTER_MASK_B64_LEN: usize =
+    (MAX_RASTER_MASK_DIM as usize) * (MAX_RASTER_MASK_DIM as usize) * 2;
 
 const fn default_true() -> bool {
     true
@@ -217,8 +223,8 @@ impl MaskShape {
 
     /// Encodes an `R8` (`width * height` bytes) mask buffer into a compact [`MaskShape::RasterMask`].
     pub fn from_raster_u8(width: u32, height: u32, bytes: &[u8]) -> Self {
-        let w = width.clamp(1, 512);
-        let h = height.clamp(1, 512);
+        let w = width.clamp(1, MAX_RASTER_MASK_DIM);
+        let h = height.clamp(1, MAX_RASTER_MASK_DIM);
         let expected = (w as usize) * (h as usize);
         let mut buf = vec![0u8; expected];
         let copy_len = expected.min(bytes.len());
@@ -242,8 +248,8 @@ impl MaskShape {
         };
         if *width == 0
             || *height == 0
-            || *width > 512
-            || *height > 512
+            || *width > MAX_RASTER_MASK_DIM
+            || *height > MAX_RASTER_MASK_DIM
             || data_b64.len() > MAX_RASTER_MASK_B64_LEN
         {
             return None;
@@ -318,8 +324,8 @@ impl MaskShape {
                 height,
                 data_b64,
             } => Self::RasterMask {
-                width: (*width).clamp(1, 512),
-                height: (*height).clamp(1, 512),
+                width: (*width).clamp(1, MAX_RASTER_MASK_DIM),
+                height: (*height).clamp(1, MAX_RASTER_MASK_DIM),
                 data_b64: if data_b64.len() <= MAX_RASTER_MASK_B64_LEN {
                     data_b64.clone()
                 } else {
@@ -736,7 +742,7 @@ impl LayerLumaRangeSpec {
     }
 }
 
-/// Baked `1024×512` `R8Unorm` mask atlas (4×2 grid of `256×256` tiles for up to 8 layers)
+/// Baked `2048×1024` `R8Unorm` mask atlas (4×2 grid of `512×512` tiles for up to 8 layers)
 /// plus per-layer spatial-mask presence flags and live Luma Range specifications.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerMaskAtlas {
@@ -748,7 +754,7 @@ pub struct LayerMaskAtlas {
 }
 
 impl LayerMaskAtlas {
-    /// Creates an empty zeroed `1024×512` atlas.
+    /// Creates an empty zeroed `2048×1024` atlas.
     pub fn empty() -> Self {
         Self {
             width: LAYER_MASK_ATLAS_WIDTH,
@@ -759,7 +765,7 @@ impl LayerMaskAtlas {
         }
     }
 
-    /// Samples layer `layer_idx`'s `256×256` spatial tile at normalized UV `(u, v)` in `[0, 1]^2`
+    /// Samples layer `layer_idx`'s `512×512` spatial tile at normalized UV `(u, v)` in `[0, 1]^2`
     /// using bilinear interpolation clamped strictly to texel centers (matching WGSL hardware
     /// `Linear` sampling with zero cross-tile bleed).
     #[inline]
@@ -985,7 +991,7 @@ fn sample_raster_u8(bytes: &[u8], width: u32, height: u32, u: f32, v: f32) -> f3
 }
 
 /// Bakes all spatial masks (`Filled`, `LinearGradient`, `RadialGradient`, `BrushStrokes`,
-/// `RasterMask`) across up to 8 [`AdjustmentLayer`]s into the unified `1024×512` `R8Unorm`
+/// `RasterMask`) across up to 8 [`AdjustmentLayer`]s into the unified `2048×1024` `R8Unorm`
 /// [`LayerMaskAtlas`], while extracting per-layer live [`LayerLumaRangeSpec`] uniforms.
 pub fn bake_layer_mask_atlas(layers: &[AdjustmentLayer]) -> LayerMaskAtlas {
     type DecodedRaster = (u32, u32, Vec<u8>);
@@ -1045,6 +1051,10 @@ pub fn bake_layer_mask_atlas(layers: &[AdjustmentLayer]) -> LayerMaskAtlas {
                 for (item, raster_opt) in &spatial_items {
                     let mut val = if let Some((rw, rh, bytes)) = raster_opt {
                         sample_raster_u8(bytes, *rw, *rh, u, v)
+                    } else if matches!(item.shape, MaskShape::RasterMask { .. }) {
+                        // Invalid/undecodable raster mask was already checked once above; never
+                        // fall back to `evaluate_spatial_mask_shape` (which would re-decode per pixel).
+                        0.0
                     } else {
                         evaluate_spatial_mask_shape(&item.shape, u, v)
                     };
@@ -1362,5 +1372,93 @@ mod tests {
             data_b64: "A".repeat(MAX_RASTER_MASK_B64_LEN + 4),
         };
         assert!(oversized_raster.decode_raster_u8().is_none());
+    }
+
+    #[test]
+    fn atlas_512_tile_bake_and_legacy_256_raster_resample() {
+        assert_eq!(LAYER_MASK_TILE_SIZE, 512);
+        assert_eq!(LAYER_MASK_ATLAS_WIDTH, 2048);
+        assert_eq!(LAYER_MASK_ATLAS_HEIGHT, 1024);
+
+        // 1) Native 512x512 RasterMask bakes 1:1 into tile 0.
+        let mut ramp_512 = vec![0u8; 512 * 512];
+        for y in 0..512usize {
+            for x in 0..512usize {
+                ramp_512[y * 512 + x] = ((x * 255 + 255) / 511) as u8;
+            }
+        }
+        let layer_512 = AdjustmentLayer::new_with_mask(
+            "l512",
+            "AI 512",
+            MaskShape::from_raster_u8(512, 512, &ramp_512),
+        );
+
+        // 2) Legacy 256x256 RasterMask deserialized from sidecar JSON bilinearly resamples into 512x512 tile 1.
+        let mut ramp_256 = vec![0u8; 256 * 256];
+        for y in 0..256usize {
+            for x in 0..256usize {
+                ramp_256[y * 256 + x] = y as u8;
+            }
+        }
+        let legacy_json = serde_json::json!({
+            "type": "raster_mask",
+            "width": 256,
+            "height": 256,
+            "data_b64": encode_base64(&ramp_256),
+        });
+        let legacy_shape: MaskShape = serde_json::from_value(legacy_json).unwrap();
+        let layer_256 = AdjustmentLayer::new_with_mask("l256", "Legacy 256", legacy_shape);
+
+        let atlas = bake_layer_mask_atlas(&[layer_512, layer_256]);
+        assert_eq!(atlas.width, 2048);
+        assert_eq!(atlas.height, 1024);
+        assert_eq!(atlas.data.len(), 2048 * 1024);
+        assert!(atlas.layer_has_spatial[0]);
+        assert!(atlas.layer_has_spatial[1]);
+
+        // Verify 512x512 horizontal ramp endpoints and midpoint
+        assert!(atlas.sample_tile(0, 0.0, 0.5) < 0.01);
+        assert!((atlas.sample_tile(0, 0.5, 0.5) - 0.5).abs() < 0.01);
+        assert!(atlas.sample_tile(0, 1.0, 0.5) > 0.99);
+
+        // Verify legacy 256x256 vertical ramp bilinearly resampled cleanly into 512x512 tile 1
+        assert!(atlas.sample_tile(1, 0.5, 0.0) < 0.01);
+        assert!((atlas.sample_tile(1, 0.5, 0.25) - 0.25).abs() < 0.01);
+        assert!((atlas.sample_tile(1, 0.5, 0.5) - 0.5).abs() < 0.01);
+        assert!((atlas.sample_tile(1, 0.5, 0.75) - 0.75).abs() < 0.01);
+        assert!(atlas.sample_tile(1, 0.5, 1.0) > 0.99);
+
+        // 3) DoS dimension cap: 1024x1024 allowed, >1024 rejected by decode_raster_u8 & clamped by sanitized().
+        let huge_dims = MaskShape::RasterMask {
+            width: MAX_RASTER_MASK_DIM + 1,
+            height: MAX_RASTER_MASK_DIM + 1,
+            data_b64: encode_base64(&[255u8; 16]),
+        };
+        assert!(huge_dims.decode_raster_u8().is_none());
+        if let MaskShape::RasterMask { width, height, .. } = huge_dims.sanitized() {
+            assert_eq!(width, MAX_RASTER_MASK_DIM);
+            assert_eq!(height, MAX_RASTER_MASK_DIM);
+        } else {
+            panic!("expected RasterMask");
+        }
+
+        // 4) DoS hardening: invalid-base64 2 MiB RasterMask bakes cleanly in O(tile) to 0.0
+        // without re-decoding per pixel.
+        let mut bad_b64 = "A".repeat(MAX_RASTER_MASK_B64_LEN - 4);
+        bad_b64.push_str("!!!!");
+        let bad_layer = AdjustmentLayer::new_with_mask(
+            "l_bad_b64",
+            "Bad B64",
+            MaskShape::RasterMask {
+                width: 512,
+                height: 512,
+                data_b64: bad_b64,
+            },
+        );
+        let bad_atlas = bake_layer_mask_atlas(&[bad_layer]);
+        assert!(bad_atlas.layer_has_spatial[0]);
+        assert_eq!(bad_atlas.sample_tile(0, 0.0, 0.0), 0.0);
+        assert_eq!(bad_atlas.sample_tile(0, 0.5, 0.5), 0.0);
+        assert_eq!(bad_atlas.sample_tile(0, 1.0, 1.0), 0.0);
     }
 }
