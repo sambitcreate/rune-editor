@@ -16,10 +16,11 @@ description: Non-destructively inspect, analyze, color-grade, cull, preview, ver
 ## 1. Self-Discovery (Zero Hallucinated Flags)
 
 ```bash
-rd capabilities                  # Check OS, RAW decode tier, formats, built-in presets
-rd schema recipe                 # Exact parameter IDs, min/max bounds, defaults, enums
-rd cli search skin               # Search commands, parameters, and presets by keyword
+rd capabilities                  # Check OS, RAW decode tier, formats, built-in presets & camera profiles
+rd schema recipe                 # Exact parameter IDs, min/max bounds, defaults, enums, builtin_camera_profiles
+rd cli search skin               # Search commands, parameters, presets, and camera profiles by keyword
 rd preset list                   # Built-in styles: neutral, warm_film, classic_chrome, editorial_bw, moody_dusk, alpine_crisp
+rd profile list --make Apple --camera "iPhone 16 Pro"  # List 14 bundled MIT Camera Profiles + imported user profiles with EXIF matches
 ```
 
 ---
@@ -35,9 +36,9 @@ rd preset list                   # Built-in styles: neutral, warm_film, classic_
 
 2. **Apply Edits Non-Destructively (`--dry-run` optional):**
    ```bash
-   # Mix a built-in preset + Base Characteristics curve + WB preset + targeted scalar/HSL/detail nudges:
+   # Apply a Camera Profile / Film Simulation + Base Characteristics curve + WB preset + targeted scalar/HSL/detail nudges:
    rd edit photo.ARW \
-     --preset classic_chrome --mix 0.8 \
+     --profile classic_chrome --profile-strength 0.85 \
      --film-curve film_extra_shadow \
      --wb-preset daylight \
      --set exposure+=0.25 \
@@ -52,10 +53,16 @@ rd preset list                   # Built-in styles: neutral, warm_film, classic_
    ```
    Or pass a typed sparse JSON `RecipePatch` via stdin (`deny_unknown_fields` catches typos immediately):
    ```bash
-   echo '{"film_curve":"film_high_contrast","wb_preset":"cloudy","exposure":"+0.30","highlights":-0.40,"curves":{"rgb":[[0,0],[0.25,0.22],[0.75,0.79],[1,1]]},"levels":{"red":{"in_black":0.02}},"wheels":{"master":{"hue_x":0.08,"luma":0.02}},"geometry":{"aspect_preset":"FourFive"}}' \
+   echo '{"camera_profile":"pro_standard","profile_strength":0.9,"film_curve":"film_high_contrast","wb_preset":"cloudy","exposure":"+0.30","highlights":-0.40,"curves":{"rgb":[[0,0],[0.25,0.22],[0.75,0.79],[1,1]]},"levels":{"red":{"in_black":0.02}},"wheels":{"master":{"hue_x":0.08,"luma":0.02}},"geometry":{"aspect_preset":"FourFive"}}' \
      | rd edit photo.ARW --patch -
    ```
    `RecipePatch` (shared by `rd edit --patch` and MCP `rune_edit_photo.patch`) supports:
+   - **Camera Profiles, Film Simulations & External `.dcp`/`.icc`/`.cube` Import:**
+     - `camera_profile`: 14 bundled MIT-licensed analytical `33³` 3D LUT profiles + user-imported `user:<slug>` profiles (`--profile <id>` on `rd edit`, top-level `camera_profile` on MCP `rune_edit_photo`, applied **before** `patch`/`set` on both surfaces):
+       - **Calibration Bases (5):** `auto` (*Auto (Camera Matched)* — dual-illuminant `rawler` 738-camera Bradford matrix on RAW, neutral identity on raster), `pro_standard` (*Rune ProStandard* — OKLab hue-invariant contrast with skin & foliage gamut protection), `camera_generic` (*Camera Generic*), `apple_raw` (*Apple Native RAW*), `linear_scientific` (*Linear Scientific* — flat colorimetric linear).
+       - **Curated Film Simulations (9):** `portrait_natural` (*Portrait Natural*), `landscape_crisp` (*Landscape Crisp*), `editorial_neutral` (*Editorial Neutral*), `classic_chrome` (*Classic Chrome*), `vivid_velvia` (*Vivid Velvia*), `soft_astia` (*Soft Astia*), `acros_mono` (*Acros Monochrome*), `warm_portra` (*Warm Portra 400*), `tungsten_cine` (*Tungsten Cine 800T*).
+       - **User Profiles (`user:<slug>`):** Pure-Rust `.dcp` (Adobe DNG Camera Profile), `.icc`/`.icm` (matrix-shaper & `A2B0` `mft1`/`mft2`), and `.cube` (3D LUT up to `65³`) imported safely into `~/.config/rune-darkroom/profiles` (`16 MiB` cap, symlink/traversal blocked, EXIF camera auto-matching).
+     - `profile_strength`: `0.0..=1.0` blend strength (default `1.0`; CLI `--profile-strength <0..1>`, MCP `profile_strength`, applied before `patch`/`set`).
    - **Base Characteristics, Film Negative Conversion & White Balance Presets:**
      - `processing_mode`: `"photography"` (default) or `"film_negative"` (CLI `--processing-mode <mode>`, MCP `rune_edit_photo.processing_mode`).
      - `film_negative`: Stage 0.5 linear orange-mask neutralization (`base_r`/`base_g`/`base_b` `0.05..=2.0`, `density` `-1..1`, `contrast` `-1..1`, `black_clip` `0..0.45`, `white_clip` `0.55..1.0`). Sample an unexposed film border with CLI `--pick-film-base <x,y>` or MCP `film_base_pick: [x, y]` (applied before `patch`/`set` to match CLI↔MCP precedence).
@@ -144,8 +151,18 @@ jq -r 'select(.analysis.focus.sharpness_score < 20) | .path' /tmp/shoot.ndjson \
 rd cull ./shoot/DSC0012.ARW ./shoot/DSC0015.ARW --pick --rate 5 --color-tag green
 ```
 
-### B. Virtual Variants, Reusable User Styles & Selective Adjustments Clipboard
+### B. Camera Profiles & Film Simulations (`rd profile`), Virtual Variants, User Styles & Selective Clipboard
 ```bash
+# List all 14 bundled MIT profiles + imported user profiles (with optional EXIF camera match highlight):
+rd profile list
+rd profile list --make Sony --camera "ILCE-7RM5" --json
+
+# Import external `.dcp`, `.icc`, `.icm`, or `.cube` profiles into `~/.config/rune-darkroom/profiles`:
+rd profile import ./SonyA7RV_Natural.dcp --name sony_a7rv_natural
+rd profile import ./Kodak2383.cube --name kodak_2383 --overwrite
+rd edit photo.ARW --profile user:kodak_2383 --profile-strength 0.75
+rd profile delete kodak_2383
+
 # Non-destructive Virtual Variants inside `.rune-edit.json`:
 rd variant list photo.ARW
 rd variant clone photo.ARW --label "B&W Print"
@@ -243,20 +260,29 @@ Rune Darkroom ships a localhost-only (`127.0.0.1`) **MCP `2025-11-25`** server w
 | Tool | Key Parameters & Capabilities |
 | :--- | :--- |
 | `rune_get_schema` | Returns registered parameter bounds, tool groups, built-in presets, and the active GUI session snapshot. |
-| `rune_inspect_photo` | Fast read-only EXIF, Kelvin WB readout (`wb_kelvin`, `wb_preset`), `film_curve`, **`processing_mode`** (+ `film_negative` when active), rating, cull flag, **`color_tag`**, virtual variant summary, **`layer_count`**, **`layers`**, **`heal_spot_count`**, and non-default recipe overrides (`path` optional). |
+| `rune_inspect_photo` | Fast read-only EXIF, **`camera_profile`**, **`profile_strength`**, Kelvin WB readout (`wb_kelvin`, `wb_preset`), `film_curve`, **`processing_mode`** (+ `film_negative` when active), rating, cull flag, **`color_tag`**, virtual variant summary, **`layer_count`**, **`layers`**, **`heal_spot_count`**, and non-default recipe overrides (`path` optional). |
 | `rune_analyze_photo` | Quantitative tone, clipping, Zone 0–X, Lab cast, skin tones, palette, sharpness, and auto suggestions (`path`, `proxy_edge`, `fast`). |
-| `rune_edit_photo` | Non-destructive edit with `preset` + `mix`, `auto` (`["wb","tone","levels","all"]`), **`processing_mode`** (`photography`/`film_negative`), **`film_base_pick`** (`[x, y]`), **`wb_pick`** (`[x, y]`), **`wb_preset`**, **`film_curve`**, **`vignette_method`**, **`skin_pick`** (`[x, y]`), **`color_slice_pick`** (`{index, x, y}`), typed sparse **`patch`** (supports `processing_mode`, `film_negative.*`, `curves.rgb`, per-channel `levels.{red,green,blue}`, `wheels.master`, `bw.split_*`, `clarity_method`, `sharpen_radius`/`threshold`/`halo`, `nr_color`, `grain_type`, `grain_size`, `advanced_color`, `skin_tone`, `lens`, `geometry.keystone_*`), dot-path `set`, `reset`, `agent`, and `dry_run`. |
-| `rune_preview_photo` | Full-parity render (spatial detail, vignette, grain, geometry, layers, heal/clone, film negative, Catmull-Rom) returning inline base64 JPEG `ImageContent` + clipping telemetry. Optional `out` writes to disk safely (raster extensions only; rejects RAW/source paths; `overwrite: false` by default — pass `"overwrite": true` to replace an existing file). |
+| `rune_edit_photo` | Non-destructive edit with `preset` + `mix`, `auto` (`["wb","tone","levels","all"]`), **`camera_profile`** (`auto`, `pro_standard`, `classic_chrome`, `user:<slug>`, etc.), **`profile_strength`** (`0.0..=1.0`, applied before `patch`/`set`), **`processing_mode`** (`photography`/`film_negative`), **`film_base_pick`** (`[x, y]`), **`wb_pick`** (`[x, y]`), **`wb_preset`**, **`film_curve`**, **`vignette_method`**, **`skin_pick`** (`[x, y]`), **`color_slice_pick`** (`{index, x, y}`), typed sparse **`patch`** (supports `camera_profile`, `profile_strength`, `processing_mode`, `film_negative.*`, `curves.rgb`, per-channel `levels.{red,green,blue}`, `wheels.master`, `bw.split_*`, `clarity_method`, `sharpen_radius`/`threshold`/`halo`, `nr_color`, `grain_type`, `grain_size`, `advanced_color`, `skin_tone`, `lens`, `geometry.keystone_*`), dot-path `set`, `reset`, `agent`, and `dry_run`. |
+| `rune_preview_photo` | Full-parity render (camera profile 3D LUT, spatial detail, vignette, grain, geometry, layers, heal/clone, film negative, Catmull-Rom) returning inline base64 JPEG `ImageContent` + clipping telemetry. Optional `out` writes to disk safely (raster extensions only; rejects RAW/source paths; `overwrite: false` by default — pass `"overwrite": true` to replace an existing file). |
 | `rune_diff_photo` | Computes CIEDE2000 color delta, EV shift, clipping deltas, and field diffs (`against_preset` optional). Supports **`assertions`** (`max_highlight_clip_pct`, `max_shadow_clip_pct`, `max_skin_de2000`, `max_mean_de2000`) to enforce quantitative guardrails. |
 | `rune_cull_or_export` | `action: "cull"` (`rating` `0..5`, `flag`: `pick`/`reject`/`none`, **`color_tag`**: `none`/`red`/`orange`/`yellow`/`green`/`blue`/`purple`/`pink`) or `action: "export"` (`out`, `format`, `quality`, `max_edge`, **`naming_template`**, **`watermark`** `{text, opacity, scale, position}`, **`strip_metadata`**, **`color_space`** `srgb`/`display_p3`, **`recipes`** multi-recipe array, **`overwrite`** defaulting to `false`). Rejects RAW extensions, non-image extensions, traversal subfolders, and source-file paths. |
-| `rune_manage_workflow` | Capture One workflow operations (`action`): **`variant_list`**, **`variant_new`**, **`variant_clone`**, **`variant_select`**, **`variant_delete`**, **`style_list`**, **`style_save`** (`autoselect_adjusted`, traversal-safe slug), **`style_apply`** (`stack`, `strength`), **`style_delete`**, **`copy_selective_groups`** (`src_path`, `dst_path`, `groups`, `autoselect_adjusted`), and **`session_init`** (`dir`, traversal/symlink-safe 4-folder Capture One session creation). |
+| `rune_manage_workflow` | Capture One workflow operations (`action`): **`profile_list`** (optional EXIF `camera_make`/`camera_model` for camera-match sorting; pinned strictly to `~/.config/rune-darkroom/profiles` — untrusted `profiles_dir` is rejected), **`variant_list`**, **`variant_new`**, **`variant_clone`**, **`variant_select`**, **`variant_delete`**, **`style_list`**, **`style_save`** (`autoselect_adjusted`, traversal-safe slug), **`style_apply`** (`stack`, `strength`), **`style_delete`**, **`copy_selective_groups`** (`src_path`, `dst_path`, `groups`, `autoselect_adjusted`), and **`session_init`** (`dir`, traversal/symlink-safe 4-folder Capture One session creation). |
 | `rune_edit_layers` | Non-destructive Adjustment Layers (up to 8), Composable Masks (`add`/`subtract`/`intersect` for `filled`/`linear`/`radial`/`luma`/`brush`/`ai_subject`/`ai_background`), Local Adjustments, and Spot Heal/Clone (up to 16) via `action`: **`layer_list`**, **`layer_add`**, **`layer_update`**, **`layer_remove`**, **`mask_add`**, **`mask_clear`**, **`ai_subject`**, **`ai_background`**, **`heal_list`**, **`heal_add`**, **`heal_remove`**, **`heal_clear`** (live GUI `⌘Z` undo sync). |
 
 ### Example MCP Tool Calls
 
 ```json
-// 1. Live-GUI edit with film_curve, wb_preset, skin_pick, color_slice_pick, lens, and keystone:
+// 1. List available Camera Profiles with EXIF auto-match via rune_manage_workflow:
 {
+  "action": "profile_list",
+  "camera_make": "Fujifilm",
+  "camera_model": "X-T5"
+}
+
+// 2. Live-GUI edit with camera_profile, profile_strength, film_curve, wb_preset, skin_pick, color_slice_pick, lens, and keystone:
+{
+  "camera_profile": "classic_chrome",
+  "profile_strength": 0.85,
   "film_curve": "film_extra_shadow",
   "wb_preset": "daylight",
   "vignette_method": "circular_on_crop",

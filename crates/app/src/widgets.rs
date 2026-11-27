@@ -6,11 +6,12 @@ use rune::{
     row, text,
 };
 use rune_editor_core::{
-    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, BlackAndWhiteParams, ClarityMethod,
-    ColorEditorSlice, ColorWheel, CompositionGrid, CropAspect, DevelopRecipe, FilmCurve,
-    FilmNegativeParams, GrainType, HISTOGRAM_BINS, HSL_BAND_COUNT, HSL_BAND_NAMES, LensParams,
-    LevelsParams, ProcessingMode, SkinToneParams, ToneCurves, VignetteMethod, WbPreset,
-    default_curve_points, linear_to_srgb, temperature_to_kelvin,
+    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, BUILTIN_CAMERA_PROFILES, BlackAndWhiteParams,
+    ClarityMethod, ColorEditorSlice, ColorWheel, CompositionGrid, CropAspect,
+    DEFAULT_CAMERA_PROFILE, DEFAULT_PROFILE_STRENGTH, DevelopRecipe, FilmCurve, FilmNegativeParams,
+    GrainType, HISTOGRAM_BINS, HSL_BAND_COUNT, HSL_BAND_NAMES, LensParams, LevelsParams,
+    ProcessingMode, ProfileCategory, SkinToneParams, ToneCurves, VignetteMethod, WbPreset,
+    canonical_profile_id, default_curve_points, linear_to_srgb, temperature_to_kelvin,
 };
 use rune_kit::{
     Button, ButtonVariant, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
@@ -2955,33 +2956,533 @@ fn hsl_editor_section(s: &AppState, k: &Kit) -> El {
     )
 }
 
-/// Capture One-style Base Characteristics card exposing Processing Mode (`Photography | Film Negative`)
-/// and the 4 Film Curves.
+/// Capture One-style Base Characteristics card exposing Camera Profile (Calibration,
+/// Film Simulations, and User `.dcp`/`.icc`/`.cube` profiles), Profile Strength, Film Curve,
+/// and Tier 1 `Advanced ▸` (Processing Mode & Profile Strength when neutral).
 fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
     let active_curve = s.recipe.film_curve;
     let active_mode = s.recipe.processing_mode;
-    let is_default =
-        active_curve == FilmCurve::FilmStandard && active_mode == ProcessingMode::Photography;
+    let active_profile = canonical_profile_id(&s.recipe.camera_profile);
+    let profile_strength = s.recipe.profile_strength;
+    let profile_is_default = active_profile == DEFAULT_CAMERA_PROFILE;
+    let strength_modified = (profile_strength - DEFAULT_PROFILE_STRENGTH).abs() > 0.005;
+    let mode_modified = active_mode != ProcessingMode::Photography;
+    let is_default = profile_is_default
+        && !strength_modified
+        && active_curve == FilmCurve::FilmStandard
+        && !mode_modified;
 
-    let mut mode_row = row()
-        .key("processing-mode-row")
-        .role("radiogroup")
-        .label("Processing mode")
-        .w_full()
-        .gap(space::PILL_GAP);
-    for mode in ProcessingMode::ALL {
-        let active = active_mode == mode;
-        mode_row = mode_row.child(crop_pill_btn(
+    let (active_profile_name, active_profile_matched) = s.active_camera_profile_label();
+
+    let profile_tip = InfoTip {
+        title: "Camera Profile",
+        shortcut: None,
+        description: "Applies a calibrated 33³ linear 3D color LUT (built-in Calibration, Film Simulation, or imported .dcp/.icc/.cube) before tone and color adjustments.",
+        cli_key: "camera_profile  ·  profile_strength",
+        tier: "Tier 0 · Color Pipeline",
+    };
+
+    let mut profile_label_cluster = row()
+        .items_center()
+        .gap(space::SM)
+        .child(text("Camera Profile").font(ty::control_label(k)).color(
+            if !profile_is_default || strength_modified {
+                k.c.text_base
+            } else {
+                k.c.text_muted
+            },
+        ))
+        .child(info_badge(
             k,
-            format!("proc-mode-{}", mode.cli_slug()),
-            "radio",
-            format!("Processing mode {}", mode.label()),
-            mode.label(),
-            size::PILL_H,
-            active,
-            k.c.text_muted,
-            move |s, tx| s.set_processing_mode_tx(mode, tx),
+            profile_tip,
+            s.hovered_info.is_some_and(|h| h.title == profile_tip.title),
         ));
+
+    if active_profile_matched {
+        profile_label_cluster = profile_label_cluster.child(
+            el().px(space::SM)
+                .py(space::MICRO)
+                .radius(k.radius.xs)
+                .fill(color::mcp_running_bg())
+                .border(border::HAIRLINE, color::mcp_running().alpha(0.45))
+                .child(
+                    text("Matched")
+                        .font(ty::mono_probe(k))
+                        .color(color::mcp_running()),
+                ),
+        );
+    }
+
+    let profile_header_row = row()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .child(profile_label_cluster)
+        .child(
+            text(if strength_modified {
+                format!("{:.0}%", profile_strength * 100.0)
+            } else if !profile_is_default {
+                "100%".to_owned()
+            } else {
+                "Auto".to_owned()
+            })
+            .font(ty::mono_compact(k))
+            .color(if !profile_is_default || strength_modified {
+                k.c.text_accent
+            } else {
+                k.c.text_faint
+            }),
+        );
+
+    let picker_chevron = if s.profile_picker_open {
+        &icons::CHEVRON_DOWN
+    } else {
+        &icons::CHEVRON_RIGHT
+    };
+
+    let mut selector_left = row().items_center().gap(space::SM).min_w(0.0).grow(1.0);
+    if !profile_is_default {
+        selector_left = selector_left.child(
+            el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                .radius(radius::circle(size::MODIFIED_DOT))
+                .fill(color::tool_modified_dot(k))
+                .a11y_hidden(),
+        );
+    }
+    selector_left = selector_left.child(
+        text(&active_profile_name)
+            .font(if !profile_is_default {
+                ty::control_label_medium(k)
+            } else {
+                ty::control_label(k)
+            })
+            .color(k.c.text_base)
+            .truncate(),
+    );
+
+    let profile_selector_btn = row()
+        .key("camera-profile-selector")
+        .role("button")
+        .label(format!("Camera Profile: {active_profile_name}"))
+        .expanded(s.profile_picker_open)
+        .focusable(true)
+        .focus_ring(
+            border::FOCUS_RING,
+            border::FOCUS_OFFSET_TIGHT,
+            k.c.border_focus,
+        )
+        .cursor(Cursor::Pointer)
+        .w_full()
+        .h(size::CAPSULE_SLIDER_H)
+        .px(space::XL)
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .radius(k.radius.lg)
+        .fill(if s.profile_picker_open {
+            k.c.layer_02
+        } else {
+            k.c.bg_base
+        })
+        .hover(k.c.layer_02)
+        .border(
+            border::HAIRLINE,
+            if s.profile_picker_open {
+                k.c.border_strong
+            } else {
+                k.c.border_base
+            },
+        )
+        .child(selector_left)
+        .child(
+            icon(picker_chevron, size::ICON_XS)
+                .color(k.c.icon_muted)
+                .a11y_hidden(),
+        )
+        .on_press(|s: &mut AppState| s.toggle_profile_picker());
+
+    let profile_strength_slider = || {
+        develop_scalar_slider(
+            k,
+            "slider-profile-strength",
+            "profile_strength",
+            "Profile Strength",
+            profile_strength,
+            format!("{:.0}%", profile_strength * 100.0),
+            |r, v| r.profile_strength = v,
+        )
+    };
+
+    let surface_strength_immediately = s.profile_picker_open || strength_modified;
+
+    let mut body = col()
+        .w_full()
+        .gap(space::ROW_GAP)
+        .child(profile_header_row)
+        .child(profile_selector_btn);
+
+    if surface_strength_immediately {
+        body = body.child(profile_strength_slider());
+    }
+
+    if s.profile_picker_open {
+        // Group 1: Calibration (5 built-ins: full-width Auto row + clean 2×2 Studio Airy grid)
+        let cal_specs: Vec<_> = BUILTIN_CAMERA_PROFILES
+            .iter()
+            .filter(|p| p.category == ProfileCategory::Calibration)
+            .collect();
+        let mut cal_group = col()
+            .key("profile-group-calibration")
+            .w_full()
+            .gap(space::XS)
+            .child(
+                text("CALIBRATION")
+                    .font(ty::mono_probe(k))
+                    .color(k.c.text_faint),
+            );
+        if let Some(&auto_spec) = cal_specs.first() {
+            let active = active_profile == auto_spec.id;
+            let pid = auto_spec.id;
+            let mut row_left = row().items_center().gap(space::SM).min_w(0.0).grow(1.0);
+            if active {
+                row_left = row_left.child(
+                    el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                        .radius(radius::circle(size::MODIFIED_DOT))
+                        .fill(k.c.text_accent)
+                        .a11y_hidden(),
+                );
+            }
+            row_left = row_left.child(
+                text(auto_spec.name)
+                    .font(if active {
+                        ty::control_label_medium(k)
+                    } else {
+                        ty::caption(k)
+                    })
+                    .color(if active {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    })
+                    .truncate(),
+            );
+            let mut item = row()
+                .key(format!("profile-opt-{pid}"))
+                .role("radio")
+                .label(format!("Camera profile {}", auto_spec.name))
+                .checked(active)
+                .focusable(true)
+                .focus_ring(
+                    border::FOCUS_RING,
+                    border::FOCUS_OFFSET_TIGHT,
+                    k.c.border_focus,
+                )
+                .cursor(Cursor::Pointer)
+                .w_full()
+                .h(size::PILL_COMPACT_H)
+                .px(space::MD)
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .radius(k.radius.sm)
+                .fill(color::pill_fill(k, active))
+                .hover(if active { k.c.layer_03 } else { k.c.layer_02 })
+                .border(border::HAIRLINE, color::pill_border(k, active))
+                .child(row_left);
+            if active {
+                item = item.child(
+                    text("Active")
+                        .font(ty::mono_probe(k))
+                        .color(k.c.text_accent),
+                );
+            }
+            cal_group = cal_group.child(item.on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                s.set_camera_profile_tx(pid, tx);
+            }));
+        }
+        for chunk in cal_specs.get(1..).unwrap_or(&[]).chunks(2) {
+            let mut r = row().w_full().gap(space::PILL_GAP);
+            for &spec in chunk {
+                let active = active_profile == spec.id;
+                let pid = spec.id;
+                let mut inner = row()
+                    .items_center()
+                    .justify_center()
+                    .gap(space::XS)
+                    .min_w(0.0);
+                if active {
+                    inner = inner.child(
+                        el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                            .radius(radius::circle(size::MODIFIED_DOT))
+                            .fill(k.c.text_accent)
+                            .a11y_hidden(),
+                    );
+                }
+                inner = inner.child(
+                    text(spec.name)
+                        .font(if active {
+                            ty::control_label_medium(k)
+                        } else {
+                            ty::caption(k)
+                        })
+                        .color(if active {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        })
+                        .truncate(),
+                );
+                r = r.child(
+                    row()
+                        .key(format!("profile-opt-{pid}"))
+                        .role("radio")
+                        .label(format!("Camera profile {}", spec.name))
+                        .checked(active)
+                        .focusable(true)
+                        .focus_ring(
+                            border::FOCUS_RING,
+                            border::FOCUS_OFFSET_TIGHT,
+                            k.c.border_focus,
+                        )
+                        .cursor(Cursor::Pointer)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .h(size::PILL_COMPACT_H)
+                        .px(space::SM)
+                        .center()
+                        .radius(k.radius.sm)
+                        .fill(color::pill_fill(k, active))
+                        .hover(if active { k.c.layer_03 } else { k.c.layer_02 })
+                        .border(border::HAIRLINE, color::pill_border(k, active))
+                        .child(inner)
+                        .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                            s.set_camera_profile_tx(pid, tx);
+                        }),
+                );
+            }
+            if chunk.len() == 1 {
+                r = r.child(el().grow(1.0).min_w(0.0).a11y_hidden());
+            }
+            cal_group = cal_group.child(r);
+        }
+
+        // Group 2: Film Simulations (9 built-ins in a compact 2-column Studio Airy grid)
+        let film_sims: Vec<_> = BUILTIN_CAMERA_PROFILES
+            .iter()
+            .filter(|p| p.category == ProfileCategory::FilmSimulation)
+            .collect();
+        let mut sim_group = col()
+            .key("profile-group-film-simulations")
+            .w_full()
+            .gap(space::XS)
+            .child(
+                text("FILM SIMULATIONS")
+                    .font(ty::mono_probe(k))
+                    .color(k.c.text_faint),
+            );
+        for chunk in film_sims.chunks(2) {
+            let mut r = row().w_full().gap(space::PILL_GAP);
+            for &spec in chunk {
+                let active = active_profile == spec.id;
+                let pid = spec.id;
+                let mut inner = row()
+                    .items_center()
+                    .justify_center()
+                    .gap(space::XS)
+                    .min_w(0.0);
+                if active {
+                    inner = inner.child(
+                        el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                            .radius(radius::circle(size::MODIFIED_DOT))
+                            .fill(k.c.text_accent)
+                            .a11y_hidden(),
+                    );
+                }
+                inner = inner.child(
+                    text(spec.name)
+                        .font(if active {
+                            ty::control_label_medium(k)
+                        } else {
+                            ty::caption(k)
+                        })
+                        .color(if active {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        })
+                        .truncate(),
+                );
+                r = r.child(
+                    row()
+                        .key(format!("profile-opt-{pid}"))
+                        .role("radio")
+                        .label(format!("Film simulation {}", spec.name))
+                        .checked(active)
+                        .focusable(true)
+                        .focus_ring(
+                            border::FOCUS_RING,
+                            border::FOCUS_OFFSET_TIGHT,
+                            k.c.border_focus,
+                        )
+                        .cursor(Cursor::Pointer)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .h(size::PILL_COMPACT_H)
+                        .px(space::SM)
+                        .center()
+                        .radius(k.radius.sm)
+                        .fill(color::pill_fill(k, active))
+                        .hover(if active { k.c.layer_03 } else { k.c.layer_02 })
+                        .border(border::HAIRLINE, color::pill_border(k, active))
+                        .child(inner)
+                        .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                            s.set_camera_profile_tx(pid, tx);
+                        }),
+                );
+            }
+            if chunk.len() == 1 {
+                r = r.child(el().grow(1.0).min_w(0.0).a11y_hidden());
+            }
+            sim_group = sim_group.child(r);
+        }
+
+        // Group 3: User Profiles (.dcp / .icc / .cube) sorted with EXIF camera-matched first
+        let mut user_group = col()
+            .key("profile-group-user")
+            .w_full()
+            .gap(space::XS)
+            .child(
+                text("USER PROFILES (.DCP / .ICC / .CUBE)")
+                    .font(ty::mono_probe(k))
+                    .color(k.c.text_faint),
+            );
+        if s.user_profiles.is_empty() {
+            user_group = user_group.child(
+                text("No imported profiles yet")
+                    .font(ty::caption(k))
+                    .color(k.c.text_faint),
+            );
+        } else {
+            for (desc, matched) in &s.user_profiles {
+                let active = active_profile == desc.id;
+                let pid = desc.id.clone();
+                let mut left_side = row().items_center().gap(space::SM).min_w(0.0).grow(1.0);
+                if active {
+                    left_side = left_side.child(
+                        el().size(size::MODIFIED_DOT, size::MODIFIED_DOT)
+                            .radius(radius::circle(size::MODIFIED_DOT))
+                            .fill(k.c.text_accent)
+                            .a11y_hidden(),
+                    );
+                }
+                left_side = left_side.child(
+                    text(&desc.name)
+                        .font(if active {
+                            ty::control_label_medium(k)
+                        } else {
+                            ty::caption(k)
+                        })
+                        .color(if active {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        })
+                        .truncate(),
+                );
+                let mut item = row()
+                    .key(format!("profile-opt-{}", desc.id))
+                    .role("radio")
+                    .label(format!("User camera profile {}", desc.name))
+                    .checked(active)
+                    .focusable(true)
+                    .focus_ring(
+                        border::FOCUS_RING,
+                        border::FOCUS_OFFSET_TIGHT,
+                        k.c.border_focus,
+                    )
+                    .cursor(Cursor::Pointer)
+                    .w_full()
+                    .h(size::PILL_COMPACT_H)
+                    .px(space::MD)
+                    .items_center()
+                    .justify_between()
+                    .gap(space::SM)
+                    .radius(k.radius.sm)
+                    .fill(if active { k.c.layer_03 } else { k.c.bg_base })
+                    .hover(if active { k.c.layer_03 } else { k.c.layer_02 })
+                    .border(
+                        border::HAIRLINE,
+                        if active {
+                            k.c.border_focus
+                        } else {
+                            k.c.border_muted
+                        },
+                    )
+                    .child(left_side);
+                if *matched {
+                    item = item.child(
+                        el().px(space::SM)
+                            .py(space::MICRO)
+                            .radius(k.radius.xs)
+                            .fill(color::mcp_running_bg())
+                            .border(border::HAIRLINE, color::mcp_running().alpha(0.45))
+                            .child(
+                                text("Matched")
+                                    .font(ty::mono_probe(k))
+                                    .color(color::mcp_running()),
+                            ),
+                    );
+                }
+                user_group =
+                    user_group.child(item.on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                        s.set_camera_profile_tx(&pid, tx);
+                    }));
+            }
+        }
+
+        let import_btn = row()
+            .key("import-camera-profile-btn")
+            .role("button")
+            .label("Import Camera Profile (.dcp, .icc, .cube)")
+            .focusable(true)
+            .focus_ring(
+                border::FOCUS_RING,
+                border::FOCUS_OFFSET_TIGHT,
+                k.c.border_focus,
+            )
+            .cursor(Cursor::Pointer)
+            .w_full()
+            .h(size::PILL_H)
+            .px(space::MD)
+            .center()
+            .radius(k.radius.md)
+            .fill(k.c.layer_02)
+            .hover(k.c.layer_03)
+            .border(border::HAIRLINE, k.c.border_strong)
+            .child(
+                text("Import Profile (.dcp / .icc / .cube)…")
+                    .font(ty::control_label_medium(k))
+                    .color(k.c.text_base)
+                    .truncate(),
+            )
+            .on_press_tx(|_s: &mut AppState, tx: &mut Tx| {
+                crate::menu::trigger_import_profile_dialog(tx);
+            });
+        user_group = user_group.child(import_btn);
+
+        let picker_card = col()
+            .key("camera-profile-picker")
+            .w_full()
+            .padding(space::LG)
+            .gap(space::ROW_GAP)
+            .radius(k.radius.md)
+            .fill(k.c.bg_deep)
+            .border(border::HAIRLINE, k.c.border_base)
+            .child(cal_group)
+            .child(sim_group)
+            .child(user_group);
+
+        body = body.child(picker_card);
     }
 
     let mut grid = col()
@@ -3010,28 +3511,7 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         grid = grid.child(r);
     }
 
-    let body = col()
-        .w_full()
-        .gap(space::ROW_GAP)
-        .child(
-            row()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    text("Mode")
-                        .font(ty::control_label(k))
-                        .color(k.c.text_muted),
-                )
-                .child(text(active_mode.label()).font(ty::mono_compact(k)).color(
-                    if active_mode == ProcessingMode::FilmNegative {
-                        color::film_negative_accent()
-                    } else {
-                        k.c.text_faint
-                    },
-                )),
-        )
-        .child(mode_row)
+    body = body
         .child(
             row()
                 .w_full()
@@ -3052,11 +3532,67 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         )
         .child(grid);
 
+    // Tier 1 inline `Advanced ▸` disclosure (Profile Strength + Processing Mode)
+    let tier1_modified = usize::from(strength_modified) + usize::from(mode_modified);
+    body = body.child(advanced_disclosure_row(
+        k,
+        "base-char-advanced-toggle",
+        "Advanced",
+        s.base_advanced_open,
+        tier1_modified,
+        2,
+        |s| s.base_advanced_open = !s.base_advanced_open,
+    ));
+
+    if s.base_advanced_open || mode_modified {
+        let mut mode_row = row()
+            .key("processing-mode-row")
+            .role("radiogroup")
+            .label("Processing mode")
+            .w_full()
+            .gap(space::PILL_GAP);
+        for mode in ProcessingMode::ALL {
+            let active = active_mode == mode;
+            mode_row = mode_row.child(crop_pill_btn(
+                k,
+                format!("proc-mode-{}", mode.cli_slug()),
+                "radio",
+                format!("Processing mode {}", mode.label()),
+                mode.label(),
+                size::PILL_H,
+                active,
+                k.c.text_muted,
+                move |s, tx| s.set_processing_mode_tx(mode, tx),
+            ));
+        }
+
+        if s.base_advanced_open && !surface_strength_immediately {
+            body = body.child(profile_strength_slider());
+        }
+        body = body
+            .child(
+                row()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        text("Mode")
+                            .font(ty::control_label(k))
+                            .color(k.c.text_muted),
+                    )
+                    .child(text(active_mode.label()).font(ty::mono_compact(k)).color(
+                        if active_mode == ProcessingMode::FilmNegative {
+                            color::film_negative_accent()
+                        } else {
+                            k.c.text_faint
+                        },
+                    )),
+            )
+            .child(mode_row);
+    }
+
     let reset = mini_reset_btn(k, "Reset Base Characteristics", is_default, |s, tx| {
-        s.update_slider_tx(true, tx, |rec| {
-            rec.film_curve = FilmCurve::FilmStandard;
-            rec.processing_mode = ProcessingMode::Photography;
-        });
+        s.reset_base_characteristics_tx(tx);
     });
 
     collapsible_section_card(
@@ -3070,8 +3606,8 @@ fn base_characteristics_section(s: &AppState, k: &Kit) -> El {
         InfoTip {
             title: "Base Characteristics",
             shortcut: None,
-            description: "Selects scene-referred Photography vs. C-41 Film Negative pipeline and the base film response curve (Standard, High Contrast, Extra Shadow, Linear).",
-            cli_key: "processing_mode  ·  film_curve",
+            description: "Selects the 33³ Camera Profile LUT (Calibration, Film Simulation, or .dcp/.icc/.cube), Profile Strength, base Film Curve, and Photography vs. C-41 Film Negative mode.",
+            cli_key: "camera_profile  ·  profile_strength  ·  processing_mode  ·  film_curve",
             tier: "Tier 0 · Pipeline",
         },
         Some(reset),

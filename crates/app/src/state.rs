@@ -9,25 +9,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rune::{AppHandle, LiveRegion, Pixels, TextEdit, Tx};
 use rune_editor_core::{
-    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, AdjustmentLayer, BrushDab, ChannelLevels,
-    ClarityMethod, ColorTag, CompiledRecipe, CropAspect, CullFilter, CullFlag, DevelopRecipe,
+    ADVANCED_COLOR_SLICE_COUNT, ALL_CLIPBOARD_GROUPS, AdjustmentLayer, BrushDab,
+    CameraProfileDescriptor, ChannelLevels, ClarityMethod, ColorTag, CompiledRecipe, CropAspect,
+    CullFilter, CullFlag, DEFAULT_CAMERA_PROFILE, DEFAULT_PROFILE_STRENGTH, DevelopRecipe,
     FilmCurve, FilmNegativeParams, GrainType, HealMode, HealSpot, HistogramData, HistoryStack,
     LayerMaskItem, LevelsParams, LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK,
     MAX_HEAL_SPOTS, MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode,
-    SessionCatalog, SessionEntry, StylePreset, ToneCurves, UserStyle, ViewportCamera,
-    VignetteMethod, WbPreset, all_param_descriptors, apply_style_to_recipe, auto_exposure_and_tone,
-    auto_levels, auto_white_balance, builtin_presets, compute_histogram_compiled,
-    copy_recipe_groups, create_capture_one_session, default_curve_points, delete_user_style,
-    filmic_tonemap, find_scalar_param, linear_to_srgb, list_user_styles, modified_recipe_groups,
-    move_photo_with_sidecar, pick_white_balance, recipe_to_sparse_patch, rgb_to_hsl_and_lab,
-    save_user_style, stack_style_onto_recipe, temperature_to_kelvin,
+    ProfileCategory, SessionCatalog, SessionEntry, StylePreset, ToneCurves, UserStyle,
+    ViewportCamera, VignetteMethod, WbPreset, all_param_descriptors, apply_style_to_recipe,
+    auto_exposure_and_tone, auto_levels, auto_white_balance, builtin_presets, canonical_profile_id,
+    compute_histogram_compiled, copy_recipe_groups, create_capture_one_session,
+    default_curve_points, delete_user_style, filmic_tonemap, find_builtin_profile,
+    find_scalar_param, import_user_profile, is_valid_camera_profile_id, linear_to_srgb,
+    list_all_camera_profiles, list_user_styles, modified_recipe_groups, move_photo_with_sidecar,
+    pick_white_balance, recipe_to_sparse_patch, rgb_to_hsl_and_lab, save_user_style,
+    stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher, LinearImage,
-    NamingContext, TextWatermark, ThumbnailRgba8, WatermarkPosition, builtin_export_recipes,
-    expand_naming_template, export_image_with_options, export_multi_recipe,
+    NamingContext, RawDecodeMode, TextWatermark, ThumbnailRgba8, WatermarkPosition,
+    builtin_export_recipes, expand_naming_template, export_image_with_options, export_multi_recipe,
     generate_demo_hdr_scene, generate_demo_thumbnail, generate_subject_mask, guard_not_source,
-    load_file, load_from_memory, load_thumbnail, scan_photo_folder,
+    is_raw_extension, load_file, load_file_proxy_with_mode, load_from_memory, load_thumbnail,
+    scan_photo_folder,
 };
 use rune_editor_mcp::{ActiveCanvasSnapshot, LocalMcpServer, McpService, McpSettings};
 
@@ -1165,6 +1169,8 @@ pub struct AppState {
     pub heal_open: bool,
 
     // Studio Airy 3-tier progressive disclosure toggles (Tier 1 inline `Advanced ▸` drawers)
+    pub profile_picker_open: bool,
+    pub base_advanced_open: bool,
     pub wb_presets_open: bool,
     pub tone_advanced_open: bool,
     pub levels_advanced_open: bool,
@@ -1184,6 +1190,10 @@ pub struct AppState {
     pub heal_advanced_open: bool,
     pub user_styles_advanced_open: bool,
     pub clipboard_groups_open: bool,
+
+    // Cached user camera profiles (EXIF-matched sorted first; refreshed on photo open/import/picker open)
+    pub user_profiles: Vec<(CameraProfileDescriptor, bool)>,
+    pub active_raw_decode_mode: RawDecodeMode,
 
     // Studio Airy Settings progressive disclosure & transient floating popovers
     pub settings_mcp_snippets_open: bool,
@@ -1280,6 +1290,46 @@ pub struct AppState {
     pub app_handle: Option<AppHandle<AppState>>,
 }
 
+fn image_camera_make_model(image: &LinearImage) -> (Option<&str>, Option<&str>) {
+    let make = image
+        .camera_calibration
+        .as_ref()
+        .map(|c| c.make.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let model = image
+        .exif
+        .as_ref()
+        .and_then(|e| e.camera_model.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            image
+                .camera_calibration
+                .as_ref()
+                .map(|c| c.model.as_str())
+                .filter(|s| !s.trim().is_empty())
+        });
+    (make, model)
+}
+
+fn collect_sorted_user_profiles(
+    image: &LinearImage,
+    profiles_dir: Option<&Path>,
+) -> Vec<(CameraProfileDescriptor, bool)> {
+    let (make, model) = image_camera_make_model(image);
+    let all = list_all_camera_profiles(make, model, profiles_dir);
+    let mut seen_builtin = false;
+    let mut out = Vec::new();
+    for desc in all {
+        if desc.category == ProfileCategory::User {
+            // `list_all_camera_profiles` places EXIF-matched user profiles strictly before builtins.
+            out.push((desc, !seen_builtin));
+        } else {
+            seen_builtin = true;
+        }
+    }
+    out
+}
+
 impl Default for AppState {
     fn default() -> Self {
         let image = Arc::new(
@@ -1313,6 +1363,8 @@ impl Default for AppState {
             catalog_len: catalog.len(),
         };
         let mcp_allow_live = Arc::new(AtomicBool::new(mcp_settings.allow_live_canvas_edits));
+
+        let user_profiles = collect_sorted_user_profiles(&image, None);
 
         Self {
             image,
@@ -1357,6 +1409,8 @@ impl Default for AppState {
             masks_open: false,
             local_adj_open: true,
             heal_open: false,
+            profile_picker_open: false,
+            base_advanced_open: false,
             wb_presets_open: false,
             tone_advanced_open: false,
             levels_advanced_open: false,
@@ -1376,6 +1430,8 @@ impl Default for AppState {
             heal_advanced_open: false,
             user_styles_advanced_open: false,
             clipboard_groups_open: false,
+            user_profiles,
+            active_raw_decode_mode: RawDecodeMode::Linear,
             settings_mcp_snippets_open: false,
             settings_mcp_tools_open: false,
             settings_security_invariants_open: false,
@@ -1679,14 +1735,7 @@ impl AppState {
         self.sync_window_state(tx);
     }
 
-    /// Applies an edit delivered by a connected local MCP agent onto the live canvas,
-    /// pushing the previous recipe onto `HistoryStack` so the user can hit `⌘Z` to undo.
-    pub fn apply_external_mcp_recipe_tx(
-        &mut self,
-        new_recipe: DevelopRecipe,
-        summary: String,
-        tx: &mut Tx,
-    ) {
+    pub fn apply_external_mcp_recipe(&mut self, new_recipe: DevelopRecipe) -> (bool, bool) {
         let sanitized = new_recipe.sanitized();
         let changed = self.recipe != sanitized;
         if changed {
@@ -1713,7 +1762,22 @@ impl AppState {
             self.saved_recipe = self.recipe.clone();
         }
         if changed {
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
+        }
+        (changed, meta_synced)
+    }
+
+    /// Applies an edit delivered by a connected local MCP agent onto the live canvas,
+    /// pushing the previous recipe onto `HistoryStack` so the user can hit `⌘Z` to undo.
+    pub fn apply_external_mcp_recipe_tx(
+        &mut self,
+        new_recipe: DevelopRecipe,
+        summary: String,
+        tx: &mut Tx,
+    ) {
+        let (changed, meta_synced) = self.apply_external_mcp_recipe(new_recipe);
+        if changed {
             self.status_message = Some(format!("{summary} (⌘Z to undo)"));
             self.sync_window_state(tx);
             tx.announce("Applied live MCP agent edit", LiveRegion::Polite);
@@ -1812,6 +1876,7 @@ impl AppState {
             self.history.push(self.recipe.clone());
             self.recipe = next;
             self.catalog.update_active_recipe(self.recipe.clone());
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
             self.status_message = Some(status.into());
         }
@@ -1858,6 +1923,147 @@ impl AppState {
     // -------------------------------------------------------------------------
     // Auto Color Science, WB Eyedropper & Viewer Diagnostics
     // -------------------------------------------------------------------------
+
+    pub fn raw_decode_mode_for_recipe(recipe: &DevelopRecipe) -> RawDecodeMode {
+        if canonical_profile_id(&recipe.camera_profile) == "apple_raw" {
+            RawDecodeMode::AppleNativeBoost
+        } else {
+            RawDecodeMode::Linear
+        }
+    }
+
+    pub fn refresh_user_profiles(&mut self) {
+        self.user_profiles = collect_sorted_user_profiles(&self.image, None);
+    }
+
+    #[cfg(test)]
+    pub fn refresh_user_profiles_in_dir(&mut self, dir: &Path) {
+        self.user_profiles = collect_sorted_user_profiles(&self.image, Some(dir));
+    }
+
+    /// Returns `(display_label, is_exif_matched_user_profile)` for the active camera profile.
+    pub fn active_camera_profile_label(&self) -> (String, bool) {
+        let canon = canonical_profile_id(&self.recipe.camera_profile);
+        if let Some((desc, matched)) = self.user_profiles.iter().find(|(d, _)| d.id == canon) {
+            return (desc.name.clone(), *matched);
+        }
+        if let Some(desc) = find_builtin_profile(&canon) {
+            return (desc.name, false);
+        }
+        let fallback = canon.strip_prefix("user:").unwrap_or(&canon);
+        (fallback.replace('_', " "), false)
+    }
+
+    pub fn toggle_profile_picker(&mut self) {
+        self.profile_picker_open = !self.profile_picker_open;
+        if self.profile_picker_open {
+            self.refresh_user_profiles();
+        }
+    }
+
+    fn sync_profile_state_after_recipe_change(&mut self) {
+        let canon = canonical_profile_id(&self.recipe.camera_profile);
+        if canon.starts_with("user:") && !self.user_profiles.iter().any(|(d, _)| d.id == canon) {
+            self.refresh_user_profiles();
+        }
+        self.maybe_redecode_active_raw_for_profile();
+    }
+
+    fn maybe_redecode_active_raw_for_profile(&mut self) {
+        let desired_mode = Self::raw_decode_mode_for_recipe(&self.recipe);
+        if desired_mode == self.active_raw_decode_mode {
+            return;
+        }
+        let Some(path) = self.image.source_path.clone() else {
+            self.active_raw_decode_mode = desired_mode;
+            return;
+        };
+        if !is_raw_extension(&path) {
+            self.active_raw_decode_mode = desired_mode;
+            return;
+        }
+        if let Ok(decoded) = load_file_proxy_with_mode(&path, None, desired_mode) {
+            self.image = Arc::new(decoded);
+            self.image_generation = self.image_generation.wrapping_add(1);
+            self.active_raw_decode_mode = desired_mode;
+            self.refresh_user_profiles();
+        }
+    }
+
+    pub fn set_camera_profile(&mut self, profile_id: impl AsRef<str>) {
+        let canon = canonical_profile_id(profile_id.as_ref());
+        if !is_valid_camera_profile_id(&canon) {
+            self.status_message = Some(format!(
+                "Unknown camera profile: {}",
+                profile_id.as_ref().trim()
+            ));
+            return;
+        }
+        if canonical_profile_id(&self.recipe.camera_profile) == canon {
+            return;
+        }
+        let mut next = self.recipe.clone();
+        next.camera_profile = canon.clone();
+        next.preset_name = None;
+        let label = self
+            .user_profiles
+            .iter()
+            .find(|(d, _)| d.id == canon)
+            .map(|(d, _)| d.name.clone())
+            .or_else(|| find_builtin_profile(&canon).map(|d| d.name))
+            .unwrap_or(canon);
+        self.commit_recipe_change(next, format!("Camera Profile: {label}"));
+    }
+
+    pub fn set_camera_profile_tx(&mut self, profile_id: impl AsRef<str>, tx: &mut Tx) {
+        self.set_camera_profile(profile_id);
+        self.sync_window_state(tx);
+    }
+
+    pub fn reset_base_characteristics_tx(&mut self, tx: &mut Tx) {
+        let mut next = self.recipe.clone();
+        next.camera_profile = DEFAULT_CAMERA_PROFILE.to_owned();
+        next.profile_strength = DEFAULT_PROFILE_STRENGTH;
+        next.film_curve = FilmCurve::FilmStandard;
+        next.processing_mode = ProcessingMode::Photography;
+        next.preset_name = None;
+        self.commit_recipe_change(next, "Reset Base Characteristics");
+        self.sync_window_state(tx);
+    }
+
+    pub fn import_camera_profile_path_tx(&mut self, path: PathBuf, tx: &mut Tx) {
+        match import_user_profile(&path, None) {
+            Ok(desc) => {
+                self.refresh_user_profiles();
+                self.profile_picker_open = false;
+                let name = desc.name.clone();
+                self.set_camera_profile(&desc.id);
+                let msg = format!("Imported & activated profile: {name}");
+                self.status_message = Some(msg.clone());
+                self.sync_window_state(tx);
+                tx.announce(msg, LiveRegion::Polite);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Profile import failed: {err}"));
+            }
+        }
+    }
+
+    /// Hermetic profile import helper used by unit tests (writes into `dir` rather than `~/.config`).
+    #[cfg(test)]
+    pub fn import_camera_profile_from_dir(
+        &mut self,
+        dir: &Path,
+        path: &Path,
+    ) -> Result<CameraProfileDescriptor, String> {
+        let desc = rune_editor_core::import_user_profile_in_dir(dir, path, None)
+            .map_err(|e| e.to_string())?;
+        self.refresh_user_profiles_in_dir(dir);
+        self.profile_picker_open = false;
+        self.set_camera_profile(&desc.id);
+        self.status_message = Some(format!("Imported & activated profile: {}", desc.name));
+        Ok(desc)
+    }
 
     pub fn set_film_curve(&mut self, curve: FilmCurve) {
         if self.recipe.film_curve == curve {
@@ -2633,6 +2839,7 @@ impl AppState {
         };
         self.clear_transient_interactions();
         self.history.clear();
+        self.sync_profile_state_after_recipe_change();
         self.recompute_histogram();
         self.status_message = Some(format!("Created Variant V{} (Neutral)", idx + 1));
         idx
@@ -2693,6 +2900,7 @@ impl AppState {
         if switched {
             self.clear_transient_interactions();
             self.history.clear();
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
             self.status_message = Some(format!("Selected Variant V{}", index + 1));
         }
@@ -2735,6 +2943,7 @@ impl AppState {
         if deleted {
             self.clear_transient_interactions();
             self.history.clear();
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
             self.status_message = Some(format!(
                 "Deleted variant • Now on V{}",
@@ -4352,6 +4561,7 @@ impl AppState {
         self.clear_transient_interactions();
         if self.history.undo(&mut self.recipe) {
             self.catalog.update_active_recipe(self.recipe.clone());
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
             self.status_message = Some("Undid last adjustment".to_owned());
         }
@@ -4366,6 +4576,7 @@ impl AppState {
         self.clear_transient_interactions();
         if self.history.redo(&mut self.recipe) {
             self.catalog.update_active_recipe(self.recipe.clone());
+            self.sync_profile_state_after_recipe_change();
             self.recompute_histogram();
             self.status_message = Some("Redid adjustment".to_owned());
         }
@@ -4431,23 +4642,29 @@ impl AppState {
     }
 
     pub fn open_image_path_tx(&mut self, path: PathBuf, tx: &mut Tx) {
-        let cached = self
-            .prefetch_cache
-            .lock()
+        let restored_meta = PhotoMeta::load_sidecar(&path)
             .ok()
-            .and_then(|c| c.get(&path).cloned());
+            .flatten()
+            .unwrap_or_default();
+        let decode_mode = Self::raw_decode_mode_for_recipe(&restored_meta.recipe);
+        let use_cache = decode_mode == RawDecodeMode::Linear || !is_raw_extension(&path);
+
+        let cached = if use_cache {
+            self.prefetch_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&path).cloned())
+        } else {
+            None
+        };
 
         let decoded_res = match cached {
             Some(img) => Ok(img),
-            None => load_file(&path).map(Arc::new),
+            None => load_file_proxy_with_mode(&path, None, decode_mode).map(Arc::new),
         };
 
         match decoded_res {
             Ok(decoded) => {
-                let restored_meta = PhotoMeta::load_sidecar(&path)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
                 let name = decoded.display_name.clone();
                 let dims = format!("{}×{}", decoded.width, decoded.height);
 
@@ -4471,8 +4688,10 @@ impl AppState {
 
                 self.image = decoded;
                 self.image_generation = self.image_generation.wrapping_add(1);
+                self.active_raw_decode_mode = decode_mode;
                 self.recipe = restored_meta.recipe.clone();
                 self.saved_recipe = restored_meta.recipe;
+                self.refresh_user_profiles();
                 self.clear_transient_interactions();
                 self.history.clear();
                 self.camera.reset();
@@ -4620,14 +4839,19 @@ impl AppState {
         }
 
         let path = entry.path;
-        let cached = self
-            .prefetch_cache
-            .lock()
-            .ok()
-            .and_then(|c| c.get(&path).cloned());
+        let decode_mode = Self::raw_decode_mode_for_recipe(&entry.meta.recipe);
+        let use_cache = decode_mode == RawDecodeMode::Linear || !is_raw_extension(&path);
+        let cached = if use_cache {
+            self.prefetch_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&path).cloned())
+        } else {
+            None
+        };
         let decoded_res = match cached {
             Some(img) => Ok(img),
-            None => load_file(&path).map(Arc::new),
+            None => load_file_proxy_with_mode(&path, None, decode_mode).map(Arc::new),
         };
         match decoded_res {
             Ok(decoded) => {
@@ -4635,8 +4859,10 @@ impl AppState {
                 let dims = format!("{}×{}", decoded.width, decoded.height);
                 self.image = decoded;
                 self.image_generation = self.image_generation.wrapping_add(1);
+                self.active_raw_decode_mode = decode_mode;
                 self.recipe = entry.meta.recipe.clone();
                 self.saved_recipe = entry.meta.recipe;
+                self.refresh_user_profiles();
                 self.clear_transient_interactions();
                 self.history.clear();
                 self.camera.reset();
@@ -5172,6 +5398,7 @@ mod tests {
     #[test]
     fn all_gui_scalar_bounds_match_core_registry() {
         let gui_ids = [
+            "profile_strength",
             "exposure",
             "contrast",
             "brightness",
@@ -5855,5 +6082,149 @@ mod tests {
         s.camera.focus_mask = true;
         s.camera.loupe_enabled = true;
         assert_eq!(s.active_overlay_count(), 3);
+    }
+
+    #[test]
+    fn phase3_camera_profile_selection_strength_undo_mcp_and_raw_mode() {
+        let mut s = AppState::default();
+
+        // 1. Registry bounds for `profile_strength` match SCALAR_PARAMS
+        let spec = find_scalar_param("profile_strength")
+            .expect("profile_strength must be registered in SCALAR_PARAMS");
+        assert_eq!((spec.min, spec.max, spec.default), (0.0, 1.0, 1.0));
+        assert_eq!(scalar_bounds("profile_strength"), (0.0, 1.0));
+        assert_eq!(scalar_range("profile_strength"), 0.0..=1.0);
+        assert!((scalar_default("profile_strength") - 1.0).abs() < 1e-6);
+
+        // 2. RAW decode mode mapping (`apple_raw` -> AppleNativeBoost, default -> Linear)
+        assert_eq!(
+            AppState::raw_decode_mode_for_recipe(&s.recipe),
+            RawDecodeMode::Linear
+        );
+        let apple_recipe = DevelopRecipe {
+            camera_profile: "apple_raw".to_owned(),
+            ..DevelopRecipe::default()
+        };
+        assert_eq!(
+            AppState::raw_decode_mode_for_recipe(&apple_recipe),
+            RawDecodeMode::AppleNativeBoost
+        );
+
+        // 3. Selecting camera profiles records undo snapshots & propagates to MCP snapshot
+        s.recipe.preset_name = Some("Warm Film".to_owned());
+        s.set_camera_profile("classic_chrome");
+        assert_eq!(s.recipe.camera_profile, "classic_chrome");
+        assert!(s.recipe.preset_name.is_none());
+        assert!(s.compiled_recipe.profile_active);
+        assert!(s.history.can_undo());
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.camera_profile,
+            "classic_chrome"
+        );
+        assert_eq!(
+            s.active_camera_profile_label(),
+            ("Classic Chrome".to_owned(), false)
+        );
+
+        // Switching again + scrubbing `profile_strength` pushes clean undo snapshots
+        s.set_camera_profile("pro_standard");
+        assert_eq!(s.recipe.camera_profile, "pro_standard");
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.camera_profile,
+            "pro_standard"
+        );
+
+        s.update_slider_inner(false, true, |r| r.profile_strength = 0.72);
+        s.update_slider_inner(true, true, |r| r.profile_strength = 0.65);
+        assert!((s.recipe.profile_strength - 0.65).abs() < 1e-5);
+        assert!((s.mcp_shared_canvas.lock().unwrap().recipe.profile_strength - 0.65).abs() < 1e-5);
+
+        // Undo unwinds profile_strength -> pro_standard -> classic_chrome -> auto cleanly
+        s.undo();
+        assert!((s.recipe.profile_strength - 1.0).abs() < 1e-5);
+        assert_eq!(s.recipe.camera_profile, "pro_standard");
+        assert!((s.mcp_shared_canvas.lock().unwrap().recipe.profile_strength - 1.0).abs() < 1e-5);
+
+        s.undo();
+        assert_eq!(s.recipe.camera_profile, "classic_chrome");
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.camera_profile,
+            "classic_chrome"
+        );
+
+        s.undo();
+        assert_eq!(s.recipe.camera_profile, "auto");
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.camera_profile,
+            "auto"
+        );
+
+        // 4. Hermetic external `.cube` profile import into temp dir activates user:<slug>
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rune_darkroom_p3_profiles_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cube_src = tmp_dir.join("Studio_Warm.cube");
+        let cube_contents = "\
+TITLE \"Studio Warm\"
+LUT_3D_SIZE 2
+0.0 0.0 0.0
+1.0 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+";
+        std::fs::write(&cube_src, cube_contents).unwrap();
+        let store_dir = tmp_dir.join("store");
+        let desc = s
+            .import_camera_profile_from_dir(&store_dir, &cube_src)
+            .expect("hermetic .cube import must succeed");
+        assert_eq!(desc.id, "user:studio_warm");
+        assert_eq!(s.recipe.camera_profile, "user:studio_warm");
+        assert_eq!(
+            s.mcp_shared_canvas.lock().unwrap().recipe.camera_profile,
+            "user:studio_warm"
+        );
+        assert!(
+            s.user_profiles
+                .iter()
+                .any(|(d, _)| d.id == "user:studio_warm")
+        );
+        assert_eq!(s.active_camera_profile_label().0, "Studio Warm");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 5. `active_raw_decode_mode` stays synced across reset_recipe, MCP edits, and variants
+        s.set_camera_profile("apple_raw");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::AppleNativeBoost);
+
+        s.reset_recipe();
+        assert_eq!(s.recipe.camera_profile, "auto");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::Linear);
+
+        let mcp_apple = DevelopRecipe {
+            camera_profile: "apple_raw".to_owned(),
+            ..DevelopRecipe::default()
+        };
+        let (changed, _) = s.apply_external_mcp_recipe(mcp_apple);
+        assert!(changed);
+        assert_eq!(s.recipe.camera_profile, "apple_raw");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::AppleNativeBoost);
+
+        // Variant creation/selection/deletion keeps `active_raw_decode_mode` synced
+        let v2 = s.new_variant(Some("Neutral Linear".to_owned()));
+        assert_eq!(v2, 1);
+        assert_eq!(s.recipe.camera_profile, "auto");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::Linear);
+
+        assert!(s.select_variant(0));
+        assert_eq!(s.recipe.camera_profile, "apple_raw");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::AppleNativeBoost);
+
+        assert!(s.delete_active_variant());
+        assert_eq!(s.recipe.camera_profile, "auto");
+        assert_eq!(s.active_raw_decode_mode, RawDecodeMode::Linear);
     }
 }

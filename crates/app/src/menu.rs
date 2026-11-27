@@ -4,7 +4,7 @@
 
 use rune::file_dialog::FileDialogOptions;
 use rune::{MenuItem, Shortcut, Tx};
-use rune_editor_core::ColorTag;
+use rune_editor_core::{ALLOWED_PROFILE_EXTENSIONS, ColorTag};
 use rune_editor_decode::SUPPORTED_EXTENSIONS;
 
 use crate::state::{AppState, ProofMargin};
@@ -24,6 +24,23 @@ pub fn trigger_open_dialog(tx: &mut Tx) {
         Ok(Some(path)) => s.open_image_path_tx(path, tx),
         Ok(None) => {}
         Err(err) => s.status_message = Some(format!("Open dialog error: {err}")),
+    });
+}
+
+pub fn trigger_import_profile_dialog(tx: &mut Tx) {
+    let options = FileDialogOptions {
+        title: "Import Camera Profile (.dcp, .icc, .cube)".into(),
+        ..Default::default()
+    }
+    .filter(
+        "Camera Profiles (.dcp, .icc, .cube)",
+        ALLOWED_PROFILE_EXTENSIONS,
+    );
+
+    tx.open_file(options, |s: &mut AppState, result, tx| match result {
+        Ok(Some(path)) => s.import_camera_profile_path_tx(path, tx),
+        Ok(None) => {}
+        Err(err) => s.status_message = Some(format!("Profile import dialog error: {err}")),
     });
 }
 

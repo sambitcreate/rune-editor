@@ -2176,6 +2176,23 @@ fn scene_film_negative(s: &mut AppState) {
     s.recompute_histogram();
 }
 
+fn scene_camera_profiles(s: &mut AppState) {
+    s.active_tab = InspectorTab::Light;
+    s.base_open = true;
+    s.profile_picker_open = true;
+    s.base_advanced_open = false;
+    s.wb_open = false;
+    s.tone_open = false;
+    s.levels_open = false;
+    s.curve_open = false;
+    s.recipe.camera_profile = "classic_chrome".to_owned();
+    s.recipe.profile_strength = 0.85;
+    s.recipe.film_curve = FilmCurve::FilmStandard;
+    s.recipe.preset_name = None;
+    s.status_message = Some("Camera Profile: Classic Chrome (85%) • 33³ Linear 3D LUT".to_owned());
+    s.recompute_histogram();
+}
+
 fn scene_proof_margin(s: &mut AppState) {
     scene_editorial(s);
     s.proof_margin = ProofMargin::Exhibition;
@@ -2217,6 +2234,7 @@ fn main() {
             ("layers-grayscale", scene_layers_grayscale),
             ("heal-clone", scene_heal_clone),
             ("film-negative", scene_film_negative),
+            ("camera-profiles", scene_camera_profiles),
             ("proof-margin", scene_proof_margin),
             ("settings-shortcuts", scene_settings_shortcuts),
             ("crop", scene_crop),
@@ -2606,5 +2624,86 @@ mod scroll_tests {
         let card_set = find_rect(&rt_set, "floating-info-popover");
         assert!(card_set[0] >= size::SETTINGS_SIDEBAR_W);
         assert!(card_set[1] + card_set[3] <= size::WINDOW_DEFAULT.1 - size::STATUS_BAR_H);
+    }
+
+    #[test]
+    fn camera_profiles_scene_layout_and_tx_sync() {
+        let mut s = AppState::default();
+        scene_camera_profiles(&mut s);
+        let mut rt = make_runtime(s, size::WINDOW_DEFAULT);
+
+        let inspector = find_rect(&rt, "develop-inspector");
+        let vp = find_rect(&rt, "inspector-scroll");
+        let selector = find_rect(&rt, "camera-profile-selector");
+        let strength = find_rect(&rt, "slider-profile-strength");
+        let picker = find_rect(&rt, "camera-profile-picker");
+        let cal_group = find_rect(&rt, "profile-group-calibration");
+        let sim_group = find_rect(&rt, "profile-group-film-simulations");
+        let user_group = find_rect(&rt, "profile-group-user");
+        let import_btn = find_rect(&rt, "import-camera-profile-btn");
+        let pro_std_btn = find_rect(&rt, "profile-opt-pro_standard");
+
+        // All Camera Profile controls sit inside the right inspector, strictly below titlebar
+        // (zero overlap on macOS traffic lights) and within the visible viewport.
+        for (name, rect) in [
+            ("camera-profile-selector", selector),
+            ("slider-profile-strength", strength),
+            ("camera-profile-picker", picker),
+            ("profile-group-calibration", cal_group),
+            ("profile-group-film-simulations", sim_group),
+            ("profile-group-user", user_group),
+            ("import-camera-profile-btn", import_btn),
+            ("profile-opt-pro_standard", pro_std_btn),
+        ] {
+            assert!(
+                rect[2] > 40.0 && rect[3] >= 20.0,
+                "{name} must have non-zero size, got {rect:?}"
+            );
+            assert!(
+                rect[0] >= inspector[0] - 0.5
+                    && rect[0] + rect[2] <= inspector[0] + inspector[2] + 0.5,
+                "{name} ({rect:?}) must stay within inspector horizontal bounds ({inspector:?})"
+            );
+            assert!(
+                rect[1] >= size::TITLEBAR_H,
+                "{name} ({rect:?}) must render strictly below titlebar / traffic lights"
+            );
+        }
+        assert!(
+            (strength[3] - size::CAPSULE_SLIDER_H).abs() < 1.0,
+            "Profile Strength capsule must match Studio Airy 32pt height, got {strength:?}"
+        );
+        assert!(
+            strength[1] + strength[3] <= vp[1] + vp[3] + 1.0,
+            "Profile Strength capsule ({strength:?}) must be immediately visible inside viewport ({vp:?})"
+        );
+        assert!(
+            import_btn[1] + import_btn[3] <= vp[1] + vp[3] + 1.0,
+            "Import Profile button ({import_btn:?}) must be visible inside viewport ({vp:?})"
+        );
+
+        // Clicking `Rune ProStandard` invokes `set_camera_profile_tx`, pushes undo, and syncs MCP snapshot
+        let click_x = pro_std_btn[0] + pro_std_btn[2] * 0.5;
+        let click_y = pro_std_btn[1] + pro_std_btn[3] * 0.5;
+        rt.pointer_move(click_x, click_y);
+        rt.pointer_down(click_x, click_y);
+        rt.pointer_up(click_x, click_y);
+        rt.frame(1.0 / 60.0);
+
+        assert_eq!(rt.state.recipe.camera_profile, "pro_standard");
+        assert!(rt.state.history.can_undo());
+        assert_eq!(
+            rt.state
+                .mcp_shared_canvas
+                .lock()
+                .unwrap()
+                .recipe
+                .camera_profile,
+            "pro_standard"
+        );
+        assert_eq!(
+            rt.state.active_camera_profile_label(),
+            ("Rune ProStandard".to_owned(), false)
+        );
     }
 }

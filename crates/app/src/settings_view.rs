@@ -1332,7 +1332,7 @@ fn tool_list_summary(k: &Kit) -> El {
         ),
         (
             "rune_edit_photo",
-            "Non-destructive · Preset blend, patch, auto WB/tone, ⌘Z undo",
+            "Non-destructive · Camera profile, preset blend, patch, auto WB/tone, ⌘Z undo",
         ),
         (
             "rune_preview_photo",
@@ -1348,7 +1348,7 @@ fn tool_list_summary(k: &Kit) -> El {
         ),
         (
             "rune_manage_workflow",
-            "Non-destructive · Virtual variants, user/stacked styles, selective clipboard",
+            "Non-destructive · Variants, user/stacked styles, profile_list, clipboard",
         ),
         (
             "rune_edit_layers",
