@@ -127,11 +127,16 @@ pub fn segment(
     let mut guard = lock_session_cache();
 
     // Load or switch model sessions if needed.
+    // Note: Apple CoreML EP in ORT 2.0-rc.15 crashes (`SIGABRT` in MPSGraphExecutable.mm:4419
+    // with ComputeUnits::All) or fails shape inference (`model.mm:79 GetStaticOutputShape`) after
+    // ~20s of graph compilation on dynamic-shape SAM 2.1 / SAM 3 Hiera graphs. Default to the
+    // multi-threaded CPU EP (opt-in CoreML via `RUNE_SAM_COREML=1` for experimentation).
+    let try_coreml = std::env::var("RUNE_SAM_COREML").is_ok_and(|v| v == "1" || v == "true");
     let needs_load = guard
         .as_ref()
         .is_none_or(|cache| cache.model_id != model_id);
     if needs_load {
-        let loaded = load_model_sessions(model_id, true)?;
+        let loaded = load_model_sessions(model_id, try_coreml)?;
         *guard = Some(loaded);
     }
 
@@ -281,7 +286,8 @@ fn build_session(
     #[cfg(target_os = "macos")]
     if try_coreml {
         let ep = ort::ep::CoreML::default()
-            .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+            .with_static_input_shapes(true)
+            .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndNeuralEngine)
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
             .build();
         if let Ok(builder) = Session::builder(env)
@@ -436,17 +442,14 @@ fn run_mask_decoder(
         labels.push(3);
     }
 
-    // Ensure at least one prompt point if only a dedicated box was supplied and no points exist.
-    if labels.is_empty() {
-        if let Some(b) = bbox {
-            coords.push(((b.x0 + b.x1) * 0.5).clamp(0.0, 1.0) * scale);
-            coords.push(((b.y0 + b.y1) * 0.5).clamp(0.0, 1.0) * scale);
-            labels.push(1);
-        } else {
-            coords.push(0.5 * scale);
-            coords.push(0.5 * scale);
-            labels.push(1);
-        }
+    // When a dedicated `input_boxes` tensor is present and no points were supplied, Hugging Face
+    // SAM 2.1 / SAM 3 ONNX decoders expect empty `input_points` `[1, 1, 0, 2]` and `input_labels`
+    // `[1, 1, 0]` so the box alone drives the mask. Only fall back to a center point if neither
+    // points nor a bounding box were provided.
+    if labels.is_empty() && !(bbox.is_some() && has_dedicated_boxes_input) {
+        coords.push(0.5 * scale);
+        coords.push(0.5 * scale);
+        labels.push(1);
     }
 
     let num_points = labels.len();
