@@ -525,7 +525,7 @@ impl DevelopGpuResources {
         let curve_lut_view = curve_lut_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let layer_mask_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rune-editor layer mask atlas 1024x512 r8unorm"),
+            label: Some("rune-editor layer mask atlas 2048x1024 r8unorm"),
             size: wgpu::Extent3d {
                 width: LAYER_MASK_ATLAS_WIDTH,
                 height: LAYER_MASK_ATLAS_HEIGHT,
@@ -640,7 +640,7 @@ impl DevelopGpuResources {
         );
     }
 
-    /// Bakes and uploads the `1024×512` `R8Unorm` layer mask atlas ONLY when layer masks
+    /// Bakes and uploads the `2048×1024` `R8Unorm` layer mask atlas ONLY when layer masks
     /// have changed since the last upload (zero re-bake or allocation on 120Hz local slider drags).
     pub fn ensure_layer_masks_uploaded(&mut self, queue: &wgpu::Queue, recipe: &DevelopRecipe) {
         let slice = &recipe.layers[..recipe.layers.len().min(MAX_ADJUSTMENT_LAYERS)];
@@ -1958,7 +1958,44 @@ mod tests {
             ..LocalAdjustments::default()
         };
 
-        let phase4_cases: [(&str, DevelopRecipe); 5] = [
+        let mut raster_512_buf = vec![0u8; 512 * 512];
+        for y in 0..512usize {
+            for x in 0..512usize {
+                let dx = (x as f32 / 511.0) - 0.5;
+                let dy = (y as f32 / 511.0) - 0.5;
+                let w = (1.0 - (dx * dx + dy * dy).sqrt() * 2.2).clamp(0.0, 1.0);
+                raster_512_buf[y * 512 + x] = (w * 255.0).round() as u8;
+            }
+        }
+        let mut raster_512_layer = AdjustmentLayer::new_with_mask(
+            "l4",
+            "Raster 512",
+            MaskShape::from_raster_u8(512, 512, &raster_512_buf),
+        );
+        raster_512_layer.adjustments = LocalAdjustments {
+            exposure: 0.7,
+            temperature: -0.2,
+            ..LocalAdjustments::default()
+        };
+
+        let mut raster_256_buf = vec![0u8; 256 * 256];
+        for y in 0..256usize {
+            for x in 0..256usize {
+                raster_256_buf[y * 256 + x] = ((x + y) / 2).min(255) as u8;
+            }
+        }
+        let mut raster_256_layer = AdjustmentLayer::new_with_mask(
+            "l5",
+            "Legacy Raster 256",
+            MaskShape::from_raster_u8(256, 256, &raster_256_buf),
+        );
+        raster_256_layer.adjustments = LocalAdjustments {
+            exposure: -0.45,
+            saturation: 0.2,
+            ..LocalAdjustments::default()
+        };
+
+        let phase4_cases: [(&str, DevelopRecipe); 7] = [
             (
                 "linear_radial_combined_layer",
                 DevelopRecipe {
@@ -1977,6 +2014,20 @@ mod tests {
                 "brush_clarity_sharpen_layer",
                 DevelopRecipe {
                     layers: vec![brush_layer],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "raster_512_layer",
+                DevelopRecipe {
+                    layers: vec![raster_512_layer],
+                    ..DevelopRecipe::default()
+                },
+            ),
+            (
+                "legacy_raster_256_layer",
+                DevelopRecipe {
+                    layers: vec![raster_256_layer],
                     ..DevelopRecipe::default()
                 },
             ),

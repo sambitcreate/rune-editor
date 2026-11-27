@@ -1113,8 +1113,8 @@ fn apply_heal_spots(base_rgb: vec3<f32>, img_uv: vec2<f32>) -> vec3<f32> {
 fn sample_layer_mask_tile(layer_idx: u32, uv: vec2<f32>) -> f32 {
     let col = f32(layer_idx % 4u);
     let row = f32(layer_idx / 4u);
-    let local_u = (0.5 + clamp(uv.x, 0.0, 1.0) * 255.0) / 256.0;
-    let local_v = (0.5 + clamp(uv.y, 0.0, 1.0) * 255.0) / 256.0;
+    let local_u = (0.5 + clamp(uv.x, 0.0, 1.0) * 511.0) / 512.0;
+    let local_v = (0.5 + clamp(uv.y, 0.0, 1.0) * 511.0) / 512.0;
     let atlas_uv = vec2<f32>((col + local_u) * 0.25, (row + local_v) * 0.5);
     return textureSampleLevel(layer_mask_atlas, photo_sampler, atlas_uv, 0.0).r;
 }

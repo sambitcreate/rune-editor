@@ -9,6 +9,7 @@ repository.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 image.workspace = true
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "half"] }
 rune-editor-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -16,9 +17,12 @@ rayon = "1"
 rawler = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "half", "coreml"] }
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString", "CFURL", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage"] }
 objc2-core-image = { version = "0.3.2", features = ["CIContext", "CIFilter", "CIImage", "CIRAWFilter", "objc2-core-foundation", "objc2-core-graphics"] }
-objc2-foundation = { version = "0.3.2", features = ["NSData", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "objc2-core-foundation"] }
+objc2-core-video = { version = "0.3.2", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSIndexSet", "NSString", "NSURL", "NSValue", "objc2-core-foundation"] }
 objc2-image-io = { version = "0.3.2", features = ["CGImageProperties", "CGImageSource", "objc2-core-graphics"] }
+objc2-vision = { version = "0.3.2", features = ["VNRequest", "VNRequestHandler", "VNStatefulRequest", "VNGenerateForegroundInstanceMaskRequest", "VNGeneratePersonSegmentationRequest", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-video"] }

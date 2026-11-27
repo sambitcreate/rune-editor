@@ -8,8 +8,12 @@
 pub mod exif;
 pub mod export;
 pub mod folder;
+pub mod model_manager;
 pub mod raw;
+pub mod sam_ort;
 pub mod vision;
+#[cfg(target_os = "macos")]
+pub mod vision_apple;
 
 use std::path::{Path, PathBuf};
 
@@ -29,12 +33,22 @@ pub use folder::{
     HotFolderWatcher, MAX_SCAN_DEPTH, ScanOptions, ThumbnailRgba8, extract_detail_luma_proxy,
     generate_demo_thumbnail, load_thumbnail, scan_photo_folder, scan_photo_folder_with_options,
 };
+pub use model_manager::{
+    ActiveEngineSummary, ModelDownloadProgress, ModelError, active_engine_summary, download_model,
+    list_model_statuses, remove_model, setup_model_from_local_dir,
+};
 pub use raw::{
     RASTER_EXTENSIONS, RAW_EXTENSIONS, RawDecodeMode, SUPPORTED_EXTENSIONS,
     extract_raw_camera_calibration, is_raw_extension, is_supported_photo, load_file_proxy,
     load_file_proxy_with_mode, probe_image_dimensions,
 };
-pub use vision::generate_subject_mask;
+pub use sam_ort::{SamMaskResult, evict_model_from_cache, evict_session_cache};
+pub use vision::{
+    SmartMaskResult, VisionError, generate_heuristic_mask, generate_interactive_heuristic_mask,
+    generate_smart_mask, generate_subject_mask,
+};
+#[cfg(target_os = "macos")]
+pub use vision_apple::VisionAppleResult;
 
 /// Decoded linear `Rgba16Float` image buffer plus metadata and fast histogram proxy.
 #[derive(Clone, Debug)]
@@ -57,6 +71,18 @@ pub struct LinearImage {
 impl LinearImage {
     pub fn byte_slice(&self) -> &[u8] {
         bytemuck::cast_slice(&self.rgba16f)
+    }
+
+    /// Returns `true` iff dimensions are non-zero and `rgba16f` holds at least `width * height * 4`
+    /// elements without arithmetic overflow.
+    pub(crate) fn has_valid_buffer(&self) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .is_some_and(|needed| self.rgba16f.len() >= needed)
     }
 }
 
@@ -1894,15 +1920,17 @@ mod tests {
         let bg_mask = generate_subject_mask(&img, true);
         let (sw, sh, subj_bytes) = subj_mask.decode_raster_u8().expect("decode subject mask");
         let (bw, bh, bg_bytes) = bg_mask.decode_raster_u8().expect("decode bg mask");
-        assert_eq!((sw, sh), (256, 256));
-        assert_eq!((bw, bh), (256, 256));
+        let tile = rune_editor_core::LAYER_MASK_TILE_SIZE as u32;
+        assert_eq!((sw, sh), (tile, tile));
+        assert_eq!((bw, bh), (tile, tile));
 
         // Exact complement between subject and background masks.
         for (&s, &b) in subj_bytes.iter().zip(bg_bytes.iter()) {
             assert_eq!(s as u16 + b as u16, 255);
         }
-        let center_val = subj_bytes[128 * 256 + 128];
-        let corner_val = subj_bytes[8 * 256 + 8];
+        let tile_usize = rune_editor_core::LAYER_MASK_TILE_SIZE;
+        let center_val = subj_bytes[(tile_usize / 2) * tile_usize + (tile_usize / 2)];
+        let corner_val = subj_bytes[16 * tile_usize + 16];
         assert!(
             center_val > 200 && corner_val < 40,
             "AI Subject mask should isolate center subject ({center_val}) vs dark corner ({corner_val})"
