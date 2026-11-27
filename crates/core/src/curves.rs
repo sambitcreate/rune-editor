@@ -132,14 +132,14 @@ fn channel_is_identity(points: &[[f32; 2]]) -> bool {
 }
 
 /// Precomputed Fritsch-Carlson monotonic cubic Hermite spline.
-struct MonotonicSpline {
+pub(crate) struct MonotonicSpline {
     xs: Vec<f32>,
     ys: Vec<f32>,
     ms: Vec<f32>,
 }
 
 impl MonotonicSpline {
-    fn from_points(raw_points: &[[f32; 2]]) -> Self {
+    pub(crate) fn from_points(raw_points: &[[f32; 2]]) -> Self {
         let mut pts: Vec<[f32; 2]> = raw_points
             .iter()
             .filter(|p| p[0].is_finite() && p[1].is_finite())
@@ -234,7 +234,7 @@ impl MonotonicSpline {
     }
 
     #[inline]
-    fn eval(&self, x: f32) -> f32 {
+    pub(crate) fn eval(&self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
         let n = self.xs.len();
         if n == 1 {

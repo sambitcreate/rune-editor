@@ -355,6 +355,8 @@ pub struct FilmNegativePatch {
 pub struct RecipePatch {
     pub processing_mode: Option<ProcessingMode>,
     pub film_negative: Option<FilmNegativePatch>,
+    pub camera_profile: Option<String>,
+    pub profile_strength: Option<ScalarOp>,
     pub film_curve: Option<FilmCurve>,
     pub exposure: Option<ScalarOp>,
     pub brightness: Option<ScalarOp>,
@@ -474,6 +476,14 @@ impl RecipePatch {
             }
             recipe.film_negative = recipe.film_negative.sanitized();
         }
+        if let Some(ref prof) = self.camera_profile {
+            if !crate::is_valid_camera_profile_id(prof) {
+                return Err(CoreError::Validation(format!(
+                    "Unknown camera_profile '{prof}'"
+                )));
+            }
+            recipe.camera_profile = crate::canonical_profile_id(prof);
+        }
         if let Some(fc) = self.film_curve {
             recipe.film_curve = fc;
         }
@@ -498,6 +508,7 @@ impl RecipePatch {
             };
         }
 
+        apply_scalar!(profile_strength, 0.0, 1.0);
         apply_scalar!(exposure, -5.0, 5.0);
         apply_scalar!(brightness, -1.0, 1.0);
         apply_scalar!(contrast, -1.0, 1.0);
@@ -1066,6 +1077,10 @@ pub fn recipe_to_sparse_patch(recipe: &DevelopRecipe) -> RecipePatch {
             reset: None,
         });
     }
+    if r.camera_profile != d.camera_profile {
+        patch.camera_profile = Some(r.camera_profile);
+    }
+    patch.profile_strength = scalar_opt(r.profile_strength, d.profile_strength);
     if r.film_curve != d.film_curve {
         patch.film_curve = Some(r.film_curve);
     }
@@ -1360,6 +1375,7 @@ pub fn blend_recipes(base: &DevelopRecipe, target: &DevelopRecipe, mix: f32) -> 
     .sanitized();
     if t >= 0.5 {
         out.processing_mode = target.processing_mode;
+        out.camera_profile = target.camera_profile.clone();
         out.film_curve = target.film_curve;
         out.wb_preset = target.wb_preset;
         out.clarity_method = target.clarity_method;

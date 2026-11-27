@@ -396,6 +396,9 @@ pub fn stack_style_onto_recipe(
         }
         .sanitized();
     }
+    if patch_no_geo.camera_profile.is_some() && s >= 0.5 {
+        out.camera_profile = direct_patched.camera_profile.clone();
+    }
     if patch_no_geo.film_curve.is_some() && s >= 0.5 {
         out.film_curve = direct_patched.film_curve;
     }

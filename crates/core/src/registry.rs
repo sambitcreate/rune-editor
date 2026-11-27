@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ADVANCED_COLOR_SLICE_COUNT, ClarityMethod, CoreError, DevelopRecipe, FilmCurve, GrainType,
-    HSL_BAND_COUNT, HSL_BAND_NAMES, ProcessingMode, VignetteMethod, WbPreset, builtin_presets,
+    ADVANCED_COLOR_SLICE_COUNT, BUILTIN_CAMERA_PROFILES, ClarityMethod, CoreError, DevelopRecipe,
+    FilmCurve, GrainType, HSL_BAND_COUNT, HSL_BAND_NAMES, ProcessingMode, VignetteMethod, WbPreset,
+    builtin_camera_profiles, builtin_presets, canonical_profile_id,
     geometry::{CompositionGrid, CropAspect},
+    is_valid_camera_profile_id,
     patch::FieldDiff,
 };
 
@@ -76,8 +78,23 @@ pub struct ScalarParamSpec {
     pub set: fn(&mut DevelopRecipe, f32),
 }
 
-/// Canonical metadata for all 23 top-level scalar sliders in `DevelopRecipe`.
+/// Canonical metadata for all 24 top-level scalar sliders in `DevelopRecipe`.
 pub const SCALAR_PARAMS: &[ScalarParamSpec] = &[
+    ScalarParamSpec {
+        id: "profile_strength",
+        label: "Profile Strength",
+        group: ParamGroup::Tone,
+        description: "Blend strength for the active camera profile or film simulation (0..1).",
+        min: 0.0,
+        max: 1.0,
+        recommended_min: 0.0,
+        recommended_max: 1.0,
+        default: 1.0,
+        step: 0.05,
+        unit: "norm",
+        get: |r| r.profile_strength,
+        set: |r, v| r.profile_strength = v,
+    },
     ScalarParamSpec {
         id: "exposure",
         label: "Exposure",
@@ -485,6 +502,8 @@ pub fn canonical_param_key(raw: &str) -> String {
         "temp" | "wb_temp" => "temperature".to_owned(),
         "wb_tint" => "tint".to_owned(),
         "wb" | "white_balance_preset" => "wb_preset".to_owned(),
+        "profile" | "camera_profile_id" | "base_profile" => "camera_profile".to_owned(),
+        "profile_amount" | "profile_mix" => "profile_strength".to_owned(),
         "curve" | "base_curve" => "film_curve".to_owned(),
         "exp" | "ev" => "exposure".to_owned(),
         "sat" => "saturation".to_owned(),
@@ -547,6 +566,24 @@ pub fn all_param_descriptors() -> Vec<ParamDescriptor> {
         });
     }
 
+    out.push(ParamDescriptor {
+        id: "camera_profile".to_owned(),
+        label: "Camera Profile".to_owned(),
+        group: ParamGroup::Tone.as_str().to_owned(),
+        kind: "enum".to_owned(),
+        description: "Base Characteristics camera calibration or film simulation 3D LUT profile."
+            .to_owned(),
+        min: None,
+        max: None,
+        default: Some(json!("auto")),
+        unit: None,
+        enum_values: Some(
+            BUILTIN_CAMERA_PROFILES
+                .iter()
+                .map(|p| p.id.to_owned())
+                .collect(),
+        ),
+    });
     out.push(ParamDescriptor {
         id: "film_curve".to_owned(),
         label: "Film Curve".to_owned(),
@@ -1548,6 +1585,24 @@ pub fn set_param_by_str(
 
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
+        ["camera_profile"] => {
+            if delta {
+                return Err(CoreError::Validation(
+                    "camera_profile does not support +=/-=".to_owned(),
+                ));
+            }
+            if !is_valid_camera_profile_id(val_trim) {
+                let valid = BUILTIN_CAMERA_PROFILES
+                    .iter()
+                    .map(|p| p.id)
+                    .collect::<Vec<_>>()
+                    .join("|");
+                return Err(CoreError::Validation(format!(
+                    "Unknown camera_profile '{val_trim}' (expected {valid}, or user:<id> / .cube / .dcp)"
+                )));
+            }
+            recipe.camera_profile = canonical_profile_id(val_trim);
+        }
         ["film_curve"] => {
             if delta {
                 return Err(CoreError::Validation(
@@ -1993,6 +2048,8 @@ pub fn reset_recipe_group(recipe: &mut DevelopRecipe, group: &str) -> Result<(),
     match group.trim().to_ascii_lowercase().as_str() {
         "all" => *recipe = d,
         "tone" => {
+            recipe.camera_profile = d.camera_profile;
+            recipe.profile_strength = d.profile_strength;
             recipe.film_curve = d.film_curve;
             recipe.exposure = d.exposure;
             recipe.contrast = d.contrast;
@@ -2104,7 +2161,9 @@ pub fn modified_recipe_groups(recipe: &DevelopRecipe) -> Vec<&'static str> {
     {
         out.push("wb");
     }
-    if recipe.film_curve != d.film_curve
+    if recipe.camera_profile != d.camera_profile
+        || (recipe.profile_strength - d.profile_strength).abs() > 1e-6
+        || recipe.film_curve != d.film_curve
         || (recipe.exposure - d.exposure).abs() > 1e-6
         || (recipe.contrast - d.contrast).abs() > 1e-6
         || (recipe.brightness - d.brightness).abs() > 1e-6
@@ -2192,6 +2251,8 @@ pub fn copy_recipe_groups(
         match group.trim().to_ascii_lowercase().as_str() {
             "all" => *dst = src.clone(),
             "tone" => {
+                dst.camera_profile = src.camera_profile.clone();
+                dst.profile_strength = src.profile_strength;
                 dst.film_curve = src.film_curve;
                 dst.exposure = src.exposure;
                 dst.contrast = src.contrast;
@@ -2281,6 +2342,9 @@ pub fn recipe_non_default_map(recipe: &DevelopRecipe) -> Map<String, Value> {
         if (cur - spec.default).abs() > 1e-5 {
             map.insert(spec.id.to_owned(), json!(round4(cur)));
         }
+    }
+    if recipe.camera_profile != default.camera_profile {
+        map.insert("camera_profile".to_owned(), json!(recipe.camera_profile));
     }
     if recipe.film_curve != default.film_curve {
         map.insert("film_curve".to_owned(), json!(recipe.film_curve));
@@ -2383,6 +2447,13 @@ pub fn recipe_field_diffs(before: &DevelopRecipe, after: &DevelopRecipe) -> Vec<
                 after: json!(round4(b)),
             });
         }
+    }
+    if before.camera_profile != after.camera_profile {
+        diffs.push(FieldDiff {
+            field: "camera_profile".to_owned(),
+            before: json!(before.camera_profile),
+            after: json!(after.camera_profile),
+        });
     }
     if before.film_curve != after.film_curve {
         diffs.push(FieldDiff {
@@ -2550,6 +2621,7 @@ pub fn recipe_schema_json() -> Value {
         "tool_groups": ["tone", "wb", "color", "wheels", "hsl", "advanced_color", "skin_tone", "levels", "curves", "detail", "bw", "effects", "lens", "geometry", "layers", "heal", "film_negative"],
         "hsl_bands": HSL_BAND_NAMES.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>(),
         "builtin_presets": presets,
+        "builtin_camera_profiles": builtin_camera_profiles(),
     })
 }
 
@@ -2815,6 +2887,7 @@ mod tests {
         for structural in [
             "schema_version",
             "preset_name",
+            "camera_profile",
             "film_curve",
             "wb_preset",
             "clarity_method",
@@ -2999,5 +3072,56 @@ mod tests {
                 "Phase 2 group '{grp}' failed copy/reset symmetry"
             );
         }
+    }
+
+    #[test]
+    fn camera_profile_registry_patch_blend_and_legacy_sidecar_compat() {
+        let mut r = DevelopRecipe::default();
+        assert_eq!(r.camera_profile, "auto");
+        assert!((r.profile_strength - 1.0).abs() < 1e-6);
+
+        // Canonical dot-path + alias resolution.
+        set_param_by_str(&mut r, "profile", "Classic Chrome", false, None).unwrap();
+        assert_eq!(r.camera_profile, "classic_chrome");
+        set_param_by_str(&mut r, "profile_strength", "0.65", false, None).unwrap();
+        assert!((get_scalar_by_path(&r, "profile_strength").unwrap() - 0.65).abs() < 1e-6);
+        assert!(modified_recipe_groups(&r).contains(&"tone"));
+
+        // Invalid camera_profile fails loudly.
+        assert!(
+            set_param_by_str(&mut r, "camera_profile", "nonexistent_profile", false, None).is_err()
+        );
+
+        // Tone group copy/reset symmetry covers camera_profile and profile_strength.
+        let mut dst = DevelopRecipe::default();
+        copy_recipe_groups(&mut dst, &r, &["tone".to_owned()]).unwrap();
+        assert_eq!(dst.camera_profile, "classic_chrome");
+        assert!((dst.profile_strength - 0.65).abs() < 1e-6);
+        reset_recipe_group(&mut dst, "tone").unwrap();
+        assert!(dst.is_neutral());
+        assert_eq!(dst.camera_profile, "auto");
+        assert!((dst.profile_strength - 1.0).abs() < 1e-6);
+
+        // Typed RecipePatch + recipe_to_sparse_patch + blend_recipes roundtrip.
+        let patch: crate::RecipePatch = serde_json::from_value(json!({
+            "camera_profile": "pro_standard",
+            "profile_strength": 0.4,
+        }))
+        .expect("deserialize camera profile patch");
+        let mut patched = DevelopRecipe::default();
+        let diffs = patch.apply_to(&mut patched, None).expect("apply patch");
+        assert_eq!(patched.camera_profile, "pro_standard");
+        assert!((patched.profile_strength - 0.4).abs() < 1e-6);
+        assert!(diffs.iter().any(|d| d.field == "camera_profile"));
+        assert!(diffs.iter().any(|d| d.field == "profile_strength"));
+
+        let sparse = crate::recipe_to_sparse_patch(&patched);
+        assert_eq!(sparse.camera_profile.as_deref(), Some("pro_standard"));
+        assert!(sparse.profile_strength.is_some());
+
+        let base = DevelopRecipe::default();
+        let blended = crate::blend_recipes(&base, &patched, 0.5);
+        assert_eq!(blended.camera_profile, "pro_standard");
+        assert!((blended.profile_strength - 0.7).abs() < 1e-5);
     }
 }

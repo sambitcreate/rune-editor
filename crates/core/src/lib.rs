@@ -12,12 +12,14 @@ pub mod curves;
 pub mod geometry;
 pub mod layers;
 pub mod patch;
+pub mod profile_io;
+pub mod profiles;
 pub mod registry;
 pub mod session;
 pub mod styles;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,6 +48,27 @@ pub use crate::layers::{
 pub use crate::patch::{
     BatchJob, EditActor, EditHistoryEntry, EditOp, FieldDiff, HslBandId, MatchReferenceOp,
     RecipePatch, ScalarOp, blend_recipes, recipe_to_sparse_patch, resolve_builtin_preset,
+};
+pub use crate::profile_io::{
+    ALLOWED_PROFILE_EXTENSIONS, CubeLut3D, DcpHsvTable, DcpProfile, IccClut3D, IccPcs, IccProfile,
+    IccTrc, MAX_CUBE_LUT_SIZE, MAX_DCP_HUE_DIVS, MAX_DCP_IFD_ENTRIES, MAX_DCP_SAT_DIVS,
+    MAX_DCP_TONE_CURVE_POINTS, MAX_DCP_VAL_DIVS, MAX_ICC_CLUT_GRID, MAX_ICC_CURVE_ENTRIES,
+    MAX_ICC_TAG_COUNT, MAX_PROFILE_FILE_BYTES, USER_PROFILE_PREFIX, default_profiles_dir,
+    delete_user_profile, delete_user_profile_in_dir, import_user_profile,
+    import_user_profile_in_dir, import_user_profile_in_dir_with_overwrite,
+    list_all_camera_profiles, list_user_profiles, list_user_profiles_in_dir, parse_cube_lut,
+    parse_dcp_profile, parse_icc_profile, resolve_profile_lut, sanitize_profile_slug,
+};
+pub use crate::profiles::{
+    BUILTIN_CAMERA_PROFILES, BuiltinCameraProfileSpec, CameraCalibration, CameraProfileDescriptor,
+    DEFAULT_CAMERA_PROFILE, DEFAULT_PROFILE_STRENGTH, ILLUMINANT_D65_KELVIN,
+    ILLUMINANT_STD_A_KELVIN, LUT_SHAPER_KNEE, LUT_SHAPER_LOG_DENOM, LUT_SHAPER_MAX_LINEAR,
+    PROFILE_LUT_SIZE, ProfileCategory, ProfileLut3D, bake_builtin_profile_lut,
+    bradford_adaptation_matrix, builtin_camera_profiles, cached_builtin_profile_lut,
+    camera_to_linear_srgb_matrix, canonical_profile_id, default_camera_profile,
+    default_profile_strength, find_builtin_profile, interpolate_camera_matrix,
+    is_valid_camera_profile_id, kelvin_to_xyz_whitepoint, linear_srgb_to_oklab, lut_shaper_forward,
+    lut_shaper_inverse, oklab_to_linear_srgb_gamut_safe,
 };
 pub use crate::registry::{
     ALL_CLIPBOARD_GROUPS, ParamDescriptor, ParamGroup, SCALAR_PARAMS, ScalarParamSpec,
@@ -419,6 +442,12 @@ impl VignetteMethod {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DevelopRecipe {
     pub schema_version: u32,
+    /// Base Characteristics camera profile or film simulation ID (default `"auto"`).
+    #[serde(default = "default_camera_profile")]
+    pub camera_profile: String,
+    /// Camera profile / film simulation blend strength (`0.0..=1.0`, default `1.0`).
+    #[serde(default = "default_profile_strength")]
+    pub profile_strength: f32,
     /// Base Characteristics Film Curve response (default `FilmStandard`).
     #[serde(default)]
     pub film_curve: FilmCurve,
@@ -547,6 +576,8 @@ impl Default for DevelopRecipe {
     fn default() -> Self {
         Self {
             schema_version: RECIPE_SCHEMA_VERSION,
+            camera_profile: default_camera_profile(),
+            profile_strength: default_profile_strength(),
             film_curve: FilmCurve::FilmStandard,
             exposure: 0.0,
             contrast: 0.0,
@@ -599,7 +630,9 @@ impl Default for DevelopRecipe {
 impl DevelopRecipe {
     pub fn is_neutral(&self) -> bool {
         let d = Self::default();
-        self.film_curve == d.film_curve
+        self.camera_profile == d.camera_profile
+            && (self.profile_strength - d.profile_strength).abs() <= 1e-6
+            && self.film_curve == d.film_curve
             && self.exposure == d.exposure
             && self.contrast == d.contrast
             && self.highlights == d.highlights
@@ -697,9 +730,16 @@ impl DevelopRecipe {
     }
 
     /// Compiles this recipe into a fast per-pixel evaluator with a pre-baked 256-entry
-    /// tone curve LUT for high-throughput histograms and full-resolution exports.
+    /// tone curve LUT and resolved camera profile 3D LUT for high-throughput histograms
+    /// and full-resolution exports.
     pub fn compile(&self) -> CompiledRecipe {
         CompiledRecipe::from_recipe(self)
+    }
+
+    /// Compiles this recipe resolving `"user:<slug>"` camera profiles against `profiles_dir`
+    /// (or [`default_profiles_dir`] when `None`).
+    pub fn compile_with_profiles_dir(&self, profiles_dir: Option<&Path>) -> CompiledRecipe {
+        CompiledRecipe::from_recipe_with_profiles_dir(self, profiles_dir)
     }
 
     /// Returns a sanitized copy of this recipe with all non-finite values zeroed and every
@@ -763,6 +803,7 @@ impl DevelopRecipe {
             .map(HealSpot::sanitized)
             .collect();
         self.film_negative = self.film_negative.sanitized();
+        self.camera_profile = canonical_profile_id(&self.camera_profile);
         self
     }
 
@@ -1220,6 +1261,9 @@ impl Default for HistogramData {
 /// scalar gains for fast per-pixel evaluation during live histogram and full-res export.
 #[derive(Clone, Debug)]
 pub struct CompiledRecipe {
+    pub profile_lut: Option<Arc<ProfileLut3D>>,
+    pub profile_strength: f32,
+    pub profile_active: bool,
     pub film_curve: FilmCurve,
     pub wb_exp: [f32; 3],
     pub brightness: f32,
@@ -1258,6 +1302,13 @@ pub struct CompiledRecipe {
 
 impl CompiledRecipe {
     pub fn from_recipe(recipe: &DevelopRecipe) -> Self {
+        Self::from_recipe_with_profiles_dir(recipe, None)
+    }
+
+    pub fn from_recipe_with_profiles_dir(
+        recipe: &DevelopRecipe,
+        profiles_dir: Option<&Path>,
+    ) -> Self {
         let wb_r = 2.0_f32.powf(recipe.temperature * 0.45 + recipe.tint * 0.22);
         let wb_g = 2.0_f32.powf(-recipe.tint * 0.35);
         let wb_b = 2.0_f32.powf(-recipe.temperature * 0.45 + recipe.tint * 0.22);
@@ -1307,8 +1358,22 @@ impl CompiledRecipe {
             || recipe.whites.abs() > 1e-6
             || brightness.abs() > 1e-6;
         let sat_active = recipe.saturation.abs() > 1e-6 || recipe.vibrance.abs() > 1e-6;
+        let profile_strength = if recipe.profile_strength.is_finite() {
+            recipe.profile_strength.clamp(0.0, 1.0)
+        } else {
+            default_profile_strength()
+        };
+        let profile_lut = if profile_strength > 1e-5 {
+            resolve_profile_lut(&recipe.camera_profile, profiles_dir)
+        } else {
+            None
+        };
+        let profile_active = profile_lut.is_some();
 
         Self {
+            profile_lut,
+            profile_strength,
+            profile_active,
             film_curve: recipe.film_curve,
             wb_exp: [wb_r * exp_gain, wb_g * exp_gain, wb_b * exp_gain],
             brightness,
@@ -1357,6 +1422,20 @@ impl CompiledRecipe {
         // 0.5. Optional Film Negative optical inversion (zero cost when Photography mode)
         let rgb = if self.processing_mode == ProcessingMode::FilmNegative {
             invert_film_negative_linear(rgb, &self.film_negative)
+        } else {
+            rgb
+        };
+
+        // 0.75. Optional Camera Profile / Film Simulation 33^3 3D LUT (zero cost when inactive)
+        let rgb = if let Some(lut) = &self.profile_lut {
+            let c = [rgb[0].max(0.0), rgb[1].max(0.0), rgb[2].max(0.0)];
+            let mapped = lut.sample_trilinear(c);
+            let s = self.profile_strength;
+            [
+                (c[0] + (mapped[0] - c[0]) * s).max(0.0),
+                (c[1] + (mapped[1] - c[1]) * s).max(0.0),
+                (c[2] + (mapped[2] - c[2]) * s).max(0.0),
+            ]
         } else {
             rgb
         };
@@ -2194,6 +2273,8 @@ mod tests {
         assert!(parsed_recipe.bw.is_neutral());
         assert!(parsed_recipe.geometry.is_identity());
         assert_eq!(parsed_recipe.film_curve, FilmCurve::FilmStandard);
+        assert_eq!(parsed_recipe.camera_profile, "auto");
+        assert!((parsed_recipe.profile_strength - 1.0).abs() < 1e-6);
         assert_eq!(parsed_recipe.wb_preset, WbPreset::AsShot);
         assert_eq!(parsed_recipe.clarity_method, ClarityMethod::Natural);
         assert_eq!(parsed_recipe.grain_type, GrainType::Fine);
