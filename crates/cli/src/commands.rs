@@ -12,36 +12,40 @@ use rune_editor_core::{
     ADVANCED_COLOR_SLICE_COUNT, ALLOWED_PROFILE_EXTENSIONS, AdjustmentLayer, BatchJob,
     CameraProfileDescriptor, ColorTag, CullFlag, DevelopRecipe, EditActor, EditOp, HealMode,
     HealSpot, LayerMaskItem, LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_HEAL_SPOTS,
-    MAX_MASKS_PER_LAYER, MAX_PROFILE_FILE_BYTES, MaskCombineOp, MaskShape, PhotoMeta,
-    ProcessingMode, ProfileCategory, RecipePatch, USER_PROFILE_PREFIX, UserStyle, WbPreset,
+    MAX_MASKS_PER_LAYER, MAX_PROFILE_FILE_BYTES, MAX_PROMPT_POINTS, MaskCombineOp, MaskShape,
+    ModelId, ModelInstallState, PhotoMeta, ProcessingMode, ProfileCategory, PromptBox, PromptPoint,
+    RecipePatch, SegmentationEngine, SmartMaskPrompt, USER_PROFILE_PREFIX, UserStyle, WbPreset,
     analyze_linear_proxy, apply_style_to_recipe, auto_exposure_and_tone, auto_levels,
     auto_white_balance, blend_recipes, builtin_camera_profiles, builtin_presets,
     canonical_param_key, compute_histogram, copy_recipe_groups, create_capture_one_session,
     default_profiles_dir, default_styles_dir, delete_user_profile, delete_user_profile_in_dir,
     delete_user_style_in_dir, diff_recipes, filmic_tonemap_with_curve, import_user_profile,
-    import_user_profile_in_dir_with_overwrite, linear_to_srgb, list_all_camera_profiles,
-    list_user_styles_in_dir, load_user_style_in_dir, modified_recipe_groups, parse_cube_lut,
-    parse_dcp_profile, parse_icc_profile, pick_white_balance, recipe_field_diffs,
-    recipe_non_default_map, recipe_schema_json, reset_recipe_group, resolve_builtin_preset,
-    rgb_to_hsl_and_lab, sanitize_profile_slug, save_user_style_in_dir, search_params,
+    import_user_profile_in_dir_with_overwrite, inspect_model_status, linear_to_srgb,
+    list_all_camera_profiles, list_user_styles_in_dir, load_ai_model_config,
+    load_user_style_in_dir, modified_recipe_groups, parse_cube_lut, parse_dcp_profile,
+    parse_icc_profile, pick_white_balance, recipe_field_diffs, recipe_non_default_map,
+    recipe_schema_json, reset_recipe_group, resolve_builtin_preset, rgb_to_hsl_and_lab,
+    sanitize_profile_slug, save_ai_model_config, save_user_style_in_dir, search_params,
     set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
     ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, HotFolderWatcher,
-    NamingContext, RASTER_EXTENSIONS, RAW_EXTENSIONS, ScanOptions, TextWatermark,
-    WatermarkPosition, builtin_export_recipes, expand_naming_template, export_image_with_options,
-    export_multi_recipe, extract_detail_luma_proxy, extract_exif_from_path, generate_subject_mask,
-    guard_not_source as decode_guard_not_source, is_raw_extension, is_supported_photo, load_file,
-    load_file_proxy, plan_multi_recipe_paths, probe_image_dimensions, sample_linear_rgb_at_uv,
-    sample_raw_linear_rgb_at_uv, scan_photo_folder_with_options,
+    NamingContext, RASTER_EXTENSIONS, RAW_EXTENSIONS, ScanOptions, SmartMaskResult, TextWatermark,
+    WatermarkPosition, active_engine_summary, builtin_export_recipes, download_model,
+    expand_naming_template, export_image_with_options, export_multi_recipe,
+    extract_detail_luma_proxy, extract_exif_from_path, generate_smart_mask,
+    guard_not_source as decode_guard_not_source, is_raw_extension, is_supported_photo,
+    list_model_statuses, load_file, load_file_proxy, plan_multi_recipe_paths,
+    probe_image_dimensions, remove_model, sample_linear_rgb_at_uv, sample_raw_linear_rgb_at_uv,
+    scan_photo_folder_with_options, setup_model_from_local_dir,
 };
 use serde_json::{Value, json};
 
 use crate::{
     AnalyzeArgs, BatchCmd, Cli, CliError, CliSearchCmd, Command, CopyLookArgs, CullArgs, DiffArgs,
-    EditArgs, ExportArgs, HealCmd, InspectArgs, LayerCmd, PresetCmd, PreviewArgs, ProfileCmd,
-    ResolvedFormat, RuntimeOpts, SessionCmd, StyleCmd, VariantCmd, emit_ndjson_line, emit_ok,
-    exit_code,
+    EditArgs, ExportArgs, HealCmd, InspectArgs, LayerCmd, ModelCmd, PresetCmd, PreviewArgs,
+    ProfileCmd, ResolvedFormat, RuntimeOpts, SessionCmd, StyleCmd, VariantCmd, emit_ndjson_line,
+    emit_ok, exit_code,
 };
 
 pub fn dispatch(command: Command, opts: &RuntimeOpts) -> Result<u8, CliError> {
@@ -59,6 +63,7 @@ pub fn dispatch(command: Command, opts: &RuntimeOpts) -> Result<u8, CliError> {
         Command::Style { sub } => cmd_style(sub, opts),
         Command::CopyLook(args) => cmd_copy_look(args, opts),
         Command::Layer { sub } => cmd_layer(sub, opts),
+        Command::Model { sub } => cmd_model(sub, opts),
         Command::Heal { sub } => cmd_heal(sub, opts),
         Command::Session { sub } => match sub {
             SessionCmd::Scan {
@@ -111,7 +116,8 @@ fn cmd_schema(target: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         { "command": "rd variant list|new|clone|select|delete <photo>", "summary": "Manage non-destructive Virtual Variants inside `.rune-edit.json`" },
         { "command": "rd style list|save|apply|delete", "summary": "Save, apply, or stack reusable User Styles (`--autoselect-adjusted`, `--stack`, `--strength`)" },
         { "command": "rd copy-look <src> <dst...>", "summary": "Selective Adjustments Clipboard (`--groups` or `--autoselect-adjusted`)" },
-        { "command": "rd layer list|add|update|mask-add|mask-clear|remove <photo>", "summary": "Manage Adjustment Layers, Combine Masks (`add`/`subtract`/`intersect`), Linear/Radial/Luma, and AI Subject/Background masks" },
+        { "command": "rd layer list|add|update|mask-add|mask-clear|remove <photo>", "summary": "Manage Adjustment Layers, Combine Masks (`add`/`subtract`/`intersect`), Linear/Radial/Luma, AI Subject/Background, and interactive AI Select (`--kind ai-select --point --box --engine --invert`) masks" },
+        { "command": "rd model list|status|setup|use|remove", "summary": "Manage AI segmentation engines (Apple Vision ANE built-in, SAM 2.1, SAM 3 ONNX): list, status, download/setup (`--accept-license`, `--from-dir`), select active engine, or remove weights" },
         { "command": "rd heal list|add|remove|clear <photo>", "summary": "Manage Spot Heal & Clone retouching stamps" },
         { "command": "rd session scan <dir>", "summary": "Scan and filter a photo directory (`--picks`, `--min-rating`, `--color-tag`, `--search`)" },
         { "command": "rd session init <dir>", "summary": "Initialize a Capture One 4-folder session (`Capture/`, `Selects/`, `Output/`, `Trash/`)" },
@@ -285,7 +291,11 @@ fn cmd_cli_search(query: &str, opts: &RuntimeOpts) -> Result<u8, CliError> {
         ),
         (
             "rd layer list|add|update|mask-add|mask-clear|remove <photo>",
-            "Adjustment Layers, Combine Masks (Linear/Radial/Luma), and AI Subject/Background masks",
+            "Adjustment Layers, Combine Masks (Linear/Radial/Luma), AI Subject/Background, and interactive AI Select (--kind ai-select --point --box --engine --invert)",
+        ),
+        (
+            "rd model list|status|setup|use|remove",
+            "Manage AI segmentation models & engines (Apple Vision ANE, SAM 2.1, SAM 3 ONNX; --accept-license, --from-dir)",
         ),
         (
             "rd heal list|add|remove|clear <photo>",
@@ -3560,6 +3570,433 @@ fn parse_radius_pair(raw: &str) -> Result<[f32; 2], CliError> {
     }
 }
 
+fn format_bytes_human(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    if bytes as f64 >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    } else if bytes as f64 >= KIB {
+        format!("{:.1} KB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn model_install_state_str(state: ModelInstallState) -> &'static str {
+    match state {
+        ModelInstallState::NotInstalled => "not_installed",
+        ModelInstallState::Partial { .. } => "partial",
+        ModelInstallState::Installed { .. } => "installed",
+    }
+}
+
+fn model_status_to_json(status: &rune_editor_core::ModelStatus) -> Value {
+    json!({
+        "id": status.id.id(),
+        "display_name": status.display_name,
+        "aliases": status.id.aliases(),
+        "engine": status.engine,
+        "hf_repo": status.hf_repo,
+        "state": model_install_state_str(status.state),
+        "installed": status.state.is_installed(),
+        "installed_bytes": status.state.bytes_present(),
+        "approx_bytes": status.approx_bytes,
+        "license": status.license,
+        "license_url": status.license_url,
+        "requires_license_acceptance": status.requires_license_acceptance,
+        "license_accepted": status.license_accepted,
+        "install_dir": status.install_dir,
+    })
+}
+
+fn parse_cli_model_id(raw: &str) -> Result<ModelId, CliError> {
+    ModelId::from_str_loose(raw).ok_or_else(|| {
+        CliError::validation(format!(
+            "Unknown model '{raw}'. Valid: sam2.1-hiera-tiny (sam2.1, sam2), sam3-tracker-q4f16 (sam3), sam3-tracker-fp16 (sam3-fp16)"
+        ))
+    })
+}
+
+fn parse_cli_engine(raw: Option<&str>) -> Result<Option<SegmentationEngine>, CliError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let eng = SegmentationEngine::from_str_loose(s).ok_or_else(|| {
+        CliError::validation(format!(
+            "Unknown segmentation --engine '{s}'. Valid: auto, apple-vision, sam2.1, sam3, heuristic"
+        ))
+    })?;
+    Ok(Some(eng))
+}
+
+fn parse_prompt_point(raw: &str) -> Result<PromptPoint, CliError> {
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return Err(CliError::validation(format!(
+            "Invalid --point '{raw}'. Expected `x,y` or `x,y,+` / `x,y,-` in 0.0..=1.0"
+        )));
+    }
+    let x: f32 = parts[0]
+        .parse()
+        .map_err(|_| CliError::validation(format!("Invalid X coordinate in --point '{raw}'")))?;
+    let y: f32 = parts[1]
+        .parse()
+        .map_err(|_| CliError::validation(format!("Invalid Y coordinate in --point '{raw}'")))?;
+    if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+        return Err(CliError::validation(format!(
+            "--point coordinates must be finite and within 0.0..=1.0 (got '{raw}')"
+        )));
+    }
+    let positive = if parts.len() == 3 {
+        match parts[2].to_ascii_lowercase().as_str() {
+            "+" | "pos" | "positive" | "1" | "fg" | "true" => true,
+            "-" | "neg" | "negative" | "0" | "bg" | "false" => false,
+            other => {
+                return Err(CliError::validation(format!(
+                    "Invalid polarity '{other}' in --point '{raw}'. Expected `+` or `-`"
+                )));
+            }
+        }
+    } else {
+        true
+    };
+    Ok(PromptPoint::new(x, y, positive))
+}
+
+fn parse_prompt_box(raw: &str) -> Result<PromptBox, CliError> {
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(CliError::validation(format!(
+            "Invalid --box '{raw}'. Expected `x0,y0,x1,y1` in 0.0..=1.0"
+        )));
+    }
+    let mut vals = [0.0_f32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        let v: f32 = part
+            .parse()
+            .map_err(|_| CliError::validation(format!("Invalid number in --box '{raw}'")))?;
+        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+            return Err(CliError::validation(format!(
+                "--box coordinates must be finite and within 0.0..=1.0 (got '{raw}')"
+            )));
+        }
+        vals[i] = v;
+    }
+    let bbox = PromptBox::new(vals[0], vals[1], vals[2], vals[3]).sanitized();
+    if !bbox.is_valid() {
+        return Err(CliError::validation(format!(
+            "--box must enclose a non-zero area (x0 != x1 and y0 != y1; got '{raw}')"
+        )));
+    }
+    Ok(bbox)
+}
+
+fn attach_smart_telemetry(data: &mut Value, smart: &SmartMaskResult) {
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("engine_used".to_owned(), json!(smart.engine_used));
+        obj.insert("backend_label".to_owned(), json!(smart.backend_label));
+        obj.insert("elapsed_ms".to_owned(), json!(smart.elapsed_ms));
+        obj.insert("instance_count".to_owned(), json!(smart.instance_count));
+        obj.insert("iou_score".to_owned(), json!(smart.iou_score));
+        obj.insert("fallback_note".to_owned(), json!(smart.fallback_note));
+    }
+}
+
+fn cmd_model(sub: ModelCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
+    match sub {
+        ModelCmd::List => {
+            let summary = active_engine_summary();
+            let statuses = list_model_statuses();
+            let builtin_apple = json!({
+                "id": "apple-vision",
+                "display_name": "Apple Vision ANE (Built-in)",
+                "aliases": ["apple-vision", "vision", "apple"],
+                "engine": SegmentationEngine::AppleVision,
+                "available": summary.apple_vision_available,
+                "backend_label": summary.apple_vision_label,
+                "state": if summary.apple_vision_available { "built_in" } else { "unavailable" },
+                "installed": summary.apple_vision_available,
+                "installed_bytes": 0,
+                "approx_bytes": 0,
+                "license": "macOS System Framework",
+                "requires_license_acceptance": false,
+                "license_accepted": true,
+            });
+            let models_json: Vec<Value> = statuses.iter().map(model_status_to_json).collect();
+
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "Active engine: {} (Subject: {}, Interactive: {})",
+                summary.configured_engine.display_name(),
+                summary.effective_auto_engine.display_name(),
+                summary.effective_interactive_engine.display_name(),
+            ));
+            lines.push(format!(
+                "  apple-vision           {} [{}] (0 B, built-in)",
+                summary.apple_vision_label,
+                if summary.apple_vision_available {
+                    "built-in"
+                } else {
+                    "unavailable"
+                }
+            ));
+            for st in &statuses {
+                let state_str = match st.state {
+                    ModelInstallState::Installed { total_bytes } => {
+                        format!("installed, {}", format_bytes_human(total_bytes))
+                    }
+                    ModelInstallState::Partial { bytes_present } => {
+                        format!("partial, {}", format_bytes_human(bytes_present))
+                    }
+                    ModelInstallState::NotInstalled => {
+                        format!("not installed, ~{}", format_bytes_human(st.approx_bytes))
+                    }
+                };
+                let lic = if st.requires_license_acceptance {
+                    if st.license_accepted {
+                        format!("{} (accepted)", st.license)
+                    } else {
+                        format!("{} (--accept-license required)", st.license)
+                    }
+                } else {
+                    st.license.clone()
+                };
+                lines.push(format!(
+                    "  {:22} {} [{}] | aliases: {} | {}",
+                    st.id.id(),
+                    st.display_name,
+                    state_str,
+                    st.id.aliases().join(", "),
+                    lic,
+                ));
+            }
+
+            let data = json!({
+                "active_engine": summary.configured_engine,
+                "effective_auto_engine": summary.effective_auto_engine,
+                "effective_interactive_engine": summary.effective_interactive_engine,
+                "models_dir": summary.models_root,
+                "builtin_apple_vision": builtin_apple,
+                "models": models_json,
+            });
+            emit_ok(opts, "model.list", data, &lines.join("\n"));
+            Ok(exit_code::OK)
+        }
+        ModelCmd::Status => {
+            let summary = active_engine_summary();
+            let statuses = list_model_statuses();
+            let installed_total_bytes: u64 = statuses
+                .iter()
+                .map(|s| s.state.bytes_present())
+                .fold(0u64, u64::saturating_add);
+            let installed_names: Vec<&str> =
+                summary.installed_models.iter().map(|id| id.id()).collect();
+
+            let human = format!(
+                "Active engine: {}\n  Effective Subject engine:     {}\n  Effective Interactive engine: {}\n  Apple Vision:                 {} ({})\n  Models directory:             {}\n  Installed models:             {}\n  Installed disk usage:         {}",
+                summary.configured_engine.display_name(),
+                summary.effective_auto_engine.display_name(),
+                summary.effective_interactive_engine.display_name(),
+                if summary.apple_vision_available {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                summary.apple_vision_label,
+                summary.models_root.display(),
+                if installed_names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    installed_names.join(", ")
+                },
+                format_bytes_human(installed_total_bytes),
+            );
+            let data = json!({
+                "active_engine": summary.configured_engine,
+                "configured_engine": summary.configured_engine,
+                "effective_auto_engine": summary.effective_auto_engine,
+                "effective_interactive_engine": summary.effective_interactive_engine,
+                "apple_vision_available": summary.apple_vision_available,
+                "apple_vision_label": summary.apple_vision_label,
+                "installed_models": summary.installed_models,
+                "preferred_sam3_variant": summary.preferred_sam3_variant,
+                "models_dir": summary.models_root,
+                "installed_total_bytes": installed_total_bytes,
+            });
+            emit_ok(opts, "model.status", data, &human);
+            Ok(exit_code::OK)
+        }
+        ModelCmd::Setup {
+            model,
+            accept_license,
+            from_dir,
+        } => {
+            let model_id = parse_cli_model_id(&model)?;
+            let spec = model_id.spec();
+            if spec.requires_license_acceptance && !accept_license {
+                return Err(rune_editor_decode::ModelError::LicenseRequired {
+                    model_id,
+                    license: spec.license.to_owned(),
+                    license_url: spec.license_url.to_owned(),
+                }
+                .into());
+            }
+
+            if opts.dry_run {
+                if let Some(dir) = &from_dir
+                    && !dir.is_dir()
+                {
+                    return Err(CliError::not_found(format!(
+                        "Local model directory not found: {}",
+                        dir.display()
+                    )));
+                }
+                let config = load_ai_model_config().unwrap_or_default();
+                let st = inspect_model_status(model_id, &config);
+                let data = json!({
+                    "model_id": model_id.id(),
+                    "source": if from_dir.is_some() { "local_dir" } else { "huggingface" },
+                    "from_dir": from_dir,
+                    "would_install_dir": st.install_dir,
+                    "approx_bytes": spec.approx_bytes,
+                    "license": spec.license,
+                    "license_accepted": accept_license || !spec.requires_license_acceptance,
+                });
+                let human = format!(
+                    "[dry-run] Would install {} ({}, ~{}) into {}",
+                    spec.display_name,
+                    model_id.id(),
+                    format_bytes_human(spec.approx_bytes),
+                    st.install_dir.display(),
+                );
+                emit_ok(opts, "model.setup", data, &human);
+                return Ok(exit_code::OK);
+            }
+
+            let source = if from_dir.is_some() {
+                "local_dir"
+            } else {
+                "huggingface"
+            };
+            let status = if let Some(dir) = from_dir.as_deref() {
+                setup_model_from_local_dir(model_id, dir, accept_license)?
+            } else {
+                let last_pct = std::cell::Cell::new(usize::MAX);
+                let last_file = std::cell::Cell::new(usize::MAX);
+                download_model(model_id, accept_license, None, |prog| {
+                    if opts.quiet {
+                        return;
+                    }
+                    let pct = ((prog.overall_fraction.clamp(0.0, 1.0)) * 100.0).round() as usize;
+                    let prev_pct = last_pct.get();
+                    let prev_file = last_file.get();
+                    if prev_file != prog.file_index
+                        || prev_pct == usize::MAX
+                        || pct >= prev_pct.saturating_add(5)
+                        || pct >= 100
+                    {
+                        last_pct.set(pct);
+                        last_file.set(prog.file_index);
+                        eprintln!(
+                            "[{:3}%] ({}/{}) {} — {}",
+                            pct,
+                            prog.file_index + 1,
+                            prog.total_files,
+                            prog.file_name,
+                            prog.status,
+                        );
+                    }
+                })?
+            };
+
+            let mut data = model_status_to_json(&status);
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("source".to_owned(), json!(source));
+            }
+            let human = format!(
+                "Installed {} ({}, {}) into {}",
+                status.display_name,
+                status.id.id(),
+                format_bytes_human(status.state.bytes_present()),
+                status.install_dir.display(),
+            );
+            emit_ok(opts, "model.setup", data, &human);
+            Ok(exit_code::OK)
+        }
+        ModelCmd::Use { engine } => {
+            let eng = SegmentationEngine::from_str_loose(&engine).ok_or_else(|| {
+                CliError::validation(format!(
+                    "Unknown segmentation engine '{engine}'. Valid: auto, apple-vision, sam2.1, sam3, heuristic"
+                ))
+            })?;
+            let mut config = load_ai_model_config().unwrap_or_default();
+            config.active_engine = eng;
+            if let Some(m) = ModelId::from_str_loose(&engine)
+                && m.is_sam3()
+            {
+                config.preferred_sam3_variant = m;
+            }
+            if !opts.dry_run {
+                save_ai_model_config(&config)?;
+            }
+            let summary = active_engine_summary();
+            let active_engine = if opts.dry_run {
+                eng
+            } else {
+                summary.configured_engine
+            };
+            let data = json!({
+                "active_engine": active_engine,
+                "effective_auto_engine": summary.effective_auto_engine,
+                "effective_interactive_engine": summary.effective_interactive_engine,
+                "preferred_sam3_variant": config.preferred_sam3_variant,
+                "models_dir": summary.models_root,
+            });
+            let human = format!(
+                "{} active segmentation engine to {} (Subject: {}, Interactive: {})",
+                if opts.dry_run {
+                    "[dry-run] Would set"
+                } else {
+                    "Set"
+                },
+                active_engine.display_name(),
+                summary.effective_auto_engine.display_name(),
+                summary.effective_interactive_engine.display_name(),
+            );
+            emit_ok(opts, "model.use", data, &human);
+            Ok(exit_code::OK)
+        }
+        ModelCmd::Remove { model } => {
+            let model_id = parse_cli_model_id(&model)?;
+            let config = load_ai_model_config().unwrap_or_default();
+            let before_status = inspect_model_status(model_id, &config);
+            let freed_bytes = before_status.state.bytes_present();
+            if !opts.dry_run {
+                remove_model(model_id)?;
+            }
+            let after_status = inspect_model_status(model_id, &config);
+            let data = json!({
+                "model_id": model_id.id(),
+                "removed": !opts.dry_run,
+                "freed_bytes": freed_bytes,
+                "status": model_status_to_json(&after_status),
+            });
+            let human = format!(
+                "{} model '{}' (freed {})",
+                if opts.dry_run {
+                    "[dry-run] Would remove"
+                } else {
+                    "Removed"
+                },
+                model_id.id(),
+                format_bytes_human(freed_bytes),
+            );
+            emit_ok(opts, "model.remove", data, &human);
+            Ok(exit_code::OK)
+        }
+    }
+}
+
 fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
     match sub {
         LayerCmd::List { photo } => {
@@ -3585,6 +4022,10 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
             kind,
             opacity,
             sets,
+            engine,
+            points,
+            bbox,
+            invert,
         } => {
             ensure_exists(&photo)?;
             if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
@@ -3592,6 +4033,7 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     "--opacity must be within 0.0..=1.0 (got {opacity})"
                 )));
             }
+            let engine_override = parse_cli_engine(engine.as_deref())?;
             let mut meta = PhotoMeta::load_sidecar(&photo)?.unwrap_or_default();
             if meta.recipe.layers.len() >= MAX_ADJUSTMENT_LAYERS {
                 return Err(CliError::validation(format!(
@@ -3600,7 +4042,18 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
             }
             let before = meta.recipe.clone();
             let id = next_layer_id(&meta.recipe.layers);
-            let mut layer = match kind.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            let norm_kind = kind.trim().to_ascii_lowercase().replace('_', "-");
+            let is_ai_select = matches!(
+                norm_kind.as_str(),
+                "ai-select" | "select" | "smart" | "smart-select"
+            );
+            if !is_ai_select && (!points.is_empty() || bbox.is_some()) {
+                return Err(CliError::validation(
+                    "`--point` and `--box` are only valid with `--kind ai-select`.",
+                ));
+            }
+            let mut smart_telemetry: Option<SmartMaskResult> = None;
+            let mut layer = match norm_kind.as_str() {
                 "empty" => AdjustmentLayer::new(&id, &name),
                 "filled" => AdjustmentLayer::new_filled(&id, &name),
                 "linear" => AdjustmentLayer::new_with_mask(
@@ -3633,21 +4086,81 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     },
                 ),
                 "ai-subject" | "subject" => {
-                    let proxy = load_file_proxy(&photo, Some(512))?;
-                    let shape = generate_subject_mask(&proxy, false);
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = if invert {
+                        SmartMaskPrompt::AutoBackground
+                    } else {
+                        SmartMaskPrompt::AutoSubject
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let shape = res.mask.clone();
+                    smart_telemetry = Some(res);
                     AdjustmentLayer::new_with_mask(&id, &name, shape)
                 }
                 "ai-background" | "background" | "ai-bg" => {
-                    let proxy = load_file_proxy(&photo, Some(512))?;
-                    let shape = generate_subject_mask(&proxy, true);
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = if invert {
+                        SmartMaskPrompt::AutoSubject
+                    } else {
+                        SmartMaskPrompt::AutoBackground
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let shape = res.mask.clone();
+                    smart_telemetry = Some(res);
+                    AdjustmentLayer::new_with_mask(&id, &name, shape)
+                }
+                "ai-select" | "select" | "smart" | "smart-select" => {
+                    if points.len() > MAX_PROMPT_POINTS {
+                        return Err(CliError::validation(format!(
+                            "Too many --point arguments ({} > max {MAX_PROMPT_POINTS})",
+                            points.len()
+                        )));
+                    }
+                    let mut parsed_points = Vec::with_capacity(points.len());
+                    for p in &points {
+                        parsed_points.push(parse_prompt_point(p)?);
+                    }
+                    let parsed_box = match bbox.as_deref() {
+                        Some(b) => Some(parse_prompt_box(b)?),
+                        None => None,
+                    };
+                    if parsed_points.is_empty() && parsed_box.is_none() {
+                        return Err(CliError::validation(
+                            "`--kind ai-select` requires at least one `--point x,y[,+|-]` or `--box x0,y0,x1,y1`.",
+                        ));
+                    }
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = SmartMaskPrompt::Interactive {
+                        points: parsed_points,
+                        bbox: parsed_box,
+                        invert,
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let shape = res.mask.clone();
+                    smart_telemetry = Some(res);
                     AdjustmentLayer::new_with_mask(&id, &name, shape)
                 }
                 other => {
                     return Err(CliError::validation(format!(
-                        "Unknown layer --kind '{other}'. Valid: empty, filled, linear, radial, luma, ai-subject, ai-background"
+                        "Unknown layer --kind '{other}'. Valid: empty, filled, linear, radial, luma, ai-subject, ai-background, ai-select"
                     )));
                 }
             };
+            if !matches!(
+                norm_kind.as_str(),
+                "ai-subject"
+                    | "subject"
+                    | "ai-background"
+                    | "background"
+                    | "ai-bg"
+                    | "ai-select"
+                    | "select"
+                    | "smart"
+                    | "smart-select"
+            ) && invert
+            {
+                layer.inverted = true;
+            }
             layer.opacity = opacity;
             apply_local_set_exprs(&mut layer.adjustments, &sets)?;
             layer = layer.sanitized();
@@ -3667,15 +4180,21 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                 );
                 meta.save_sidecar_in_place(&photo)?;
             }
-            let data = json!({
+            let mut data = json!({
                 "path": photo,
                 "index": idx,
                 "id": id,
                 "layer_count": meta.recipe.layers.len(),
                 "layers": build_layers_summary(&meta.recipe.layers),
             });
+            let engine_note = if let Some(ref smart) = smart_telemetry {
+                attach_smart_telemetry(&mut data, smart);
+                format!(" via {} ({}ms)", smart.backend_label, smart.elapsed_ms)
+            } else {
+                String::new()
+            };
             let human = format!(
-                "Added layer #{idx} '{name}' ({kind}) on {}",
+                "Added layer #{idx} '{name}' ({kind}){engine_note} on {}",
                 photo.display()
             );
             emit_ok(opts, "layer.add", data, &human);
@@ -3758,6 +4277,10 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
             low_falloff,
             high_falloff,
             inverted,
+            engine,
+            points,
+            bbox,
+            invert,
         } => {
             ensure_exists(&photo)?;
             let combine_op = MaskCombineOp::from_cli_str(&op).ok_or_else(|| {
@@ -3765,6 +4288,7 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     "Unknown --op '{op}'. Valid: add, subtract, intersect"
                 ))
             })?;
+            let engine_override = parse_cli_engine(engine.as_deref())?;
             let mut meta = PhotoMeta::load_sidecar(&photo)?.unwrap_or_default();
             let idx = resolve_layer_index(&meta.recipe.layers, &index)?;
             if meta.recipe.layers[idx].masks.len() >= MAX_MASKS_PER_LAYER {
@@ -3772,7 +4296,18 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     "Layer #{idx} already has the maximum {MAX_MASKS_PER_LAYER} masks"
                 )));
             }
-            let shape = match kind.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            let norm_kind = kind.trim().to_ascii_lowercase().replace('_', "-");
+            let is_ai_select = matches!(
+                norm_kind.as_str(),
+                "ai-select" | "select" | "smart" | "smart-select"
+            );
+            if !is_ai_select && (!points.is_empty() || bbox.is_some()) {
+                return Err(CliError::validation(
+                    "`--point` and `--box` are only valid with `--kind ai-select`.",
+                ));
+            }
+            let mut smart_telemetry: Option<SmartMaskResult> = None;
+            let shape = match norm_kind.as_str() {
                 "filled" => MaskShape::Filled,
                 "linear" => {
                     let s = match start.as_deref() {
@@ -3843,23 +4378,83 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                     }
                 }
                 "ai-subject" | "subject" => {
-                    let proxy = load_file_proxy(&photo, Some(512))?;
-                    generate_subject_mask(&proxy, false)
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = if invert {
+                        SmartMaskPrompt::AutoBackground
+                    } else {
+                        SmartMaskPrompt::AutoSubject
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let mask = res.mask.clone();
+                    smart_telemetry = Some(res);
+                    mask
                 }
                 "ai-background" | "background" | "ai-bg" => {
-                    let proxy = load_file_proxy(&photo, Some(512))?;
-                    generate_subject_mask(&proxy, true)
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = if invert {
+                        SmartMaskPrompt::AutoSubject
+                    } else {
+                        SmartMaskPrompt::AutoBackground
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let mask = res.mask.clone();
+                    smart_telemetry = Some(res);
+                    mask
+                }
+                "ai-select" | "select" | "smart" | "smart-select" => {
+                    if points.len() > MAX_PROMPT_POINTS {
+                        return Err(CliError::validation(format!(
+                            "Too many --point arguments ({} > max {MAX_PROMPT_POINTS})",
+                            points.len()
+                        )));
+                    }
+                    let mut parsed_points = Vec::with_capacity(points.len());
+                    for p in &points {
+                        parsed_points.push(parse_prompt_point(p)?);
+                    }
+                    let parsed_box = match bbox.as_deref() {
+                        Some(b) => Some(parse_prompt_box(b)?),
+                        None => None,
+                    };
+                    if parsed_points.is_empty() && parsed_box.is_none() {
+                        return Err(CliError::validation(
+                            "`--kind ai-select` requires at least one `--point x,y[,+|-]` or `--box x0,y0,x1,y1`.",
+                        ));
+                    }
+                    let proxy = load_file_proxy(&photo, Some(1024))?;
+                    let prompt = SmartMaskPrompt::Interactive {
+                        points: parsed_points,
+                        bbox: parsed_box,
+                        invert,
+                    };
+                    let res = generate_smart_mask(&proxy, &prompt, engine_override)?;
+                    let mask = res.mask.clone();
+                    smart_telemetry = Some(res);
+                    mask
                 }
                 other => {
                     return Err(CliError::validation(format!(
-                        "Unknown mask --kind '{other}'. Valid: linear, radial, luma, filled, ai-subject, ai-background"
+                        "Unknown mask --kind '{other}'. Valid: linear, radial, luma, filled, ai-subject, ai-background, ai-select"
                     )));
                 }
             };
             let before = meta.recipe.clone();
             let mut item = LayerMaskItem::new(shape);
             item.op = combine_op;
-            item.inverted = inverted;
+            item.inverted = inverted
+                || (invert
+                    && !matches!(
+                        norm_kind.as_str(),
+                        "ai-subject"
+                            | "subject"
+                            | "ai-background"
+                            | "background"
+                            | "ai-bg"
+                            | "ai-select"
+                            | "select"
+                            | "smart"
+                            | "smart-select"
+                    ));
             meta.recipe.layers[idx].masks.push(item.sanitized());
             meta.recipe.preset_name = None;
             let diffs = recipe_field_diffs(&before, &meta.recipe);
@@ -3875,14 +4470,20 @@ fn cmd_layer(sub: LayerCmd, opts: &RuntimeOpts) -> Result<u8, CliError> {
                 );
                 meta.save_sidecar_in_place(&photo)?;
             }
-            let data = json!({
+            let mut data = json!({
                 "path": photo,
                 "index": idx,
                 "mask_count": meta.recipe.layers[idx].masks.len(),
                 "layers": build_layers_summary(&meta.recipe.layers),
             });
+            let engine_note = if let Some(ref smart) = smart_telemetry {
+                attach_smart_telemetry(&mut data, smart);
+                format!(" via {} ({}ms)", smart.backend_label, smart.elapsed_ms)
+            } else {
+                String::new()
+            };
             let human = format!(
-                "Added {kind} mask ({op}) to layer #{idx} on {}",
+                "Added {kind} mask ({op}){engine_note} to layer #{idx} on {}",
                 photo.display()
             );
             emit_ok(opts, "layer.mask_add", data, &human);
@@ -5228,6 +5829,10 @@ mod tests {
                     kind: "linear".to_owned(),
                     opacity: 0.85,
                     sets: vec!["exposure=-0.6".to_owned(), "dehaze=0.25".to_owned()],
+                    engine: None,
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
                 },
                 &opts,
             )
@@ -5254,6 +5859,10 @@ mod tests {
                     low_falloff: 0.1,
                     high_falloff: 0.1,
                     inverted: false,
+                    engine: None,
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
                 },
                 &opts,
             )
@@ -5278,6 +5887,10 @@ mod tests {
                     low_falloff: 0.12,
                     high_falloff: 0.08,
                     inverted: false,
+                    engine: None,
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
                 },
                 &opts,
             )
@@ -5294,6 +5907,10 @@ mod tests {
                     kind: "ai-subject".to_owned(),
                     opacity: 1.0,
                     sets: vec!["exposure=0.35".to_owned(), "clarity=0.2".to_owned()],
+                    engine: None,
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
                 },
                 &opts,
             )
@@ -5308,6 +5925,10 @@ mod tests {
                     kind: "ai-background".to_owned(),
                     opacity: 0.75,
                     sets: vec!["exposure=-0.4".to_owned()],
+                    engine: None,
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
                 },
                 &opts,
             )
@@ -5836,6 +6457,357 @@ DOMAIN_MAX 1.0 1.0 1.0
             .is_err(),
             "deleting already-deleted profile must return error"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase2_cli_models_and_ai_select_hermetic_end_to_end() {
+        use std::sync::Mutex;
+
+        use clap::Parser;
+        use rune_editor_core::{
+            LAYER_MASK_TILE_SIZE, MaskCombineOp, MaskShape, RUNE_MODELS_DIR_ENV,
+            inspect_model_install,
+        };
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        struct ModelsDirGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for ModelsDirGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(RUNE_MODELS_DIR_ENV, v) },
+                    None => unsafe { std::env::remove_var(RUNE_MODELS_DIR_ENV) },
+                }
+            }
+        }
+
+        let _guard_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_test_dir("phase2_models_ai_select");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        let _env_guard = ModelsDirGuard {
+            prev: std::env::var_os(RUNE_MODELS_DIR_ENV),
+        };
+        unsafe { std::env::set_var(RUNE_MODELS_DIR_ENV, &models_dir) };
+
+        let opts = test_runtime_opts();
+
+        // 1. Verify Clap parsing for `rd model` (incl. `download` alias) & `rd layer --kind ai-select`.
+        let parsed_dl = Cli::try_parse_from([
+            "rd",
+            "model",
+            "download",
+            "sam3",
+            "--accept-license",
+            "--from-dir",
+            "/tmp/fake-sam3",
+        ])
+        .expect("clap parse rd model download alias");
+        assert!(matches!(
+            parsed_dl.command,
+            Command::Model {
+                sub: ModelCmd::Setup {
+                    accept_license: true,
+                    from_dir: Some(_),
+                    ..
+                }
+            }
+        ));
+        let parsed_layer = Cli::try_parse_from([
+            "rd",
+            "layer",
+            "add",
+            "photo.jpg",
+            "--name",
+            "Smart",
+            "--kind",
+            "ai-select",
+            "--engine",
+            "heuristic",
+            "--point",
+            "0.5,0.4,+",
+            "--point",
+            "0.1,0.1,-",
+            "--box",
+            "0.2,0.2,0.8,0.8",
+            "--invert",
+        ])
+        .expect("clap parse rd layer add ai-select");
+        assert!(matches!(
+            parsed_layer.command,
+            Command::Layer {
+                sub: LayerCmd::Add { invert: true, .. }
+            }
+        ));
+
+        // 2. `rd model list`, `rd model status`, `rd model use`.
+        assert_eq!(cmd_model(ModelCmd::List, &opts).expect("model list"), 0);
+        assert_eq!(cmd_model(ModelCmd::Status, &opts).expect("model status"), 0);
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Use {
+                    engine: "heuristic".to_owned(),
+                },
+                &opts,
+            )
+            .expect("model use heuristic"),
+            0
+        );
+        assert_eq!(
+            load_ai_model_config().expect("load config").active_engine,
+            SegmentationEngine::Heuristic
+        );
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Use {
+                    engine: "sam3".to_owned(),
+                },
+                &opts,
+            )
+            .expect("model use sam3"),
+            0
+        );
+        assert_eq!(
+            load_ai_model_config().expect("load config").active_engine,
+            SegmentationEngine::Sam3Tracker
+        );
+        assert!(
+            cmd_model(
+                ModelCmd::Use {
+                    engine: "nonexistent_engine".to_owned(),
+                },
+                &opts,
+            )
+            .is_err(),
+            "unknown engine must fail"
+        );
+
+        // 3. Offline local directory setup for SAM 2.1 (Apache-2.0, no license flag required).
+        let sam21_src = dir.join("sam21_local");
+        std::fs::create_dir_all(&sam21_src).expect("create sam21 src");
+        for f in ModelId::Sam21HieraTinyFp16.spec().files {
+            std::fs::write(sam21_src.join(f.filename), b"\x08\x01ONNX_DUMMY_WEIGHTS")
+                .expect("write dummy onnx");
+        }
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Setup {
+                    model: "sam2.1".to_owned(),
+                    accept_license: false,
+                    from_dir: Some(sam21_src.clone()),
+                },
+                &opts,
+            )
+            .expect("sam2.1 local setup"),
+            0
+        );
+        assert!(inspect_model_install(ModelId::Sam21HieraTinyFp16).is_installed());
+
+        // 4. SAM 3 license gate rejects without `--accept-license` with exact license name, URL, and hint!
+        let sam3_src = dir.join("sam3_local");
+        std::fs::create_dir_all(sam3_src.join("onnx")).expect("create sam3 onnx src");
+        for f in ModelId::Sam3TrackerQ4f16.spec().files {
+            std::fs::write(
+                sam3_src.join("onnx").join(f.filename),
+                b"\x08\x01SAM3_DUMMY_WEIGHTS",
+            )
+            .expect("write dummy sam3 onnx");
+        }
+        let lic_err = cmd_model(
+            ModelCmd::Setup {
+                model: "sam3-tracker-q4f16".to_owned(),
+                accept_license: false,
+                from_dir: Some(sam3_src.clone()),
+            },
+            &opts,
+        )
+        .expect_err("SAM 3 without --accept-license must fail");
+        assert_eq!(lic_err.code, "LICENSE_REQUIRED");
+        assert!(lic_err.message.contains("Meta SAM License"));
+        assert!(
+            lic_err
+                .message
+                .contains("https://github.com/facebookresearch/sam3/blob/main/LICENSE")
+        );
+        assert!(
+            lic_err
+                .hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("--accept-license")
+        );
+        assert!(!inspect_model_install(ModelId::Sam3TrackerQ4f16).is_installed());
+
+        // With `--accept-license`, SAM 3 installs cleanly and persists license acceptance!
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Setup {
+                    model: "sam3".to_owned(),
+                    accept_license: true,
+                    from_dir: Some(sam3_src),
+                },
+                &opts,
+            )
+            .expect("sam3 local setup with --accept-license"),
+            0
+        );
+        assert!(inspect_model_install(ModelId::Sam3TrackerQ4f16).is_installed());
+        assert!(
+            load_ai_model_config()
+                .expect("load config")
+                .is_license_accepted(ModelId::Sam3TrackerQ4f16)
+        );
+
+        // 5. `rd model remove` removes installed weights cleanly.
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Remove {
+                    model: "sam2.1".to_owned(),
+                },
+                &opts,
+            )
+            .expect("remove sam2.1"),
+            0
+        );
+        assert!(!inspect_model_install(ModelId::Sam21HieraTinyFp16).is_installed());
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Remove {
+                    model: "sam3".to_owned(),
+                },
+                &opts,
+            )
+            .expect("remove sam3"),
+            0
+        );
+        assert!(!inspect_model_install(ModelId::Sam3TrackerQ4f16).is_installed());
+
+        // Reset engine back to auto.
+        assert_eq!(
+            cmd_model(
+                ModelCmd::Use {
+                    engine: "auto".to_owned(),
+                },
+                &opts,
+            )
+            .expect("model use auto"),
+            0
+        );
+
+        // 6. `rd schema` & `rd cli search` include `rd model` and `ai-select`.
+        assert_eq!(cmd_schema("commands", &opts).expect("schema commands"), 0);
+        assert_eq!(cmd_cli_search("model", &opts).expect("cli search model"), 0);
+        assert_eq!(
+            cmd_cli_search("ai-select", &opts).expect("cli search ai-select"),
+            0
+        );
+
+        // 7. `rd layer add --kind ai-select` & `rd layer mask-add --kind ai-select`.
+        let photo = dir.join("smart_select.png");
+        write_test_png(&photo, 96, 64);
+
+        // Missing points and box must fail cleanly.
+        assert!(
+            cmd_layer(
+                LayerCmd::Add {
+                    photo: photo.clone(),
+                    name: "MissingPrompt".to_owned(),
+                    kind: "ai-select".to_owned(),
+                    opacity: 1.0,
+                    sets: Vec::new(),
+                    engine: Some("heuristic".to_owned()),
+                    points: Vec::new(),
+                    bbox: None,
+                    invert: false,
+                },
+                &opts,
+            )
+            .is_err(),
+            "ai-select without --point or --box must fail"
+        );
+
+        // Explicitly requesting an uninstalled SAM 2.1 model fails with MODEL_NOT_INSTALLED.
+        let uninst_err = cmd_layer(
+            LayerCmd::Add {
+                photo: photo.clone(),
+                name: "NeedsSam".to_owned(),
+                kind: "ai-select".to_owned(),
+                opacity: 1.0,
+                sets: Vec::new(),
+                engine: Some("sam2.1".to_owned()),
+                points: vec!["0.5,0.4,+".to_owned()],
+                bbox: None,
+                invert: false,
+            },
+            &opts,
+        )
+        .expect_err("uninstalled sam2.1 engine override must fail");
+        assert_eq!(uninst_err.code, "MODEL_NOT_INSTALLED");
+
+        // Valid `rd layer add --kind ai-select --point 0.5,0.4,+ --point 0.1,0.1,- --box 0.2,0.2,0.8,0.8`
+        assert_eq!(
+            cmd_layer(
+                LayerCmd::Add {
+                    photo: photo.clone(),
+                    name: "Smart Object".to_owned(),
+                    kind: "ai-select".to_owned(),
+                    opacity: 0.9,
+                    sets: vec!["exposure=0.45".to_owned()],
+                    engine: Some("heuristic".to_owned()),
+                    points: vec!["0.5,0.4,+".to_owned(), "0.1,0.1,-".to_owned()],
+                    bbox: Some("0.2,0.2,0.8,0.8".to_owned()),
+                    invert: false,
+                },
+                &opts,
+            )
+            .expect("layer add ai-select"),
+            0
+        );
+
+        // Valid `rd layer mask-add --kind ai-select --op subtract --point 0.5,0.5 --invert`
+        assert_eq!(
+            cmd_layer(
+                LayerCmd::MaskAdd {
+                    photo: photo.clone(),
+                    index: "0".to_owned(),
+                    kind: "ai-select".to_owned(),
+                    op: "subtract".to_owned(),
+                    start: None,
+                    end: None,
+                    center: None,
+                    radius: None,
+                    angle: 0.0,
+                    feather: None,
+                    low: 0.0,
+                    high: 1.0,
+                    low_falloff: 0.1,
+                    high_falloff: 0.1,
+                    inverted: false,
+                    engine: Some("heuristic".to_owned()),
+                    points: vec!["0.5,0.5".to_owned()],
+                    bbox: None,
+                    invert: true,
+                },
+                &opts,
+            )
+            .expect("layer mask-add ai-select"),
+            0
+        );
+
+        let meta = PhotoMeta::load_sidecar(&photo).unwrap().unwrap();
+        assert_eq!(meta.recipe.layers.len(), 1);
+        assert_eq!(meta.recipe.layers[0].masks.len(), 2);
+        assert_eq!(meta.recipe.layers[0].masks[1].op, MaskCombineOp::Subtract);
+        match &meta.recipe.layers[0].masks[0].shape {
+            MaskShape::RasterMask { width, height, .. } => {
+                assert_eq!(*width, LAYER_MASK_TILE_SIZE as u32);
+                assert_eq!(*height, LAYER_MASK_TILE_SIZE as u32);
+            }
+            other => panic!("expected 512x512 RasterMask, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

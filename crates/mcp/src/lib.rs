@@ -1,6 +1,6 @@
 //! Local Model Context Protocol (`2025-11-25`) server for Rune Darkroom.
 //!
-//! Provides BOTH official local transports over a single shared 7-tool engine:
+//! Provides BOTH official local transports over a single shared 10-tool engine:
 //! - **Streamable HTTP (`http://127.0.0.1:<port>/mcp`)** embedded inside the Rune Darkroom
 //!   desktop GUI (toggleable ON/OFF in Settings) so agents can edit the live canvas on the
 //!   user's behalf with `⌘Z` undo support.
@@ -235,7 +235,7 @@ mod tests {
             "expected 202 on notification, got {status}"
         );
 
-        // 5. tools/list returns all 9 annotated tools
+        // 5. tools/list returns all 10 annotated tools
         let list_body = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string();
         let list_req = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nMcp-Session-Id: {sid}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{list_body}",
@@ -245,7 +245,7 @@ mod tests {
         assert!(status.contains("200"));
         let list_json: Value = serde_json::from_str(&body).unwrap();
         let tools = list_json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         assert!(
             tools
                 .iter()
@@ -274,7 +274,7 @@ mod tests {
             "expected 200 on chunked POST, got {status}"
         );
         let chunk_json: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(chunk_json["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(chunk_json["result"]["tools"].as_array().unwrap().len(), 10);
 
         // 8. DELETE /mcp terminates the session cleanly
         let del_req = format!(
@@ -2666,6 +2666,452 @@ LUT_3D_SIZE 2
                 .get("profiles_dir")
                 .is_none()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_phase2_models_and_ai_select_hermetic_end_to_end() {
+        use std::sync::Mutex;
+
+        use rune_editor_core::{
+            ColorTag, CullFlag, DevelopRecipe, LAYER_MASK_TILE_SIZE, MaskCombineOp, MaskShape,
+            ModelId, RUNE_MODELS_DIR_ENV, SegmentationEngine, load_ai_model_config,
+        };
+        use rune_editor_decode::generate_demo_hdr_scene;
+
+        static MODELS_ENV_LOCK: Mutex<()> = Mutex::new(());
+        struct ModelsDirGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for ModelsDirGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(RUNE_MODELS_DIR_ENV, v) },
+                    None => unsafe { std::env::remove_var(RUNE_MODELS_DIR_ENV) },
+                }
+            }
+        }
+
+        struct LiveAiHost {
+            snap: Mutex<ActiveCanvasSnapshot>,
+        }
+        impl McpHostBridge for LiveAiHost {
+            fn active_canvas(&self) -> Option<ActiveCanvasSnapshot> {
+                Some(self.snap.lock().unwrap().clone())
+            }
+            fn apply_live_recipe(
+                &self,
+                _target: Option<&std::path::Path>,
+                new_recipe: DevelopRecipe,
+                _summary: String,
+            ) -> Result<bool, String> {
+                self.snap.lock().unwrap().recipe = new_recipe;
+                Ok(true)
+            }
+        }
+
+        let _lock = MODELS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_test_dir("phase2_models_ai_select");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).expect("create temp models dir");
+        let _env_guard = ModelsDirGuard {
+            prev: std::env::var_os(RUNE_MODELS_DIR_ENV),
+        };
+        unsafe { std::env::set_var(RUNE_MODELS_DIR_ENV, &models_dir) };
+
+        let demo = Arc::new(generate_demo_hdr_scene(120, 80));
+        let host = Arc::new(LiveAiHost {
+            snap: Mutex::new(ActiveCanvasSnapshot {
+                display_name: "ai_select.dng".to_owned(),
+                source_path: None,
+                image: demo,
+                recipe: DevelopRecipe::default(),
+                rating: 0,
+                flag: CullFlag::None,
+                color_tag: ColorTag::None,
+                demo_mode: true,
+                folder: None,
+                catalog_len: 1,
+            }),
+        });
+        let svc = McpService::new(host.clone());
+        let call = |id: u64, name: &str, arguments: Value| {
+            svc.handle_request(&protocol::JsonRpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: Some(json!(id)),
+                method: "tools/call".to_owned(),
+                params: Some(json!({ "name": name, "arguments": arguments })),
+            })
+            .unwrap()
+        };
+
+        // 1. Verify `tool_definitions()` exposes 10 tools including `rune_models` & `ai_select`.
+        let defs = tools::tool_definitions();
+        assert_eq!(defs.len(), 10);
+        let models_def = defs
+            .iter()
+            .find(|t| t.name == "rune_models")
+            .expect("rune_models tool definition");
+        let models_actions = models_def.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        for expected in ["list", "status", "use", "download", "setup_local", "remove"] {
+            assert!(
+                models_actions.iter().any(|a| a == expected),
+                "rune_models missing action {expected}"
+            );
+        }
+        let layers_def = defs
+            .iter()
+            .find(|t| t.name == "rune_edit_layers")
+            .expect("rune_edit_layers tool definition");
+        assert!(
+            layers_def.input_schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "ai_select")
+        );
+        assert!(
+            layers_def.input_schema["properties"]
+                .get("points")
+                .is_some()
+        );
+        assert!(layers_def.input_schema["properties"].get("box").is_some());
+        assert!(
+            layers_def.input_schema["properties"]
+                .get("engine")
+                .is_some()
+        );
+        assert!(
+            layers_def.input_schema["properties"]
+                .get("layer_index")
+                .is_some()
+        );
+
+        // 2. `rune_models` list & status + security/validation rejections.
+        let list_res = call(1, "rune_models", json!({ "action": "list" }));
+        assert_eq!(list_res["result"]["isError"], false, "list: {list_res}");
+        assert_eq!(
+            list_res["result"]["structuredContent"]["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(list_res["result"]["structuredContent"]["builtin_apple_vision"].is_object());
+
+        let status_res = call(2, "rune_models", json!({ "action": "status" }));
+        assert_eq!(status_res["result"]["isError"], false);
+        assert_eq!(
+            status_res["result"]["structuredContent"]["installed_total_bytes"],
+            0
+        );
+
+        // Unknown argument rejected.
+        let bad_arg = call(
+            3,
+            "rune_models",
+            json!({ "action": "list", "models_dir": "/etc" }),
+        );
+        assert_eq!(bad_arg["result"]["isError"], true);
+        assert_eq!(
+            bad_arg["result"]["structuredContent"]["code"],
+            "UNKNOWN_ARGUMENT"
+        );
+
+        // Action-scoped mismatch rejected.
+        let bad_scope = call(
+            4,
+            "rune_models",
+            json!({ "action": "status", "engine": "auto" }),
+        );
+        assert_eq!(bad_scope["result"]["isError"], true);
+        assert_eq!(
+            bad_scope["result"]["structuredContent"]["code"],
+            "VALIDATION_ERROR"
+        );
+
+        // Path traversal & symlink rejected on `setup_local`.
+        let bad_trav = call(
+            5,
+            "rune_models",
+            json!({
+                "action": "setup_local",
+                "model": "sam2.1",
+                "source_dir": "../etc"
+            }),
+        );
+        assert_eq!(bad_trav["result"]["isError"], true);
+        assert_eq!(
+            bad_trav["result"]["structuredContent"]["code"],
+            "VALIDATION_ERROR"
+        );
+
+        #[cfg(unix)]
+        {
+            let real_dir = dir.join("real_src");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            let sym_dir = dir.join("sym_src");
+            std::os::unix::fs::symlink(&real_dir, &sym_dir).unwrap();
+            let bad_sym = call(
+                6,
+                "rune_models",
+                json!({
+                    "action": "setup_local",
+                    "model": "sam2.1",
+                    "source_dir": sym_dir
+                }),
+            );
+            assert_eq!(bad_sym["result"]["isError"], true);
+            assert_eq!(
+                bad_sym["result"]["structuredContent"]["code"],
+                "VALIDATION_ERROR"
+            );
+        }
+
+        // 3. `rune_models` download & setup_local enforce SAM 3 license gate.
+        let dl_no_lic = call(
+            7,
+            "rune_models",
+            json!({ "action": "download", "model": "sam3-tracker-q4f16" }),
+        );
+        assert_eq!(dl_no_lic["result"]["isError"], true);
+        assert_eq!(
+            dl_no_lic["result"]["structuredContent"]["code"],
+            "LICENSE_REQUIRED"
+        );
+
+        let sam3_src = dir.join("sam3_local");
+        std::fs::create_dir_all(&sam3_src).unwrap();
+        for f in ModelId::Sam3TrackerQ4f16.spec().files {
+            std::fs::write(sam3_src.join(f.filename), b"\x08\x01SAM3_WEIGHTS").unwrap();
+        }
+        let local_no_lic = call(
+            8,
+            "rune_models",
+            json!({
+                "action": "setup_local",
+                "model": "sam3",
+                "source_dir": sam3_src
+            }),
+        );
+        assert_eq!(local_no_lic["result"]["isError"], true);
+        assert_eq!(
+            local_no_lic["result"]["structuredContent"]["code"],
+            "LICENSE_REQUIRED"
+        );
+
+        // 4. `setup_local` succeeds for SAM 2.1 (no license required) & SAM 3 (with `accept_license: true`).
+        let sam21_src = dir.join("sam21_local");
+        std::fs::create_dir_all(&sam21_src).unwrap();
+        for f in ModelId::Sam21HieraTinyFp16.spec().files {
+            std::fs::write(sam21_src.join(f.filename), b"\x08\x01SAM21_WEIGHTS").unwrap();
+        }
+        let ok_sam21 = call(
+            9,
+            "rune_models",
+            json!({
+                "action": "setup_local",
+                "model": "sam2.1-hiera-tiny",
+                "source_dir": sam21_src
+            }),
+        );
+        assert_eq!(ok_sam21["result"]["isError"], false, "sam21: {ok_sam21}");
+        assert_eq!(
+            ok_sam21["result"]["structuredContent"]["model"]["installed"],
+            true
+        );
+
+        let ok_sam3 = call(
+            10,
+            "rune_models",
+            json!({
+                "action": "setup_local",
+                "model": "sam3",
+                "source_dir": sam3_src,
+                "accept_license": true
+            }),
+        );
+        assert_eq!(ok_sam3["result"]["isError"], false, "sam3: {ok_sam3}");
+        assert_eq!(
+            ok_sam3["result"]["structuredContent"]["model"]["license_accepted"],
+            true
+        );
+
+        let status_installed = call(11, "rune_models", json!({ "action": "status" }));
+        assert!(
+            status_installed["result"]["structuredContent"]["installed_total_bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+
+        // 5. `rune_models` `use` and `remove`.
+        let use_res = call(
+            12,
+            "rune_models",
+            json!({ "action": "use", "engine": "heuristic" }),
+        );
+        assert_eq!(use_res["result"]["isError"], false);
+        assert_eq!(
+            load_ai_model_config().unwrap().active_engine,
+            SegmentationEngine::Heuristic
+        );
+
+        let rm_sam21 = call(
+            13,
+            "rune_models",
+            json!({ "action": "remove", "model": "sam2.1" }),
+        );
+        assert_eq!(rm_sam21["result"]["isError"], false);
+        assert_eq!(
+            rm_sam21["result"]["structuredContent"]["model"]["installed"],
+            false
+        );
+
+        let rm_sam3 = call(
+            14,
+            "rune_models",
+            json!({ "action": "remove", "model": "sam3" }),
+        );
+        assert_eq!(rm_sam3["result"]["isError"], false);
+
+        let status_clean = call(15, "rune_models", json!({ "action": "status" }));
+        assert_eq!(
+            status_clean["result"]["structuredContent"]["installed_total_bytes"],
+            0
+        );
+
+        // 6. `rune_edit_layers` `ai_select`, `mask_add` (`kind: "ai_select"`), and `engine` on `ai_subject`/`ai_background`.
+        let empty_sel = call(16, "rune_edit_layers", json!({ "action": "ai_select" }));
+        assert_eq!(empty_sel["result"]["isError"], true);
+        assert_eq!(
+            empty_sel["result"]["structuredContent"]["code"],
+            "VALIDATION_ERROR"
+        );
+
+        let uninstalled_eng = call(
+            17,
+            "rune_edit_layers",
+            json!({
+                "action": "ai_select",
+                "engine": "sam2.1",
+                "points": [{ "x": 0.5, "y": 0.4, "positive": true }]
+            }),
+        );
+        assert_eq!(uninstalled_eng["result"]["isError"], true);
+        assert_eq!(
+            uninstalled_eng["result"]["structuredContent"]["code"],
+            "MODEL_NOT_INSTALLED"
+        );
+
+        let sel_new = call(
+            18,
+            "rune_edit_layers",
+            json!({
+                "action": "ai_select",
+                "name": "Subject Jacket",
+                "engine": "heuristic",
+                "points": [
+                    { "x": 0.5, "y": 0.4, "positive": true },
+                    { "x": 0.1, "y": 0.1, "positive": false }
+                ],
+                "box": [0.2, 0.2, 0.8, 0.8],
+                "invert": false,
+                "adjustments": { "exposure": 0.35 }
+            }),
+        );
+        assert_eq!(sel_new["result"]["isError"], false, "ai_select: {sel_new}");
+        let sc = &sel_new["result"]["structuredContent"];
+        assert_eq!(sc["engine_used"], "heuristic");
+        assert!(sc["backend_label"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(sc.get("elapsed_ms").is_some());
+        assert!(sc.get("instance_count").is_some());
+        assert!(sc.get("iou_score").is_some());
+        assert!(sc.get("fallback_note").is_some());
+        assert_eq!(sc["live_gui_updated"], true);
+
+        // Attach a second `ai_select` mask onto `layer_index: 0` via `op: "subtract"` + `invert: true`.
+        let sel_attach = call(
+            19,
+            "rune_edit_layers",
+            json!({
+                "action": "ai_select",
+                "layer_index": 0,
+                "op": "subtract",
+                "engine": "heuristic",
+                "points": [{ "x": 0.5, "y": 0.5 }],
+                "invert": true
+            }),
+        );
+        assert_eq!(
+            sel_attach["result"]["isError"], false,
+            "ai_select attach: {sel_attach}"
+        );
+        assert_eq!(
+            sel_attach["result"]["structuredContent"]["engine_used"],
+            "heuristic"
+        );
+
+        // Attach via `mask_add` with `kind: "ai_select"` and `box`.
+        let mask_add_sel = call(
+            20,
+            "rune_edit_layers",
+            json!({
+                "action": "mask_add",
+                "layer_index": 0,
+                "kind": "ai_select",
+                "op": "intersect",
+                "engine": "heuristic",
+                "box": [0.25, 0.25, 0.75, 0.75]
+            }),
+        );
+        assert_eq!(
+            mask_add_sel["result"]["isError"], false,
+            "mask_add ai_select: {mask_add_sel}"
+        );
+        assert_eq!(
+            mask_add_sel["result"]["structuredContent"]["engine_used"],
+            "heuristic"
+        );
+
+        // `ai_subject` and `ai_background` accept optional `engine` and emit telemetry.
+        let sub_res = call(
+            21,
+            "rune_edit_layers",
+            json!({ "action": "ai_subject", "engine": "heuristic" }),
+        );
+        assert_eq!(sub_res["result"]["isError"], false, "ai_subject: {sub_res}");
+        assert_eq!(
+            sub_res["result"]["structuredContent"]["engine_used"],
+            "heuristic"
+        );
+
+        let bg_res = call(
+            22,
+            "rune_edit_layers",
+            json!({ "action": "ai_background", "engine": "heuristic" }),
+        );
+        assert_eq!(bg_res["result"]["isError"], false, "ai_bg: {bg_res}");
+        assert_eq!(
+            bg_res["result"]["structuredContent"]["engine_used"],
+            "heuristic"
+        );
+
+        let rec = host.snap.lock().unwrap().recipe.clone();
+        assert_eq!(rec.layers.len(), 3);
+        assert_eq!(rec.layers[0].masks.len(), 3);
+        assert_eq!(rec.layers[0].masks[1].op, MaskCombineOp::Subtract);
+        assert_eq!(rec.layers[0].masks[2].op, MaskCombineOp::Intersect);
+        match &rec.layers[0].masks[0].shape {
+            MaskShape::RasterMask { width, height, .. } => {
+                assert_eq!(*width, LAYER_MASK_TILE_SIZE as u32);
+                assert_eq!(*height, LAYER_MASK_TILE_SIZE as u32);
+            }
+            other => panic!("expected 512x512 RasterMask, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

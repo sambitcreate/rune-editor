@@ -1,8 +1,8 @@
-//! Shared 9-tool MCP dispatcher, warm RAW proxy cache, MCP Resources, and
+//! Shared 10-tool MCP dispatcher, warm RAW proxy cache, MCP Resources, and
 //! live GUI Host Bridge trait (`McpHostBridge`).
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,24 +10,27 @@ use rune_editor_core::{
     ADVANCED_COLOR_SLICE_COUNT, AdjustmentLayer, BUILTIN_CAMERA_PROFILES, BrushDab, ColorTag,
     CullFlag, DevelopRecipe, EditActor, FilmCurve, HealMode, HealSpot, LayerMaskItem,
     LocalAdjustments, MAX_ADJUSTMENT_LAYERS, MAX_BRUSH_DABS_PER_MASK, MAX_HEAL_SPOTS,
-    MAX_MASKS_PER_LAYER, MaskCombineOp, MaskShape, PhotoMeta, ProcessingMode, ProfileCategory,
-    RecipePatch, UserStyle, VignetteMethod, WbPreset, all_param_descriptors, analyze_linear_proxy,
-    apply_style_to_recipe, auto_exposure_and_tone, auto_levels, auto_white_balance, blend_recipes,
-    builtin_presets, canonical_profile_id, compute_histogram, copy_recipe_groups,
-    create_capture_one_session, default_profiles_dir, default_styles_dir, delete_user_style_in_dir,
-    diff_recipes, is_valid_camera_profile_id, list_all_camera_profiles, list_user_styles_in_dir,
-    load_user_style_in_dir, modified_recipe_groups, pick_white_balance, recipe_field_diffs,
-    recipe_non_default_map, recipe_schema_json, reset_recipe_group, resolve_builtin_preset,
-    sanitize_style_slug, save_user_style_in_dir, set_param_by_str, stack_style_onto_recipe,
-    temperature_to_kelvin,
+    MAX_MASKS_PER_LAYER, MAX_PROMPT_POINTS, MaskCombineOp, MaskShape, ModelId, ModelInstallState,
+    PhotoMeta, ProcessingMode, ProfileCategory, PromptBox, PromptPoint, RecipePatch,
+    SegmentationEngine, SmartMaskPrompt, UserStyle, VignetteMethod, WbPreset,
+    all_param_descriptors, analyze_linear_proxy, apply_style_to_recipe, auto_exposure_and_tone,
+    auto_levels, auto_white_balance, blend_recipes, builtin_presets, canonical_profile_id,
+    compute_histogram, copy_recipe_groups, create_capture_one_session, default_profiles_dir,
+    default_styles_dir, delete_user_style_in_dir, diff_recipes, inspect_model_status,
+    is_valid_camera_profile_id, list_all_camera_profiles, list_user_styles_in_dir,
+    load_ai_model_config, load_user_style_in_dir, modified_recipe_groups, pick_white_balance,
+    recipe_field_diffs, recipe_non_default_map, recipe_schema_json, reset_recipe_group,
+    resolve_builtin_preset, sanitize_style_slug, save_ai_model_config, save_user_style_in_dir,
+    set_param_by_str, stack_style_onto_recipe, temperature_to_kelvin,
 };
 use rune_editor_decode::{
-    ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, LinearImage, NamingContext,
-    TextWatermark, WatermarkPosition, builtin_export_recipes, expand_naming_template,
+    ExportColorSpace, ExportFormat, ExportOptions, ExportRecipeSpec, LinearImage, ModelError,
+    NamingContext, SmartMaskResult, TextWatermark, VisionError, WatermarkPosition,
+    active_engine_summary, builtin_export_recipes, download_model, expand_naming_template,
     export_image_to_jpeg_vec, export_image_with_options, export_multi_recipe,
-    extract_detail_luma_proxy, extract_exif_from_path, generate_subject_mask, guard_not_source,
-    is_raw_extension, load_file, load_file_proxy, plan_multi_recipe_paths, sample_linear_rgb_at_uv,
-    sample_raw_linear_rgb_at_uv,
+    extract_detail_luma_proxy, extract_exif_from_path, generate_smart_mask, guard_not_source,
+    is_raw_extension, list_model_statuses, load_file, load_file_proxy, plan_multi_recipe_paths,
+    remove_model, sample_linear_rgb_at_uv, sample_raw_linear_rgb_at_uv, setup_model_from_local_dir,
 };
 use serde_json::{Value, json};
 
@@ -312,6 +315,7 @@ impl McpService {
             "rune_cull_or_export" => self.tool_cull_or_export(&args),
             "rune_manage_workflow" => self.tool_manage_workflow(&args),
             "rune_edit_layers" => self.tool_edit_layers(&args),
+            "rune_models" => self.tool_models(&args),
             _ => {
                 self.host.on_activity(name, false);
                 return jsonrpc_error(
@@ -2242,12 +2246,14 @@ impl McpService {
                 "action",
                 "path",
                 "index",
+                "layer_index",
                 "id",
                 "name",
                 "kind",
                 "opacity",
                 "enabled",
                 "inverted",
+                "invert",
                 "op",
                 "adjustments",
                 "start",
@@ -2261,6 +2267,9 @@ impl McpService {
                 "low_falloff",
                 "high_falloff",
                 "strokes",
+                "points",
+                "box",
+                "engine",
                 "target",
                 "source",
                 "mode",
@@ -2283,7 +2292,7 @@ impl McpService {
                 "VALIDATION_ERROR",
                 "Missing required `action` on rune_edit_layers.",
                 Some(
-                    "Valid: layer_list, layer_add, layer_update, layer_remove, mask_add, mask_clear, ai_subject, ai_background, heal_list, heal_add, heal_remove, heal_clear",
+                    "Valid: layer_list, layer_add, layer_update, layer_remove, mask_add, mask_clear, ai_subject, ai_background, ai_select, heal_list, heal_add, heal_remove, heal_clear",
                 ),
             );
         };
@@ -2297,7 +2306,25 @@ impl McpService {
             .and_then(Value::as_str)
             .unwrap_or("mcp-layers");
 
-        let (path_opt, img, mut meta, is_active) = match self.resolve_target(args, 512) {
+        let needs_highres_proxy = matches!(action, "ai_subject" | "ai_background" | "ai_select")
+            || args.get("kind").and_then(Value::as_str).is_some_and(|k| {
+                let norm = k.trim().to_ascii_lowercase().replace('-', "_");
+                matches!(
+                    norm.as_str(),
+                    "ai_subject"
+                        | "subject"
+                        | "ai_background"
+                        | "background"
+                        | "ai_bg"
+                        | "ai_select"
+                        | "select"
+                        | "smart"
+                        | "smart_select"
+                )
+            });
+        let proxy_edge = if needs_highres_proxy { 1024 } else { 512 };
+
+        let (path_opt, img, mut meta, is_active) = match self.resolve_target(args, proxy_edge) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -2414,10 +2441,13 @@ impl McpService {
                 let mut layer = if kind.eq_ignore_ascii_case("empty") {
                     AdjustmentLayer::new(&id, &name)
                 } else {
-                    let shape = match parse_mcp_mask_shape(kind, args, &img) {
+                    let (shape, smart_opt) = match parse_mcp_mask_shape(kind, args, &img) {
                         Ok(s) => s,
                         Err(e) => return e,
                     };
+                    if let Some(ref smart) = smart_opt {
+                        insert_mcp_smart_telemetry(&mut extra, smart);
+                    }
                     AdjustmentLayer::new_with_mask(&id, &name, shape)
                 };
                 layer.opacity = opacity;
@@ -2515,7 +2545,7 @@ impl McpService {
                 let Some(kind) = args.get("kind").and_then(Value::as_str) else {
                     return tool_err(
                         "VALIDATION_ERROR",
-                        "Missing `kind` for `mask_add` (linear, radial, luma, filled, brush, ai_subject, ai_background).",
+                        "Missing `kind` for `mask_add` (linear, radial, luma, filled, brush, ai_subject, ai_background, ai_select).",
                         None,
                     );
                 };
@@ -2527,10 +2557,13 @@ impl McpService {
                         None,
                     );
                 };
-                let shape = match parse_mcp_mask_shape(kind, args, &img) {
+                let (shape, smart_opt) = match parse_mcp_mask_shape(kind, args, &img) {
                     Ok(s) => s,
                     Err(e) => return e,
                 };
+                if let Some(ref smart) = smart_opt {
+                    insert_mcp_smart_telemetry(&mut extra, smart);
+                }
                 let mut item = LayerMaskItem::new(shape);
                 item.op = combine_op;
                 item.inverted = args
@@ -2561,14 +2594,51 @@ impl McpService {
                 extra.insert("index".to_owned(), json!(idx));
                 commit(&mut meta, before, format!("MCP mask_clear #{idx}"), extra)
             }
-            "ai_subject" | "ai_background" => {
-                let is_bg = action == "ai_background";
-                let shape = generate_subject_mask(&img, is_bg);
+            "ai_subject" | "ai_background" | "ai_select" => {
+                let engine_override = match parse_mcp_engine(args) {
+                    Ok(e) => e,
+                    Err(e) => return e,
+                };
+                let prompt = match action {
+                    "ai_subject" => {
+                        let inv = match parse_opt_bool(args.get("invert"), "invert") {
+                            Ok(v) => v.unwrap_or(false),
+                            Err(e) => return e,
+                        };
+                        if inv {
+                            SmartMaskPrompt::AutoBackground
+                        } else {
+                            SmartMaskPrompt::AutoSubject
+                        }
+                    }
+                    "ai_background" => {
+                        let inv = match parse_opt_bool(args.get("invert"), "invert") {
+                            Ok(v) => v.unwrap_or(false),
+                            Err(e) => return e,
+                        };
+                        if inv {
+                            SmartMaskPrompt::AutoSubject
+                        } else {
+                            SmartMaskPrompt::AutoBackground
+                        }
+                    }
+                    "ai_select" => match parse_mcp_ai_select_prompt(args) {
+                        Ok(p) => p,
+                        Err(e) => return e,
+                    },
+                    _ => unreachable!(),
+                };
+                let smart = match run_mcp_smart_mask(&img, &prompt, engine_override) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
+                insert_mcp_smart_telemetry(&mut extra, &smart);
+                let shape = smart.mask;
                 let opacity = match parse_opt_f32_range(args.get("opacity"), "opacity", 0.0, 1.0) {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
-                let target_idx = if args.get("index").is_some() || args.get("id").is_some() {
+                let target_idx = if has_mcp_layer_selector(args) {
                     let idx = match resolve_mcp_layer_index(&meta.recipe.layers, args) {
                         Ok(i) => i,
                         Err(e) => return e,
@@ -2615,7 +2685,11 @@ impl McpService {
                             None,
                         );
                     }
-                    let default_name = if is_bg { "AI Background" } else { "AI Subject" };
+                    let default_name = match action {
+                        "ai_background" => "AI Background",
+                        "ai_select" => "AI Select",
+                        _ => "AI Subject",
+                    };
                     let name = args
                         .get("name")
                         .and_then(Value::as_str)
@@ -2743,8 +2817,292 @@ impl McpService {
                 "VALIDATION_ERROR",
                 format!("Unknown `rune_edit_layers` action '{other}'."),
                 Some(
-                    "Valid: layer_list, layer_add, layer_update, layer_remove, mask_add, mask_clear, ai_subject, ai_background, heal_list, heal_add, heal_remove, heal_clear",
+                    "Valid: layer_list, layer_add, layer_update, layer_remove, mask_add, mask_clear, ai_subject, ai_background, ai_select, heal_list, heal_add, heal_remove, heal_clear",
                 ),
+            ),
+        }
+    }
+
+    fn tool_models(&self, args: &Value) -> Value {
+        if let Some(obj) = args.as_object() {
+            const ALLOWED: &[&str] = &["action", "engine", "model", "accept_license", "source_dir"];
+            for key in obj.keys() {
+                if !ALLOWED.contains(&key.as_str()) {
+                    return tool_err(
+                        "UNKNOWN_ARGUMENT",
+                        format!("Unknown argument '{key}' on rune_models."),
+                        Some(
+                            "Allowed arguments: action, engine, model, accept_license, source_dir",
+                        ),
+                    );
+                }
+            }
+        }
+
+        let Some(action) = args.get("action").and_then(Value::as_str) else {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "Missing required `action` on rune_models.",
+                Some("Valid: list, status, use, download, setup_local, remove"),
+            );
+        };
+
+        if action != "use" && args.get("engine").is_some_and(|v| !v.is_null()) {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "`engine` is only valid with `action: \"use\"`.",
+                None,
+            );
+        }
+        if !matches!(action, "download" | "setup_local" | "remove")
+            && args.get("model").is_some_and(|v| !v.is_null())
+        {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "`model` is only valid with `download`, `setup_local`, or `remove`.",
+                None,
+            );
+        }
+        if !matches!(action, "download" | "setup_local")
+            && args.get("accept_license").is_some_and(|v| !v.is_null())
+        {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "`accept_license` is only valid with `download` or `setup_local`.",
+                None,
+            );
+        }
+        if action != "setup_local" && args.get("source_dir").is_some_and(|v| !v.is_null()) {
+            return tool_err(
+                "VALIDATION_ERROR",
+                "`source_dir` is only valid with `action: \"setup_local\"`.",
+                None,
+            );
+        }
+
+        match action {
+            "list" => {
+                let summary = active_engine_summary();
+                let statuses = list_model_statuses();
+                let builtin_apple = json!({
+                    "id": "apple-vision",
+                    "display_name": "Apple Vision ANE (Built-in)",
+                    "aliases": ["apple-vision", "vision", "apple"],
+                    "engine": SegmentationEngine::AppleVision,
+                    "available": summary.apple_vision_available,
+                    "backend_label": summary.apple_vision_label,
+                    "state": if summary.apple_vision_available { "built_in" } else { "unavailable" },
+                    "installed": summary.apple_vision_available,
+                    "installed_bytes": 0,
+                    "approx_bytes": 0,
+                    "license": "macOS System Framework",
+                    "requires_license_acceptance": false,
+                    "license_accepted": true,
+                });
+                let models: Vec<Value> = statuses.iter().map(mcp_model_status_json).collect();
+                tool_ok(
+                    json!({
+                        "ok": true,
+                        "action": action,
+                        "active_engine": summary.configured_engine,
+                        "effective_auto_engine": summary.effective_auto_engine,
+                        "effective_interactive_engine": summary.effective_interactive_engine,
+                        "models_dir": summary.models_root,
+                        "builtin_apple_vision": builtin_apple,
+                        "models": models,
+                    }),
+                    None,
+                    None,
+                )
+            }
+            "status" => {
+                let summary = active_engine_summary();
+                let statuses = list_model_statuses();
+                let installed_total_bytes: u64 = statuses
+                    .iter()
+                    .map(|s| s.state.bytes_present())
+                    .fold(0u64, u64::saturating_add);
+                tool_ok(
+                    json!({
+                        "ok": true,
+                        "action": action,
+                        "active_engine": summary.configured_engine,
+                        "configured_engine": summary.configured_engine,
+                        "effective_auto_engine": summary.effective_auto_engine,
+                        "effective_interactive_engine": summary.effective_interactive_engine,
+                        "apple_vision_available": summary.apple_vision_available,
+                        "apple_vision_label": summary.apple_vision_label,
+                        "installed_models": summary.installed_models,
+                        "preferred_sam3_variant": summary.preferred_sam3_variant,
+                        "models_dir": summary.models_root,
+                        "installed_total_bytes": installed_total_bytes,
+                    }),
+                    None,
+                    None,
+                )
+            }
+            "use" => {
+                let Some(raw) = args
+                    .get("engine")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return tool_err(
+                        "VALIDATION_ERROR",
+                        "Missing non-empty string `engine` for `use`.",
+                        Some(
+                            "Valid: auto, apple_vision, sam21_tiny, sam3_tracker, heuristic (aliases: apple-vision, sam2.1, sam3)",
+                        ),
+                    );
+                };
+                let Some(eng) = SegmentationEngine::from_str_loose(raw) else {
+                    return tool_err(
+                        "VALIDATION_ERROR",
+                        format!("Unknown segmentation `engine` '{raw}'."),
+                        Some(
+                            "Valid: auto, apple_vision, sam21_tiny, sam3_tracker, heuristic (aliases: apple-vision, sam2.1, sam3)",
+                        ),
+                    );
+                };
+                let mut config = load_ai_model_config().unwrap_or_default();
+                config.active_engine = eng;
+                if let Some(m) = ModelId::from_str_loose(raw)
+                    && m.is_sam3()
+                {
+                    config.preferred_sam3_variant = m;
+                }
+                if let Err(e) = save_ai_model_config(&config) {
+                    return tool_err("IO_ERROR", e.to_string(), None);
+                }
+                let summary = active_engine_summary();
+                tool_ok(
+                    json!({
+                        "ok": true,
+                        "action": action,
+                        "active_engine": summary.configured_engine,
+                        "effective_auto_engine": summary.effective_auto_engine,
+                        "effective_interactive_engine": summary.effective_interactive_engine,
+                        "preferred_sam3_variant": summary.preferred_sam3_variant,
+                        "models_dir": summary.models_root,
+                    }),
+                    None,
+                    None,
+                )
+            }
+            "download" => {
+                let model_id = match parse_mcp_model_id(args) {
+                    Ok(id) => id,
+                    Err(e) => return e,
+                };
+                let accept_license =
+                    match parse_opt_bool(args.get("accept_license"), "accept_license") {
+                        Ok(v) => v.unwrap_or(false),
+                        Err(e) => return e,
+                    };
+                let spec = model_id.spec();
+                if spec.requires_license_acceptance && !accept_license {
+                    return tool_err(
+                        "LICENSE_REQUIRED",
+                        format!(
+                            "Model '{}' requires accepting the {} ({}) before downloading.",
+                            model_id.id(),
+                            spec.license,
+                            spec.license_url
+                        ),
+                        Some(
+                            "Review the license URL and re-call `rune_models` with `accept_license: true`.",
+                        ),
+                    );
+                }
+                match download_model(model_id, accept_license, None, |_| {}) {
+                    Ok(status) => tool_ok(
+                        json!({
+                            "ok": true,
+                            "action": action,
+                            "source": "huggingface",
+                            "model": mcp_model_status_json(&status),
+                        }),
+                        None,
+                        None,
+                    ),
+                    Err(e) => map_model_error_to_mcp(e),
+                }
+            }
+            "setup_local" => {
+                let model_id = match parse_mcp_model_id(args) {
+                    Ok(id) => id,
+                    Err(e) => return e,
+                };
+                let accept_license =
+                    match parse_opt_bool(args.get("accept_license"), "accept_license") {
+                        Ok(v) => v.unwrap_or(false),
+                        Err(e) => return e,
+                    };
+                let canon_dir = match validate_mcp_source_dir(args.get("source_dir")) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                let spec = model_id.spec();
+                if spec.requires_license_acceptance && !accept_license {
+                    return tool_err(
+                        "LICENSE_REQUIRED",
+                        format!(
+                            "Model '{}' requires accepting the {} ({}) before installing.",
+                            model_id.id(),
+                            spec.license,
+                            spec.license_url
+                        ),
+                        Some(
+                            "Review the license URL and re-call `rune_models` with `accept_license: true`.",
+                        ),
+                    );
+                }
+                match setup_model_from_local_dir(model_id, &canon_dir, accept_license) {
+                    Ok(status) => tool_ok(
+                        json!({
+                            "ok": true,
+                            "action": action,
+                            "source": "local_dir",
+                            "source_dir": canon_dir,
+                            "model": mcp_model_status_json(&status),
+                        }),
+                        None,
+                        None,
+                    ),
+                    Err(e) => map_model_error_to_mcp(e),
+                }
+            }
+            "remove" => {
+                let model_id = match parse_mcp_model_id(args) {
+                    Ok(id) => id,
+                    Err(e) => return e,
+                };
+                let config = load_ai_model_config().unwrap_or_default();
+                let freed_bytes = inspect_model_status(model_id, &config)
+                    .state
+                    .bytes_present();
+                if let Err(e) = remove_model(model_id) {
+                    return map_model_error_to_mcp(e);
+                }
+                let after = inspect_model_status(model_id, &config);
+                tool_ok(
+                    json!({
+                        "ok": true,
+                        "action": action,
+                        "model_id": model_id.id(),
+                        "removed": true,
+                        "freed_bytes": freed_bytes,
+                        "model": mcp_model_status_json(&after),
+                    }),
+                    None,
+                    None,
+                )
+            }
+            other => tool_err(
+                "VALIDATION_ERROR",
+                format!("Unknown `rune_models` action '{other}'."),
+                Some("Valid: list, status, use, download, setup_local, remove"),
             ),
         }
     }
@@ -2837,9 +3195,40 @@ fn next_mcp_heal_id(spots: &[HealSpot]) -> String {
     }
 }
 
+fn has_mcp_layer_selector(args: &Value) -> bool {
+    args.get("index").is_some_and(|v| !v.is_null())
+        || args.get("layer_index").is_some_and(|v| !v.is_null())
+        || args.get("id").is_some_and(|v| !v.is_null())
+}
+
 fn resolve_mcp_layer_index(layers: &[AdjustmentLayer], args: &Value) -> Result<usize, Value> {
-    if let Some(idx) = args.get("index").and_then(Value::as_u64) {
-        let i = idx as usize;
+    let parse_u64_idx = |val: Option<&Value>, field: &str| -> Result<Option<usize>, Value> {
+        match val {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+                tool_err(
+                    "VALIDATION_ERROR",
+                    format!("`{field}` must be a non-negative integer."),
+                    None,
+                )
+            }),
+        }
+    };
+    let idx_a = parse_u64_idx(args.get("index"), "index")?;
+    let idx_b = parse_u64_idx(args.get("layer_index"), "layer_index")?;
+    let resolved_num = match (idx_a, idx_b) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                format!("Conflicting `index` ({a}) and `layer_index` ({b})."),
+                None,
+            ));
+        }
+        (Some(a), _) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(i) = resolved_num {
         if i < layers.len() {
             return Ok(i);
         }
@@ -2864,7 +3253,7 @@ fn resolve_mcp_layer_index(layers: &[AdjustmentLayer], args: &Value) -> Result<u
     }
     Err(tool_err(
         "VALIDATION_ERROR",
-        "Provide integer `index` or string `id` to select a layer.",
+        "Provide integer `index` / `layer_index` or string `id` to select a layer.",
         None,
     ))
 }
@@ -2966,19 +3355,391 @@ fn apply_mcp_local_adjustments(
     Ok(())
 }
 
-fn parse_mcp_mask_shape(kind: &str, args: &Value, img: &LinearImage) -> Result<MaskShape, Value> {
+fn parse_opt_bool(val: Option<&Value>, field: &str) -> Result<Option<bool>, Value> {
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_bool().map(Some).ok_or_else(|| {
+            tool_err(
+                "VALIDATION_ERROR",
+                format!("`{field}` must be a boolean."),
+                None,
+            )
+        }),
+    }
+}
+
+fn parse_mcp_engine(args: &Value) -> Result<Option<SegmentationEngine>, Value> {
+    match args.get("engine") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let Some(s) = v.as_str() else {
+                return Err(tool_err(
+                    "VALIDATION_ERROR",
+                    "`engine` must be a string (`auto`, `apple_vision`, `sam21_tiny`, `sam3_tracker`, `heuristic`).",
+                    None,
+                ));
+            };
+            SegmentationEngine::from_str_loose(s)
+                .map(Some)
+                .ok_or_else(|| {
+                    tool_err(
+                        "VALIDATION_ERROR",
+                        format!("Unknown segmentation `engine` '{s}'."),
+                        Some("Valid: auto, apple_vision, sam21_tiny, sam3_tracker, heuristic (aliases: apple-vision, sam2.1, sam3)"),
+                    )
+                })
+        }
+    }
+}
+
+fn parse_mcp_ai_select_prompt(args: &Value) -> Result<SmartMaskPrompt, Value> {
+    let mut points = Vec::new();
+    if let Some(pts_val) = args.get("points")
+        && !pts_val.is_null()
+    {
+        let Some(arr) = pts_val.as_array() else {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                "`points` must be an array of `{ x, y, positive? }` objects.",
+                None,
+            ));
+        };
+        if arr.len() > MAX_PROMPT_POINTS {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                format!(
+                    "`points` exceeds maximum {MAX_PROMPT_POINTS} prompt points (got {}).",
+                    arr.len()
+                ),
+                None,
+            ));
+        }
+        for (idx, item) in arr.iter().enumerate() {
+            let Some(obj) = item.as_object() else {
+                return Err(tool_err(
+                    "VALIDATION_ERROR",
+                    format!("`points[{idx}]` must be an object `{{ x, y, positive? }}`."),
+                    None,
+                ));
+            };
+            for key in obj.keys() {
+                if !matches!(key.as_str(), "x" | "y" | "positive") {
+                    return Err(tool_err(
+                        "VALIDATION_ERROR",
+                        format!("Unknown key '{key}' in `points[{idx}]`."),
+                        Some("Allowed keys: x, y, positive"),
+                    ));
+                }
+            }
+            let x = obj
+                .get("x")
+                .and_then(Value::as_f64)
+                .map(|n| n as f32)
+                .ok_or_else(|| {
+                    tool_err(
+                        "VALIDATION_ERROR",
+                        format!("`points[{idx}].x` must be a number in 0.0..=1.0."),
+                        None,
+                    )
+                })?;
+            let y = obj
+                .get("y")
+                .and_then(Value::as_f64)
+                .map(|n| n as f32)
+                .ok_or_else(|| {
+                    tool_err(
+                        "VALIDATION_ERROR",
+                        format!("`points[{idx}].y` must be a number in 0.0..=1.0."),
+                        None,
+                    )
+                })?;
+            if !x.is_finite()
+                || !y.is_finite()
+                || !(0.0..=1.0).contains(&x)
+                || !(0.0..=1.0).contains(&y)
+            {
+                return Err(tool_err(
+                    "VALIDATION_ERROR",
+                    format!("`points[{idx}]` coordinates must be finite and within 0.0..=1.0."),
+                    None,
+                ));
+            }
+            let positive =
+                parse_opt_bool(obj.get("positive"), "points[].positive")?.unwrap_or(true);
+            points.push(PromptPoint::new(x, y, positive));
+        }
+    }
+
+    let bbox = if let Some(box_val) = args.get("box")
+        && !box_val.is_null()
+    {
+        let Some(arr) = box_val.as_array() else {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                "`box` must be a 4-number array `[x0, y0, x1, y1]` in 0.0..=1.0.",
+                None,
+            ));
+        };
+        if arr.len() != 4 {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                "`box` must contain exactly 4 numbers `[x0, y0, x1, y1]`.",
+                None,
+            ));
+        }
+        let mut vals = [0.0_f32; 4];
+        for (i, v) in arr.iter().enumerate() {
+            let Some(n) = v.as_f64() else {
+                return Err(tool_err(
+                    "VALIDATION_ERROR",
+                    "`box` elements must be numbers in 0.0..=1.0.",
+                    None,
+                ));
+            };
+            let f = n as f32;
+            if !f.is_finite() || !(0.0..=1.0).contains(&f) {
+                return Err(tool_err(
+                    "VALIDATION_ERROR",
+                    "`box` coordinates must be finite and within 0.0..=1.0.",
+                    None,
+                ));
+            }
+            vals[i] = f;
+        }
+        let b = PromptBox::new(vals[0], vals[1], vals[2], vals[3]).sanitized();
+        if !b.is_valid() {
+            return Err(tool_err(
+                "VALIDATION_ERROR",
+                "`box` must enclose a non-zero area (x0 != x1 and y0 != y1).",
+                None,
+            ));
+        }
+        Some(b)
+    } else {
+        None
+    };
+
+    if points.is_empty() && bbox.is_none() {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            "`ai_select` requires at least one entry in `points` or a bounding `box`.",
+            Some("Provide `points: [{x, y, positive}]` and/or `box: [x0, y0, x1, y1]`."),
+        ));
+    }
+
+    let invert = parse_opt_bool(args.get("invert"), "invert")?.unwrap_or(false);
+    Ok(SmartMaskPrompt::Interactive {
+        points,
+        bbox,
+        invert,
+    })
+}
+
+fn run_mcp_smart_mask(
+    img: &LinearImage,
+    prompt: &SmartMaskPrompt,
+    engine_override: Option<SegmentationEngine>,
+) -> Result<SmartMaskResult, Value> {
+    generate_smart_mask(img, prompt, engine_override).map_err(|err| match err {
+        VisionError::ModelNotInstalled(id) => tool_err(
+            "MODEL_NOT_INSTALLED",
+            format!("Segmentation model '{}' is not installed.", id.id()),
+            Some(&format!(
+                "Call `rune_models` with action `download` or `setup_local` for '{}', or use `engine: \"auto\"`.",
+                id.id()
+            )),
+        ),
+        VisionError::BackendUnavailable(msg) => tool_err(
+            "BACKEND_UNAVAILABLE",
+            format!("Segmentation backend unavailable: {msg}"),
+            Some("Call `rune_models` with `action: \"status\"` or use `engine: \"auto\"`."),
+        ),
+        VisionError::EmptyImage | VisionError::InferenceFailed(_) => {
+            tool_err("SEGMENTATION_FAILED", err.to_string(), None)
+        }
+    })
+}
+
+fn insert_mcp_smart_telemetry(extra: &mut serde_json::Map<String, Value>, smart: &SmartMaskResult) {
+    extra.insert("engine_used".to_owned(), json!(smart.engine_used));
+    extra.insert("backend_label".to_owned(), json!(smart.backend_label));
+    extra.insert("elapsed_ms".to_owned(), json!(smart.elapsed_ms));
+    extra.insert("instance_count".to_owned(), json!(smart.instance_count));
+    extra.insert("iou_score".to_owned(), json!(smart.iou_score));
+    extra.insert("fallback_note".to_owned(), json!(smart.fallback_note));
+}
+
+fn parse_mcp_model_id(args: &Value) -> Result<ModelId, Value> {
+    let Some(raw) = args
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            "Missing non-empty string `model`.",
+            Some(
+                "Valid: sam2.1-hiera-tiny (sam2.1), sam3-tracker-q4f16 (sam3), sam3-tracker-fp16 (sam3-fp16)",
+            ),
+        ));
+    };
+    ModelId::from_str_loose(raw).ok_or_else(|| {
+        tool_err(
+            "VALIDATION_ERROR",
+            format!("Unknown `model` '{raw}'."),
+            Some("Valid: sam2.1-hiera-tiny (sam2.1), sam3-tracker-q4f16 (sam3), sam3-tracker-fp16 (sam3-fp16)"),
+        )
+    })
+}
+
+fn validate_mcp_source_dir(val: Option<&Value>) -> Result<PathBuf, Value> {
+    let Some(raw_str) = val
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            "Missing non-empty string `source_dir` for `setup_local`.",
+            None,
+        ));
+    };
+    if raw_str.contains('\0') {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            "`source_dir` must not contain NUL bytes.",
+            None,
+        ));
+    }
+    let raw_path = PathBuf::from(raw_str);
+    if raw_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            "`source_dir` must not contain parent-directory traversal (`..`).",
+            None,
+        ));
+    }
+    let meta = match std::fs::symlink_metadata(&raw_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(tool_err(
+                "INPUT_NOT_FOUND",
+                format!("`source_dir` does not exist: {}", raw_path.display()),
+                None,
+            ));
+        }
+        Err(e) => return Err(tool_err("IO_ERROR", e.to_string(), None)),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            format!("`source_dir` must not be a symlink: {}", raw_path.display()),
+            None,
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            format!(
+                "`source_dir` must be an existing directory: {}",
+                raw_path.display()
+            ),
+            None,
+        ));
+    }
+    let canon = std::fs::canonicalize(&raw_path).map_err(|e| {
+        tool_err(
+            "VALIDATION_ERROR",
+            format!("Could not canonicalize `source_dir`: {e}"),
+            None,
+        )
+    })?;
+    if !canon.is_dir() {
+        return Err(tool_err(
+            "VALIDATION_ERROR",
+            format!(
+                "Canonical `source_dir` is not a directory: {}",
+                canon.display()
+            ),
+            None,
+        ));
+    }
+    Ok(canon)
+}
+
+fn mcp_model_status_json(status: &rune_editor_core::ModelStatus) -> Value {
+    let state_str = match status.state {
+        ModelInstallState::NotInstalled => "not_installed",
+        ModelInstallState::Partial { .. } => "partial",
+        ModelInstallState::Installed { .. } => "installed",
+    };
+    json!({
+        "id": status.id.id(),
+        "display_name": status.display_name,
+        "aliases": status.id.aliases(),
+        "engine": status.engine,
+        "hf_repo": status.hf_repo,
+        "state": state_str,
+        "installed": status.state.is_installed(),
+        "installed_bytes": status.state.bytes_present(),
+        "approx_bytes": status.approx_bytes,
+        "license": status.license,
+        "license_url": status.license_url,
+        "requires_license_acceptance": status.requires_license_acceptance,
+        "license_accepted": status.license_accepted,
+        "install_dir": status.install_dir,
+    })
+}
+
+fn map_model_error_to_mcp(err: ModelError) -> Value {
+    match err {
+        ModelError::LicenseRequired {
+            model_id,
+            license,
+            license_url,
+        } => tool_err(
+            "LICENSE_REQUIRED",
+            format!(
+                "Model '{}' requires accepting the {license} ({license_url}) before downloading or installing.",
+                model_id.id()
+            ),
+            Some("Review the license URL and re-call `rune_models` with `accept_license: true`."),
+        ),
+        ModelError::MissingLocalFile { .. } => tool_err("INPUT_NOT_FOUND", err.to_string(), None),
+        ModelError::InvalidPath(_) | ModelError::EmptyOrCorruptFile { .. } => {
+            tool_err("VALIDATION_ERROR", err.to_string(), None)
+        }
+        ModelError::Cancelled(_) => tool_err("DOWNLOAD_CANCELLED", err.to_string(), None),
+        ModelError::DownloadFailed { .. } | ModelError::Io(_) | ModelError::Core(_) => {
+            tool_err("IO_ERROR", err.to_string(), None)
+        }
+    }
+}
+
+fn parse_mcp_mask_shape(
+    kind: &str,
+    args: &Value,
+    img: &LinearImage,
+) -> Result<(MaskShape, Option<SmartMaskResult>), Value> {
     match kind.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "filled" => Ok(MaskShape::Filled),
+        "filled" => Ok((MaskShape::Filled, None)),
         "linear" | "linear_gradient" => {
             let start = parse_norm_xy(args.get("start"), "start")?.unwrap_or([0.5, 0.0]);
             let end = parse_norm_xy(args.get("end"), "end")?.unwrap_or([0.5, 0.55]);
             let feather =
                 parse_opt_f32_range(args.get("feather"), "feather", 0.0, 1.0)?.unwrap_or(1.0);
-            Ok(MaskShape::LinearGradient {
-                start,
-                end,
-                feather,
-            })
+            Ok((
+                MaskShape::LinearGradient {
+                    start,
+                    end,
+                    feather,
+                },
+                None,
+            ))
         }
         "radial" | "radial_gradient" => {
             let center = parse_norm_xy(args.get("center"), "center")?.unwrap_or([0.5, 0.5]);
@@ -3023,12 +3784,15 @@ fn parse_mcp_mask_shape(kind: &str, args: &Value, img: &LinearImage) -> Result<M
                 .unwrap_or(0.0);
             let feather =
                 parse_opt_f32_range(args.get("feather"), "feather", 0.0, 1.0)?.unwrap_or(0.4);
-            Ok(MaskShape::RadialGradient {
-                center,
-                radius,
-                angle_deg,
-                feather,
-            })
+            Ok((
+                MaskShape::RadialGradient {
+                    center,
+                    radius,
+                    angle_deg,
+                    feather,
+                },
+                None,
+            ))
         }
         "luma" | "luma_range" => {
             let low = parse_opt_f32_range(args.get("low"), "low", 0.0, 1.0)?.unwrap_or(0.5);
@@ -3046,12 +3810,15 @@ fn parse_mcp_mask_shape(kind: &str, args: &Value, img: &LinearImage) -> Result<M
             let high_falloff =
                 parse_opt_f32_range(args.get("high_falloff"), "high_falloff", 0.0, 1.0)?
                     .unwrap_or(0.1);
-            Ok(MaskShape::LumaRange {
-                low,
-                high,
-                low_falloff,
-                high_falloff,
-            })
+            Ok((
+                MaskShape::LumaRange {
+                    low,
+                    high,
+                    low_falloff,
+                    high_falloff,
+                },
+                None,
+            ))
         }
         "brush" | "brush_strokes" => {
             let strokes: Vec<BrushDab> = match args.get("strokes") {
@@ -3088,16 +3855,48 @@ fn parse_mcp_mask_shape(kind: &str, args: &Value, img: &LinearImage) -> Result<M
                     None,
                 ));
             }
-            Ok(MaskShape::BrushStrokes {
-                strokes: strokes.into_iter().map(BrushDab::sanitized).collect(),
-            })
+            Ok((
+                MaskShape::BrushStrokes {
+                    strokes: strokes.into_iter().map(BrushDab::sanitized).collect(),
+                },
+                None,
+            ))
         }
-        "ai_subject" | "subject" => Ok(generate_subject_mask(img, false)),
-        "ai_background" | "background" | "ai_bg" => Ok(generate_subject_mask(img, true)),
+        "ai_subject" | "subject" => {
+            let engine_override = parse_mcp_engine(args)?;
+            let inv = parse_opt_bool(args.get("invert"), "invert")?.unwrap_or(false);
+            let prompt = if inv {
+                SmartMaskPrompt::AutoBackground
+            } else {
+                SmartMaskPrompt::AutoSubject
+            };
+            let smart = run_mcp_smart_mask(img, &prompt, engine_override)?;
+            let shape = smart.mask.clone();
+            Ok((shape, Some(smart)))
+        }
+        "ai_background" | "background" | "ai_bg" => {
+            let engine_override = parse_mcp_engine(args)?;
+            let inv = parse_opt_bool(args.get("invert"), "invert")?.unwrap_or(false);
+            let prompt = if inv {
+                SmartMaskPrompt::AutoSubject
+            } else {
+                SmartMaskPrompt::AutoBackground
+            };
+            let smart = run_mcp_smart_mask(img, &prompt, engine_override)?;
+            let shape = smart.mask.clone();
+            Ok((shape, Some(smart)))
+        }
+        "ai_select" | "select" | "smart" | "smart_select" => {
+            let engine_override = parse_mcp_engine(args)?;
+            let prompt = parse_mcp_ai_select_prompt(args)?;
+            let smart = run_mcp_smart_mask(img, &prompt, engine_override)?;
+            let shape = smart.mask.clone();
+            Ok((shape, Some(smart)))
+        }
         other => Err(tool_err(
             "VALIDATION_ERROR",
             format!(
-                "Unknown mask kind '{other}' (expected filled, linear, radial, luma, brush, ai_subject, ai_background)."
+                "Unknown mask kind '{other}' (expected filled, linear, radial, luma, brush, ai_subject, ai_background, ai_select)."
             ),
             None,
         )),
@@ -3929,8 +4728,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "rune_edit_layers",
-            title: "Edit Adjustment Layers, Combine Masks, AI Subject & Heal/Clone",
-            description: "Non-destructively manages up to 8 Capture One-style Adjustment Layers, Composable Masks (`add`/`subtract`/`intersect` for Filled, Linear, Radial, Luma Range, Brush, AI Subject, AI Background), Local Adjustments, and up to 16 Spot Heal & Clone stamps (live-updates the open GUI canvas with Cmd+Z undo).",
+            title: "Edit Adjustment Layers, Combine Masks, AI Select & Heal/Clone",
+            description: "Non-destructively manages up to 8 Capture One-style Adjustment Layers, Composable Masks (`add`/`subtract`/`intersect` for Filled, Linear, Radial, Luma Range, Brush, AI Subject, AI Background, and interactive AI Select), Local Adjustments, and up to 16 Spot Heal & Clone stamps (live-updates the open GUI canvas with Cmd+Z undo and returns segmentation telemetry).",
             input_schema: json!({
                 "type": "object",
                 "required": ["action"],
@@ -3946,6 +4745,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                             "mask_clear",
                             "ai_subject",
                             "ai_background",
+                            "ai_select",
                             "heal_list",
                             "heal_add",
                             "heal_remove",
@@ -3954,13 +4754,38 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     },
                     "path": { "type": "string", "description": "Optional photo path; omit to target the live GUI canvas." },
                     "index": { "type": "integer", "minimum": 0, "description": "Zero-based layer or heal spot index." },
+                    "layer_index": { "type": "integer", "minimum": 0, "description": "Alias of `index` targeting an existing adjustment layer (optional on `ai_select`/`ai_subject`/`ai_background`)." },
                     "id": { "type": "string", "description": "Layer or heal spot ID (alternative to `index`)." },
                     "name": { "type": "string", "description": "Layer display name." },
-                    "kind": { "type": "string", "enum": ["empty", "filled", "linear", "radial", "luma", "brush", "ai_subject", "ai_background"] },
+                    "kind": { "type": "string", "enum": ["empty", "filled", "linear", "radial", "luma", "brush", "ai_subject", "ai_background", "ai_select"] },
                     "opacity": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "enabled": { "type": "boolean" },
                     "inverted": { "type": "boolean" },
+                    "invert": { "type": "boolean", "default": false, "description": "Invert the generated AI selection mask (`ai_select`, `ai_subject`, `ai_background`)." },
                     "op": { "type": "string", "enum": ["add", "subtract", "intersect"], "default": "add" },
+                    "engine": { "type": "string", "description": "Optional segmentation engine override (`auto`, `apple_vision`, `sam21_tiny`, `sam3_tracker`, `heuristic`; aliases: `apple-vision`, `sam2.1`, `sam3`)." },
+                    "points": {
+                        "type": "array",
+                        "maxItems": MAX_PROMPT_POINTS,
+                        "description": "Interactive prompt points for `ai_select` (`[{ x, y, positive? }]`, normalized `0..=1`, `positive` defaults to `true`).",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["x", "y"],
+                            "properties": {
+                                "x": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                                "y": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                                "positive": { "type": "boolean", "default": true }
+                            }
+                        }
+                    },
+                    "box": {
+                        "type": "array",
+                        "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "Interactive bounding box `[x0, y0, x1, y1]` in normalized `0..=1` coordinates for `ai_select`."
+                    },
                     "adjustments": { "type": "object", "description": "Local slider map (`exposure`, `contrast`, `brightness`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `clarity`, `dehaze`, `sharpen`)." },
                     "start": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                     "end": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
@@ -3986,6 +4811,46 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 destructive_hint: false,
                 idempotent_hint: false,
                 open_world_hint: false,
+            },
+        },
+        ToolDef {
+            name: "rune_models",
+            title: "Manage AI Segmentation Engines & ONNX Models",
+            description: "Inspect and manage AI segmentation backends (built-in Apple Vision ANE plus on-demand SAM 2.1 Hiera Tiny and SAM 3 Tracker ONNX models): list installed/available models, check active & effective Subject/Interactive engine status, switch active engine, download or import weights from a safe local directory (enforcing explicit `accept_license: true` for SAM 3), or remove installed weights.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["action"],
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "status", "use", "download", "setup_local", "remove"]
+                    },
+                    "engine": {
+                        "type": "string",
+                        "description": "Target engine for `action: \"use\"` (`auto`, `apple_vision`, `sam21_tiny`, `sam3_tracker`, `heuristic`; aliases: `apple-vision`, `sam2.1`, `sam3`)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model ID or alias for `download`, `setup_local`, or `remove` (`sam2.1-hiera-tiny`, `sam3-tracker-q4f16`, `sam3-tracker-fp16`, or aliases `sam2.1`, `sam3`, `sam3-fp16`)."
+                    },
+                    "accept_license": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Must be explicitly `true` to download or install models requiring third-party license acceptance (e.g., SAM 3 Meta SAM License)."
+                    },
+                    "source_dir": {
+                        "type": "string",
+                        "description": "Existing local directory containing the model's ONNX files for `action: \"setup_local\"` (rejects `..` traversal and symlinks)."
+                    }
+                }
+            }),
+            output_schema: json!({ "type": "object" }),
+            annotations: ToolAnnotations {
+                read_only_hint: false,
+                destructive_hint: false,
+                idempotent_hint: false,
+                open_world_hint: true,
             },
         },
     ]

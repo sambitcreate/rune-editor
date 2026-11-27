@@ -140,6 +140,76 @@ impl From<rune_editor_decode::DecodeError> for CliError {
     }
 }
 
+impl From<rune_editor_decode::ModelError> for CliError {
+    fn from(err: rune_editor_decode::ModelError) -> Self {
+        match err {
+            rune_editor_decode::ModelError::LicenseRequired {
+                model_id,
+                license,
+                license_url,
+            } => Self {
+                code: "LICENSE_REQUIRED",
+                exit: exit_code::VALIDATION,
+                message: format!(
+                    "Model '{}' requires accepting the {license} ({license_url}) before downloading or installing.",
+                    model_id.id()
+                ),
+                hint: Some(format!(
+                    "Review {license} at {license_url} and re-run with `--accept-license`."
+                )),
+            },
+            rune_editor_decode::ModelError::MissingLocalFile { .. } => {
+                Self::not_found(err.to_string())
+            }
+            rune_editor_decode::ModelError::InvalidPath(_)
+            | rune_editor_decode::ModelError::EmptyOrCorruptFile { .. } => {
+                Self::validation(err.to_string())
+            }
+            rune_editor_decode::ModelError::Cancelled(_) => Self {
+                code: "DOWNLOAD_CANCELLED",
+                exit: exit_code::PARTIAL_OR_ASSERT,
+                message: err.to_string(),
+                hint: None,
+            },
+            rune_editor_decode::ModelError::DownloadFailed { .. }
+            | rune_editor_decode::ModelError::Io(_) => Self::io(err.to_string()),
+            rune_editor_decode::ModelError::Core(core_err) => core_err.into(),
+        }
+    }
+}
+
+impl From<rune_editor_decode::VisionError> for CliError {
+    fn from(err: rune_editor_decode::VisionError) -> Self {
+        match err {
+            rune_editor_decode::VisionError::ModelNotInstalled(id) => Self {
+                code: "MODEL_NOT_INSTALLED",
+                exit: exit_code::NOT_FOUND,
+                message: format!("Segmentation model '{}' is not installed.", id.id()),
+                hint: Some(if id.is_sam3() {
+                    format!(
+                        "Install it with `rd model setup {} --accept-license` (requires {}), or use `--engine auto`.",
+                        id.id(),
+                        id.spec().license
+                    )
+                } else {
+                    format!(
+                        "Install it with `rd model setup {}`, or use `--engine auto`.",
+                        id.id()
+                    )
+                }),
+            },
+            rune_editor_decode::VisionError::BackendUnavailable(msg) => Self {
+                code: "BACKEND_UNAVAILABLE",
+                exit: exit_code::VALIDATION,
+                message: format!("Segmentation backend unavailable: {msg}"),
+                hint: Some("Run `rd model status` or re-run with `--engine auto`.".to_owned()),
+            },
+            rune_editor_decode::VisionError::EmptyImage
+            | rune_editor_decode::VisionError::InferenceFailed(_) => Self::decode(err.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     /// Compact JSON/NDJSON when stdout is piped; readable text on a TTY.
@@ -250,10 +320,15 @@ pub enum Command {
     },
     /// Capture One-style Selective Adjustments Clipboard: copy selected or adjusted tool groups across photos.
     CopyLook(CopyLookArgs),
-    /// Manage non-destructive Adjustment Layers, Combine Masks (`Add`/`Subtract`/`Intersect`), and AI Subject/Background masks.
+    /// Manage non-destructive Adjustment Layers, Combine Masks (`Add`/`Subtract`/`Intersect`), AI Subject/Background, and AI Select masks.
     Layer {
         #[command(subcommand)]
         sub: LayerCmd,
+    },
+    /// Manage AI segmentation engines and downloadable ONNX models (Apple Vision ANE, SAM 2.1, SAM 3).
+    Model {
+        #[command(subcommand)]
+        sub: ModelCmd,
     },
     /// Manage non-destructive Spot Heal & Clone retouching stamps.
     Heal {
@@ -575,12 +650,12 @@ pub struct CopyLookArgs {
 pub enum LayerCmd {
     /// List all adjustment layers and their masks on a photo.
     List { photo: PathBuf },
-    /// Add a new adjustment layer (empty, filled, linear, radial, luma, ai-subject, or ai-background).
+    /// Add a new adjustment layer (empty, filled, linear, radial, luma, ai-subject, ai-background, or ai-select).
     Add {
         photo: PathBuf,
         #[arg(long)]
         name: String,
-        /// Initial mask kind (`empty`, `filled`, `linear`, `radial`, `luma`, `ai-subject`, `ai-background`).
+        /// Initial mask kind (`empty`, `filled`, `linear`, `radial`, `luma`, `ai-subject`, `ai-background`, `ai-select`).
         #[arg(long, default_value = "empty")]
         kind: String,
         /// Layer opacity in `0.0..=1.0` (default `1.0`).
@@ -589,6 +664,18 @@ pub enum LayerCmd {
         /// Local adjustment assignments: `key=val`, `key+=delta`, `key-=delta` (`exposure`, `contrast`, `brightness`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `clarity`, `dehaze`, `sharpen`).
         #[arg(long = "set", value_name = "EXPR")]
         sets: Vec<String>,
+        /// Segmentation engine override for AI masks (`auto`, `apple-vision`, `sam2.1`, `sam3`, `heuristic`).
+        #[arg(long)]
+        engine: Option<String>,
+        /// Repeatable interactive prompt point `x,y[,+|-]` in normalized `0..=1` coords for `--kind ai-select` (default `+`).
+        #[arg(long = "point", value_name = "X,Y[,+|-]")]
+        points: Vec<String>,
+        /// Interactive bounding box `x0,y0,x1,y1` in normalized `0..=1` coords for `--kind ai-select`.
+        #[arg(long = "box", value_name = "X0,Y0,X1,Y1")]
+        bbox: Option<String>,
+        /// Invert the generated AI selection mask (`--kind ai-select`).
+        #[arg(long, default_value_t = false)]
+        invert: bool,
     },
     /// Update an existing adjustment layer's metadata or local adjustments.
     Update {
@@ -614,7 +701,7 @@ pub enum LayerCmd {
         /// Zero-based layer index or layer ID.
         #[arg(long)]
         index: String,
-        /// Mask kind (`linear`, `radial`, `luma`, `filled`, `ai-subject`, `ai-background`).
+        /// Mask kind (`linear`, `radial`, `luma`, `filled`, `ai-subject`, `ai-background`, `ai-select`).
         #[arg(long)]
         kind: String,
         /// Combine operation (`add`, `subtract`, `intersect`).
@@ -653,6 +740,18 @@ pub enum LayerCmd {
         /// Invert this mask shape.
         #[arg(long, default_value_t = false)]
         inverted: bool,
+        /// Segmentation engine override for AI masks (`auto`, `apple-vision`, `sam2.1`, `sam3`, `heuristic`).
+        #[arg(long)]
+        engine: Option<String>,
+        /// Repeatable interactive prompt point `x,y[,+|-]` in normalized `0..=1` coords for `--kind ai-select` (default `+`).
+        #[arg(long = "point", value_name = "X,Y[,+|-]")]
+        points: Vec<String>,
+        /// Interactive bounding box `x0,y0,x1,y1` in normalized `0..=1` coords for `--kind ai-select`.
+        #[arg(long = "box", value_name = "X0,Y0,X1,Y1")]
+        bbox: Option<String>,
+        /// Invert the generated AI selection mask (`--kind ai-select`).
+        #[arg(long, default_value_t = false)]
+        invert: bool,
     },
     /// Clear all masks from an adjustment layer.
     MaskClear {
@@ -667,6 +766,36 @@ pub enum LayerCmd {
         /// Zero-based layer index or layer ID.
         #[arg(long)]
         index: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelCmd {
+    /// List built-in Apple Vision ANE and all downloadable ONNX segmentation models with install & license status.
+    List,
+    /// Show active engine configuration, effective Subject & Interactive engines, models directory, and disk usage.
+    Status,
+    /// Download or locally import ONNX weights for a segmentation model (`sam2.1-hiera-tiny`, `sam3-tracker-q4f16`, `sam3-tracker-fp16`).
+    #[command(visible_alias = "download")]
+    Setup {
+        /// Model ID or alias (e.g. `sam2.1`, `sam3`, `sam3-tracker-q4f16`, `sam3-tracker-fp16`).
+        model: String,
+        /// Explicitly accept the model's license (required for Meta SAM License models such as SAM 3).
+        #[arg(long)]
+        accept_license: bool,
+        /// Offline import from a local directory containing the model's `.onnx` / `.onnx_data` files instead of downloading.
+        #[arg(long)]
+        from_dir: Option<PathBuf>,
+    },
+    /// Select and persist the active segmentation engine (`auto`, `apple-vision`, `sam2.1`, `sam3`, `heuristic`).
+    Use {
+        /// Engine identifier (`auto`, `apple-vision`, `sam2.1`, `sam3`, `heuristic`).
+        engine: String,
+    },
+    /// Remove installed ONNX weights for a segmentation model from disk.
+    Remove {
+        /// Model ID or alias to remove.
+        model: String,
     },
 }
 
@@ -1022,6 +1151,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Style { .. } => "style",
         Command::CopyLook(_) => "copy-look",
         Command::Layer { .. } => "layer",
+        Command::Model { .. } => "model",
         Command::Heal { .. } => "heal",
         Command::Session { .. } => "session.scan",
         Command::Preset { .. } => "preset",
